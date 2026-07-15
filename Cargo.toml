@@ -1,0 +1,26 @@
+[package]
+name = "esp32-opcua-gateway"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "esp32-opcua-gateway"
+path = "src/main.rs"
+
+[dependencies]
+esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.5", features = ["esp32s3"] }
+esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
+esp-println = { version = "0.17", features = ["esp32s3"] }
+embedded-hal-bus = "0.3"
+w5500-ll = { version = "0.13", features = ["eh1"] }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = true
+
+[profile.dev]
+opt-level = "z"
