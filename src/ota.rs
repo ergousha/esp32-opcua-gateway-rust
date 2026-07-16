@@ -1,7 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
 use esp_idf_svc::ota::EspOta;
-use esp_idf_svc::tls::X509;
 use log::{error, info};
 
 /// Performs an Over-The-Air (OTA) update from the given HTTP(S) URL.
