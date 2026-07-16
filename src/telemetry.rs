@@ -17,7 +17,7 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
         id.thing_name
     );
 
-    let mut session = mqtt_util::connect(
+    let session = mqtt_util::connect(
         &config::mqtt_url(),
         &id.thing_name, // client_id == thingName (device policy limits it this way)
         &mqtt_util::Creds {
