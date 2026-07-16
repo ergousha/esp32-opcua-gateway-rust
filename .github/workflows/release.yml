@@ -1,59 +1,82 @@
-name: Release
+name: ESP32 Release
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_BUILD_JOBS: "2"
+  CMAKE_BUILD_PARALLEL_LEVEL: "2"
+  ESPFLASH_VERSION: "4.5.0"
+  ESPFLASH_SHA256: "9408208ee3d2408cd1247da61bf6e85e7611d4380c590b85e61070fe7e2bb069"
 
 jobs:
   release:
-    name: Create Release
+    name: Build & Release for ESP32-S3
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # Required to create GitHub Releases
+      id-token: write # Required for AWS OIDC authentication
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-
-      - name: Verify Cargo.toml version matches the tag
-        # Guards against the version field drifting from the tags (as
-        # happened in the source project this workflow was adapted from) —
-        # fails the release fast instead of letting Cargo.toml and the
-        # release tags disagree indefinitely.
+      - name: Install ESP toolchain
+        uses: esp-rs/xtensa-toolchain@ec6d36527049a7f4fb2cb0c1a644668c1bb8a2a4 # v1.7.0
+        with:
+          buildtargets: esp32s3
+          ldproxy: true
         env:
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          TAG_VERSION="${TAG_NAME#v}"
-          CARGO_VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::Tag $TAG_NAME does not match Cargo.toml version $CARGO_VERSION. Bump the \`version\` field in Cargo.toml to $TAG_VERSION (in a PR, before tagging) and push the tag again."
-            exit 1
-          fi
-          echo "Cargo.toml version ($CARGO_VERSION) matches tag ($TAG_NAME)."
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build changelog
-        id: changelog
-        run: |
-          # Extract changelog from git log since last tag
-          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          if [ -z "$PREV_TAG" ]; then
-            CHANGELOG=$(git log --oneline --format="- %h %s")
-          else
-            CHANGELOG=$(git log $PREV_TAG..HEAD --oneline --format="- %h %s")
-          fi
-          echo "changelog<<EOF" >> $GITHUB_OUTPUT
-          echo "$CHANGELOG" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Set up swap space
+        uses: pierotofy/set-swap-space@fc79b3f67fa8a838184ce84a674ca12238d2c761 # master
+        with:
+          swap-size-gb: 10
 
-      - name: Create Release
+      - name: Cache Rust build
+        if: ${{ !env.ACT }}
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install cargo-espflash
+        run: |
+          archive="$RUNNER_TEMP/cargo-espflash.zip"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/esp-rs/espflash/releases/download/v${ESPFLASH_VERSION}/cargo-espflash-x86_64-unknown-linux-gnu.zip"
+          echo "${ESPFLASH_SHA256}  ${archive}" | sha256sum --check
+          unzip -q "$archive" -d "$HOME/.cargo/bin"
+          chmod +x "$HOME/.cargo/bin/cargo-espflash"
+
+      - name: Build for ESP32-S3
+        run: cargo build --release
+
+      - name: Generate Firmware Bin
+        run: cargo espflash save-image --release --chip esp32s3 firmware.bin
+
+      - name: Create GitHub Release
         env:
-          TAG_NAME: ${{ github.ref_name }}
-          CHANGELOG: ${{ steps.changelog.outputs.changelog }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$TAG_NAME" \
-            --title "Release $TAG_NAME" \
-            --notes "## Changes in this Release"$'\n'"$CHANGELOG"
+          VERSION=$(grep -m1 '^version =' Cargo.toml | cut -d '"' -f2)
+          # Create a unique tag using the Cargo version and the short commit SHA
+          TAG="v${VERSION}_${GITHUB_SHA::7}"
+          
+          # Use GitHub CLI to create the release, upload firmware.bin, and generate notes
+          gh release create "$TAG" firmware.bin \
+            --title "Release $TAG" \
+            --generate-notes \
+            --target "$GITHUB_SHA"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/esp32-ztp-github-actions-role
+          aws-region: eu-central-1
+
+      - name: Upload Firmware to S3 (Triggers OTA)
+        run: |
+          VERSION=$(grep -m1 '^version =' Cargo.toml | cut -d '"' -f2)
+          aws s3 cp firmware.bin "s3://esp32-ztp-firmware-${{ secrets.AWS_ACCOUNT_ID }}/firmware_v${VERSION}_${{ github.sha }}.bin"

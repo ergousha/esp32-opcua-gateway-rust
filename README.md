@@ -12,10 +12,6 @@ publish telemetry. Networking tries **wired Ethernet (W5500 + DHCP)** first and
 falls back to **WiFi** (`cfg.toml`) if there's no link/lease. See
 [`docs/PROVISIONING.md`](docs/PROVISIONING.md) for the full flow.
 
-> **Status: verified end-to-end on hardware** (ESP32-S3-ETH, 2026-07-16). Over
-> WiFi fallback the device provisioned itself (thing `28848553144F` created,
-> unique cert attached, DynamoDB `provisioned=true`), streamed telemetry to
-> CloudWatch, and on reboot reused its NVS identity (skipped re-provisioning).
 
 ## Monorepo layout
 
