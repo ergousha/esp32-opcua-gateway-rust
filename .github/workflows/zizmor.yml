@@ -1,0 +1,36 @@
+name: Zizmor Security Checks
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/**'
+
+jobs:
+  zizmor:
+    name: Zizmor Security Linter
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # This workflow only ever needs a normal stable Rust toolchain to install
+    # and run zizmor — never the espup-installed `esp` toolchain that the
+    # repo's rust-toolchain.toml pins for the ESP32-S3 firmware build. Forcing
+    # stable here avoids "custom toolchain 'esp' ... is not installed" failures.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Install zizmor
+        run: cargo install zizmor --locked
+
+      - name: Run zizmor
+        run: zizmor .github/workflows/

@@ -1,15 +1,15 @@
 [build]
-target = "xtensa-esp32s3-none-elf"
+target = "xtensa-esp32s3-espidf"
 
-[target.xtensa-esp32s3-none-elf]
+[target.'cfg(target_os = "espidf")']
+linker = "ldproxy"
 runner = "espflash flash --monitor"
-rustflags = [
-  "-C", "link-arg=-Wl,-Tlinkall.x",
-  "-C", "link-arg=-nostartfiles",
-]
-
-[env]
-ESP_LOG = "info"
+rustflags = ["--cfg", "espidf_time64"]
 
 [unstable]
-build-std = ["core", "alloc"]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32s3"
+ESP_IDF_VERSION = "v5.5.3"
+ESP_IDF_TOOLS_INSTALL_DIR = "workspace"

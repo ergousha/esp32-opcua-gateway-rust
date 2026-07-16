@@ -1,6 +1,6 @@
 # ESP32-S3-ETH OPC UA Gateway (Rust)
 
-`no_std` Rust firmware targeting the [Waveshare ESP32-S3-ETH](hardware/README.md)
+`no_std`-free (std, ESP-IDF-based) Rust firmware targeting the [Waveshare ESP32-S3-ETH](hardware/README.md)
 board — an ESP32-S3 (Xtensa LX7) with an on-board W5500 wired Ethernet chip,
 PoE header, TF card slot, and camera interface. See [`hardware/README.md`](hardware/README.md)
 for the full component list, pinout, and board dimensions.
@@ -30,13 +30,21 @@ camera interface.
 ## Toolchain setup
 
 This targets the ESP32-S3 (Xtensa LX7), which needs Espressif's Rust fork
-instead of upstream `rustc`:
+instead of upstream `rustc`, plus the native ESP-IDF build tools (`std`
+firmware links against ESP-IDF, unlike a bare-metal `no_std` build):
 
 ```sh
 cargo install espup --locked
 espup install --targets esp32s3
 . ~/export-esp.sh   # run in every new shell before building
+
+cargo install ldproxy --locked   # linker shim required by .cargo/config.toml
 ```
+
+The first build downloads and builds the ESP-IDF SDK version pinned in
+[`.cargo/config.toml`](.cargo/config.toml) (`ESP_IDF_VERSION`) via `embuild`
+— this needs `python3`, `git`, `cmake`, and `ninja` on `PATH`, and takes a
+while the first time; it's cached under `.embuild/` afterward.
 
 ## Build & flash
 

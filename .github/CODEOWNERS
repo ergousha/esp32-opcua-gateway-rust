@@ -1,0 +1,8 @@
+* @eakin
+
+# Workflows
+.github/workflows/ @eakin
+
+# Build and dependencies
+Cargo.toml @eakin
+Cargo.lock @eakin
