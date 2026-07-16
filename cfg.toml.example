@@ -1,0 +1,9 @@
+# Copy this file to `cfg.toml` (same directory) and fill in your real WiFi
+# credentials. `cfg.toml` is gitignored so your password never ends up in the
+# repo; the values are baked into the firmware at compile time via toml-cfg.
+#
+# WiFi is only the FALLBACK: the firmware tries wired Ethernet (W5500 + DHCP,
+# ~10s) first and connects over WiFi only if there's no link/lease.
+[esp32-opcua-gateway]
+wifi_ssid = "your-ssid"
+wifi_psk = "your-password"

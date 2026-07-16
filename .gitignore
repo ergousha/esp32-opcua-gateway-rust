@@ -1,2 +1,28 @@
 /.embuild
 /target
+
+# --- Claim kimligi: GERCEK SIR, asla commit'leme ---
+# build.rs eksikse placeholder uretir; boylece bunlari ignore etmek CI/fresh
+# clone build'ini bozmaz. AmazonRootCA1.pem publiktir -> commit'lenebilir.
+/certs/claim.crt.pem
+/certs/claim.private.key
+
+# --- Terraform ---
+terraform/.terraform/
+terraform/.build/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/terraform.tfvars
+terraform/*.tfvars.json
+crash.log
+
+# --- AWS kimlik bilgileri (gercek sir; .example takipte) ---
+/aws-env.sh
+.env
+
+# --- WiFi kimlik bilgileri (toml-cfg; derlemeye gomulur) ---
+/cfg.toml
+
+# --- Python ---
+__pycache__/
+*.pyc

@@ -5,9 +5,62 @@ board — an ESP32-S3 (Xtensa LX7) with an on-board W5500 wired Ethernet chip,
 PoE header, TF card slot, and camera interface. See [`hardware/README.md`](hardware/README.md)
 for the full component list, pinout, and board dimensions.
 
-This bring-up brings the W5500 up over SPI, confirms communication via its
-VERSIONR register, and reports Ethernet PHY link status — the foundation for
-the OPC UA gateway to come.
+The firmware now performs **AWS IoT zero-touch provisioning**: on first boot it
+obtains a unique X.509 identity via AWS IoT **Fleet Provisioning by Claim**,
+stores it in NVS, and then connects to IoT Core with its own certificate to
+publish telemetry. Networking tries **wired Ethernet (W5500 + DHCP)** first and
+falls back to **WiFi** (`cfg.toml`) if there's no link/lease. See
+[`docs/PROVISIONING.md`](docs/PROVISIONING.md) for the full flow.
+
+> **Status: verified end-to-end on hardware** (ESP32-S3-ETH, 2026-07-16). Over
+> WiFi fallback the device provisioned itself (thing `28848553144F` created,
+> unique cert attached, DynamoDB `provisioned=true`), streamed telemetry to
+> CloudWatch, and on reboot reused its NVS identity (skipped re-provisioning).
+
+## Monorepo layout
+
+```
+.
+├── src/                     # Rust firmware (this crate)
+│   ├── main.rs              # boot: eth up -> provision-or-load -> telemetry
+│   ├── eth.rs               # W5500 via ESP-IDF esp_eth (lwIP netif + DHCP)
+│   ├── wifi.rs              # WiFi fallback (cfg.toml, toml-cfg)
+│   ├── device_id.rs         # embedded claim certs + NVS device identity + MAC
+│   ├── provisioning.rs      # Fleet Provisioning by Claim client
+│   ├── telemetry.rs         # normal-operation MQTT publish loop
+│   ├── mqtt_util.rs         # mutual-TLS MQTT client wrapper
+│   └── config.rs            # PoC config (endpoint, template, secret)
+├── cfg.toml.example         # WiFi creds template -> copy to cfg.toml (gitignored)
+├── certs/                   # claim cert + root CA (build-embedded; see certs/README.md)
+├── terraform/               # ALL AWS infra (serverless, on-demand)
+│   ├── iot.tf               # IoT Core: template, policies, claim cert, rule
+│   ├── dynamodb.tf          # device registry (MAC + secret)
+│   ├── lambda.tf + lambda/  # pre-provisioning hook (validates MAC+secret)
+│   └── ...
+├── scripts/seed_device.py   # register a device (MAC+secret) in DynamoDB
+└── docs/                    # AWS access + provisioning guides
+```
+
+## AWS zero-touch provisioning — quick start
+
+1. **Deploy AWS infra** — see [`docs/AWS_ACCESS_SETUP.md`](docs/AWS_ACCESS_SETUP.md):
+   ```sh
+   cd terraform && terraform init && terraform apply
+   ```
+2. **Embed the claim identity** into the firmware:
+   ```sh
+   terraform output -raw claim_certificate_pem > ../certs/claim.crt.pem
+   terraform output -raw claim_private_key     > ../certs/claim.private.key
+   ```
+3. **Set** `src/config.rs` → `MQTT_ENDPOINT` (from `terraform output iot_endpoint`),
+   `PROVISIONING_TEMPLATE`, and `DEVICE_SECRET`. For WiFi fallback, copy
+   `cfg.toml.example` → `cfg.toml` and fill in your SSID/password.
+4. **Register the device** in DynamoDB (MAC is logged on first boot):
+   ```sh
+   python3 scripts/seed_device.py --mac AA:BB:CC:DD:EE:FF --secret change-me-shared-secret
+   ```
+5. **Build & flash** (below). On first boot the device provisions itself; on
+   later boots it reuses the NVS-stored identity.
 
 ## Hardware
 
@@ -77,5 +130,10 @@ To find the port yourself:
 and needs a real terminal with a TTY attached — it fails with "Failed to
 initialize input reader" if run from a script or a non-interactive shell.
 
-Expect `W5500 VERSIONR = 0x04` followed by periodic `Ethernet link: up/down`
-lines once an Ethernet cable is connected.
+With an Ethernet cable connected, expect the serial log to show the W5500
+coming up and a DHCP lease (`Ethernet hazir. IP: ...`), then — on first boot —
+the provisioning flow (`CreateKeysAndCertificate` → `RegisterThing` →
+`Provisioning ONAYLANDI. thingName=...`), and finally periodic
+`telemetri gonderildi seq=...` lines. On subsequent boots it logs
+`Kayitli cihaz kimligi bulundu; provisioning atlaniyor.` and goes straight to
+telemetry. See [`docs/PROVISIONING.md`](docs/PROVISIONING.md) for troubleshooting.

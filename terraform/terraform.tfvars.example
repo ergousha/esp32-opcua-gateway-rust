@@ -1,0 +1,6 @@
+# Kopyalayin: cp terraform.tfvars.example terraform.tfvars
+aws_region                 = "eu-central-1"
+project_name               = "esp32-ztp"
+provisioning_template_name = "esp32-s3-fleet-template"
+telemetry_topic_prefix     = "dt"
+log_retention_days         = 7
