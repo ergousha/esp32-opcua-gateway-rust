@@ -25,11 +25,7 @@ pub const PROVISIONING_TEMPLATE: &str = "esp32-s3-fleet-template";
 /// ESP32-S3 DS peripheral ile korunmali.
 pub const DEVICE_SECRET: &str = "change-me-shared-secret";
 
-/// Telemetri topic prefix'i (terraform `telemetry_topic_prefix`).
-pub const TELEMETRY_TOPIC_PREFIX: &str = "dt";
 
-/// Telemetri gonderme araligi (ms).
-pub const TELEMETRY_INTERVAL_MS: u32 = 10_000;
 
 /// MQTT baglanti URL'i (mutual TLS, port 8883).
 pub fn mqtt_url() -> String {

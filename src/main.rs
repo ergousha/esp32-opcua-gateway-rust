@@ -5,7 +5,7 @@
 //!   2. NVS'de kalici cihaz kimligi var mi? bak.
 //!        - YOK  -> claim sertifikasiyla provisioning yap, sonucu NVS'ye yaz.
 //!        - VAR  -> dogrudan cihaz kimligiyle devam.
-//!   3. Cihaz kimligiyle IoT Core'a baglanip telemetri yayinla.
+//!   3. Cihaz kimligiyle IoT Core'a baglanip baglantiyi acik tutar.
 //!
 //! Pinler (`../hardware/pins.png`, SPI2/FSPI):
 //!   MOSI=GPIO11, MISO=GPIO12, SCLK=GPIO13, CS=GPIO14, INT=GPIO10, RST=GPIO9
@@ -83,6 +83,6 @@ fn main() -> Result<()> {
         id
     };
 
-    // --- 3) Telemetri (sonsuz dongu) --------------------------------------
+    // --- 3) Cihaz baglantisi (sonsuz dongu) --------------------------------------
     telemetry::run(&identity)
 }
