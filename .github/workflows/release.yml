@@ -7,8 +7,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  CMAKE_BUILD_PARALLEL_LEVEL: "2"
-  CARGO_BUILD_JOBS: "2"
 
 jobs:
   release:
@@ -33,6 +31,13 @@ jobs:
         run: espup install --targets esp32s3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Swap Space (Prevent OOM)
+        run: |
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
