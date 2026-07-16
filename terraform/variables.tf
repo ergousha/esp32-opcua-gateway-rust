@@ -27,3 +27,9 @@ variable "telemetry_topic_prefix" {
   type        = string
   default     = "dt"
 }
+
+variable "github_repo" {
+  description = "GitHub repository for OIDC authentication (e.g., owner/repo)"
+  type        = string
+  default     = "ergousha/esp32-opcua-gateway-rust"
+}

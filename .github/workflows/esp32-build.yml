@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write # Required for AWS OIDC authentication
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -48,10 +49,33 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      - name: Install cargo-espflash
+        run: cargo install cargo-espflash --locked
+        env:
+          RUSTUP_TOOLCHAIN: stable
+
       - name: Build for ESP32-S3
         run: |
           source $HOME/export-esp.sh
           cargo build --release --verbose
+
+      - name: Generate Firmware Bin
+        run: |
+          source $HOME/export-esp.sh
+          cargo espflash save-image --release --chip esp32s3 firmware.bin
+
+      - name: Configure AWS Credentials
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/esp32-ztp-github-actions-role
+          aws-region: eu-central-1
+
+      - name: Upload Firmware to S3
+        if: github.ref == 'refs/heads/main'
+        run: |
+          VERSION=$(grep -m1 '^version =' Cargo.toml | cut -d '"' -f2)
+          aws s3 cp firmware.bin s3://esp32-ztp-firmware-${{ secrets.AWS_ACCOUNT_ID }}/firmware_v${VERSION}_${{ github.sha }}.bin
 
   check:
     name: Cargo check

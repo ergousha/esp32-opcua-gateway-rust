@@ -14,6 +14,7 @@ mod config;
 mod device_id;
 mod eth;
 mod mqtt_util;
+mod ota;
 mod provisioning;
 mod telemetry;
 mod wifi;
