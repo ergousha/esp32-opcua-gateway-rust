@@ -13,6 +13,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_BUILD_JOBS: "2"
+  CMAKE_BUILD_PARALLEL_LEVEL: "2"
+  ESPFLASH_VERSION: "4.5.0"
+  ESPFLASH_SHA256: "9408208ee3d2408cd1247da61bf6e85e7611d4380c590b85e61070fe7e2bb069"
 
 jobs:
   build:
@@ -26,23 +30,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-
-      # RUSTUP_TOOLCHAIN=stable is required here: the repo's rust-toolchain.toml
-      # pins the espup-installed `esp` toolchain repo-wide, but it isn't
-      # installed yet at this point, so any plain `cargo` invocation would
-      # otherwise fail with "custom toolchain 'esp' ... is not installed".
-      - name: Install espup
-        run: cargo install espup --locked
-        env:
-          RUSTUP_TOOLCHAIN: stable
-
       - name: Install ESP toolchain
-        run: espup install --targets esp32s3
+        uses: esp-rs/xtensa-toolchain@ec6d36527049a7f4fb2cb0c1a644668c1bb8a2a4 # v1.7.0
+        with:
+          buildtargets: esp32s3
+          ldproxy: true
         env:
-          # espup queries the GitHub API for release info; unauthenticated
-          # requests are rate-limited (60/hr per IP) and can 403 on shared
-          # CI runners. Authenticating raises that to 5000/hr.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up swap space
@@ -50,63 +43,24 @@ jobs:
         with:
           swap-size-gb: 10
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Cache Rust build
+        if: ${{ !env.ACT }}
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install cargo-espflash
-        run: cargo install cargo-espflash --locked
-        env:
-          RUSTUP_TOOLCHAIN: stable
+        run: |
+          archive="$RUNNER_TEMP/cargo-espflash.zip"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/esp-rs/espflash/releases/download/v${ESPFLASH_VERSION}/cargo-espflash-x86_64-unknown-linux-gnu.zip"
+          echo "${ESPFLASH_SHA256}  ${archive}" | sha256sum --check
+          unzip -q "$archive" -d "$HOME/.cargo/bin"
+          chmod +x "$HOME/.cargo/bin/cargo-espflash"
 
       - name: Build for ESP32-S3
-        run: |
-          source $HOME/export-esp.sh
-          cargo build --release --verbose
+        run: cargo build --release
 
       - name: Generate Firmware Bin
-        run: |
-          source $HOME/export-esp.sh
-          cargo espflash save-image --release --chip esp32s3 firmware.bin
-
-  check:
-    name: Cargo check
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-
-      - name: Install espup
-        run: cargo install espup --locked
-        env:
-          RUSTUP_TOOLCHAIN: stable
-
-      # .cargo/config.toml sets `linker = "ldproxy"` for the espidf target;
-      # ldproxy is a separate esp-rs crate that espup does not install.
-      - name: Install ldproxy
-        run: cargo install ldproxy --locked
-        env:
-          RUSTUP_TOOLCHAIN: stable
-
-      - name: Install ESP toolchain
-        run: espup install --targets esp32s3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up swap space
-        uses: pierotofy/set-swap-space@fc79b3f67fa8a838184ce84a674ca12238d2c761 # master
-        with:
-          swap-size-gb: 10
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Run cargo check
-        run: |
-          source $HOME/export-esp.sh
-          cargo check --verbose
+        run: cargo espflash save-image --release --chip esp32s3 firmware.bin
 
   fmt:
     name: Rustfmt
@@ -144,20 +98,11 @@ jobs:
         with:
           components: clippy
 
-      - name: Install espup
-        run: cargo install espup --locked
-        env:
-          RUSTUP_TOOLCHAIN: stable
-
-      # .cargo/config.toml sets `linker = "ldproxy"` for the espidf target;
-      # ldproxy is a separate esp-rs crate that espup does not install.
-      - name: Install ldproxy
-        run: cargo install ldproxy --locked
-        env:
-          RUSTUP_TOOLCHAIN: stable
-
       - name: Install ESP toolchain
-        run: espup install --targets esp32s3
+        uses: esp-rs/xtensa-toolchain@ec6d36527049a7f4fb2cb0c1a644668c1bb8a2a4 # v1.7.0
+        with:
+          buildtargets: esp32s3
+          ldproxy: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -166,12 +111,12 @@ jobs:
         with:
           swap-size-gb: 10
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Cache Rust build
+        if: ${{ !env.ACT }}
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Run clippy
-        run: |
-          source $HOME/export-esp.sh
-          cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   doc:
     name: Documentation
@@ -183,22 +128,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-
-      - name: Install espup
-        run: cargo install espup --locked
-        env:
-          RUSTUP_TOOLCHAIN: stable
-
-      # .cargo/config.toml sets `linker = "ldproxy"` for the espidf target;
-      # ldproxy is a separate esp-rs crate that espup does not install.
-      - name: Install ldproxy
-        run: cargo install ldproxy --locked
-        env:
-          RUSTUP_TOOLCHAIN: stable
-
       - name: Install ESP toolchain
-        run: espup install --targets esp32s3
+        uses: esp-rs/xtensa-toolchain@ec6d36527049a7f4fb2cb0c1a644668c1bb8a2a4 # v1.7.0
+        with:
+          buildtargets: esp32s3
+          ldproxy: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -207,65 +141,11 @@ jobs:
         with:
           swap-size-gb: 10
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Cache Rust build
+        if: ${{ !env.ACT }}
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Check documentation
-        run: |
-          source $HOME/export-esp.sh
-          cargo doc --no-deps --document-private-items
+        run: cargo doc --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
-
-  esp32-size:
-    name: Check Binary Size
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-
-      - name: Install espup and cargo-bloat
-        run: |
-          cargo install espup --locked
-          cargo install cargo-bloat --locked
-        env:
-          RUSTUP_TOOLCHAIN: stable
-
-      # .cargo/config.toml sets `linker = "ldproxy"` for the espidf target;
-      # ldproxy is a separate esp-rs crate that espup does not install.
-      - name: Install ldproxy
-        run: cargo install ldproxy --locked
-        env:
-          RUSTUP_TOOLCHAIN: stable
-
-      - name: Install ESP toolchain
-        run: espup install --targets esp32s3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up swap space
-        uses: pierotofy/set-swap-space@fc79b3f67fa8a838184ce84a674ca12238d2c761 # master
-        with:
-          swap-size-gb: 10
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Build for size check
-        run: |
-          source $HOME/export-esp.sh
-          cargo build --release
-
-      # cargo-bloat's ELF parser doesn't reliably support the Xtensa
-      # architecture used by the esp32s3 target (known upstream limitation),
-      # so this can fail with "symbols section is missing" even though the
-      # build above succeeded. Non-fatal: it's a size-reporting nicety, not
-      # a correctness check.
-      - name: Check binary size
-        continue-on-error: true
-        run: |
-          source $HOME/export-esp.sh
-          cargo bloat --release -n 20

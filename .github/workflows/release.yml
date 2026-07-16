@@ -7,6 +7,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_BUILD_JOBS: "2"
+  CMAKE_BUILD_PARALLEL_LEVEL: "2"
+  ESPFLASH_VERSION: "4.5.0"
+  ESPFLASH_SHA256: "9408208ee3d2408cd1247da61bf6e85e7611d4380c590b85e61070fe7e2bb069"
 
 jobs:
   release:
@@ -20,15 +24,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-
-      - name: Install espup
-        run: cargo install espup --locked
-        env:
-          RUSTUP_TOOLCHAIN: stable
-
       - name: Install ESP toolchain
-        run: espup install --targets esp32s3
+        uses: esp-rs/xtensa-toolchain@ec6d36527049a7f4fb2cb0c1a644668c1bb8a2a4 # v1.7.0
+        with:
+          buildtargets: esp32s3
+          ldproxy: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -37,22 +37,24 @@ jobs:
         with:
           swap-size-gb: 10
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Cache Rust build
+        if: ${{ !env.ACT }}
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install cargo-espflash
-        run: cargo install cargo-espflash --locked
-        env:
-          RUSTUP_TOOLCHAIN: stable
+        run: |
+          archive="$RUNNER_TEMP/cargo-espflash.zip"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/esp-rs/espflash/releases/download/v${ESPFLASH_VERSION}/cargo-espflash-x86_64-unknown-linux-gnu.zip"
+          echo "${ESPFLASH_SHA256}  ${archive}" | sha256sum --check
+          unzip -q "$archive" -d "$HOME/.cargo/bin"
+          chmod +x "$HOME/.cargo/bin/cargo-espflash"
 
       - name: Build for ESP32-S3
-        run: |
-          source $HOME/export-esp.sh
-          cargo build --release --verbose
+        run: cargo build --release
 
       - name: Generate Firmware Bin
-        run: |
-          source $HOME/export-esp.sh
-          cargo espflash save-image --release --chip esp32s3 firmware.bin
+        run: cargo espflash save-image --release --chip esp32s3 firmware.bin
 
       - name: Create GitHub Release
         env:
@@ -77,4 +79,4 @@ jobs:
       - name: Upload Firmware to S3 (Triggers OTA)
         run: |
           VERSION=$(grep -m1 '^version =' Cargo.toml | cut -d '"' -f2)
-          aws s3 cp firmware.bin s3://esp32-ztp-firmware-${{ secrets.AWS_ACCOUNT_ID }}/firmware_v${VERSION}_${{ github.sha }}.bin
+          aws s3 cp firmware.bin "s3://esp32-ztp-firmware-${{ secrets.AWS_ACCOUNT_ID }}/firmware_v${VERSION}_${{ github.sha }}.bin"
