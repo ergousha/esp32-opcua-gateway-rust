@@ -1,12 +1,11 @@
-//! AWS IoT Fleet Provisioning by Claim istemcisi.
+//! AWS IoT Fleet Provisioning by Claim client.
 //!
-//! Akis:
-//!   1. Claim (bootstrap) sertifikasiyla baglan.
-//!   2. CreateKeysAndCertificate: benzersiz cihaz sertifikasi + anahtar + sahiplik
-//!      token'i al.
-//!   3. RegisterThing: MAC + secret ile provisioning template'i tetikle. Lambda
-//!      pre-provisioning hook DynamoDB'de dogrular; onaylanirsa thing olusur.
-//!   4. Elde edilen kalici kimligi dondur (cagiran NVS'ye yazar).
+//! Flow:
+//!   1. Connect using Claim (bootstrap) certificate.
+//!   2. CreateKeysAndCertificate: get unique device certificate + key + ownership token.
+//!   3. RegisterThing: trigger provisioning template with MAC + secret. Lambda
+//!      pre-provisioning hook validates against DynamoDB; if approved, thing is created.
+//!   4. Return the obtained persistent identity (caller writes it to NVS).
 
 use std::thread::sleep;
 use std::time::Duration;
@@ -22,11 +21,11 @@ const CREATE_ACCEPTED: &str = "$aws/certificates/create/json/accepted";
 const CREATE_REJECTED: &str = "$aws/certificates/create/json/rejected";
 const CREATE_PUBLISH: &str = "$aws/certificates/create/json";
 
-/// Claim kimligiyle baglanip tam provisioning akisini yurutur.
+/// Connects with the claim identity and executes the complete provisioning flow.
 pub fn run() -> Result<DeviceIdentity> {
     let (mac_colon, mac_plain) = device_id::mac_addr();
     let client_id = format!("claim-{mac_plain}");
-    log::info!("Provisioning basliyor. MAC={mac_colon} client_id={client_id}");
+    log::info!("Provisioning starting. MAC={mac_colon} client_id={client_id}");
 
     let mut session = mqtt_util::connect(
         &config::mqtt_url(),
@@ -38,34 +37,34 @@ pub fn run() -> Result<DeviceIdentity> {
         },
     )?;
 
-    wait_connected(&session.events).context("claim baglantisi kurulamadi")?;
-    log::info!("Claim kimligiyle baglanildi.");
+    wait_connected(&session.events).context("claim connection failed")?;
+    log::info!("Connected with claim identity.");
 
     // 1) CreateKeysAndCertificate
     session.client.subscribe(CREATE_ACCEPTED, QOS1)?;
     session.client.subscribe(CREATE_REJECTED, QOS1)?;
-    sleep(Duration::from_millis(1000)); // SUBACK icin kisa bekleme
+    sleep(Duration::from_millis(1000)); // Short wait for SUBACK
 
     session
         .client
         .publish(CREATE_PUBLISH, QOS1, false, b"{}")
-        .context("create keys istegi gonderilemedi")?;
-    log::info!("CreateKeysAndCertificate istegi gonderildi.");
+        .context("failed to send create keys request")?;
+    log::info!("CreateKeysAndCertificate request sent.");
 
     let create_resp = wait_response(&session.events, "certificates/create/json")?;
     let cert_pem = create_resp["certificatePem"]
         .as_str()
-        .ok_or_else(|| anyhow!("certificatePem yok"))?
+        .ok_or_else(|| anyhow!("certificatePem missing"))?
         .to_string();
     let priv_key = create_resp["privateKey"]
         .as_str()
-        .ok_or_else(|| anyhow!("privateKey yok"))?
+        .ok_or_else(|| anyhow!("privateKey missing"))?
         .to_string();
     let ownership_token = create_resp["certificateOwnershipToken"]
         .as_str()
-        .ok_or_else(|| anyhow!("certificateOwnershipToken yok"))?
+        .ok_or_else(|| anyhow!("certificateOwnershipToken missing"))?
         .to_string();
-    log::info!("Benzersiz cihaz sertifikasi alindi.");
+    log::info!("Unique device certificate received.");
 
     // 2) RegisterThing
     let tmpl = config::PROVISIONING_TEMPLATE;
@@ -90,15 +89,15 @@ pub fn run() -> Result<DeviceIdentity> {
     session
         .client
         .publish(&register_publish, QOS1, false, register_body.as_bytes())
-        .context("RegisterThing istegi gonderilemedi")?;
-    log::info!("RegisterThing istegi gonderildi (MAC + secret dogrulaniyor).");
+        .context("failed to send RegisterThing request")?;
+    log::info!("RegisterThing request sent (validating MAC + secret).");
 
     let register_resp = wait_response(&session.events, "provision/json")?;
     let thing_name = register_resp["thingName"]
         .as_str()
-        .ok_or_else(|| anyhow!("thingName yok"))?
+        .ok_or_else(|| anyhow!("thingName missing"))?
         .to_string();
-    log::info!("Provisioning ONAYLANDI. thingName={thing_name}");
+    log::info!("Provisioning APPROVED. thingName={thing_name}");
 
     Ok(DeviceIdentity {
         cert_pem,
@@ -107,37 +106,37 @@ pub fn run() -> Result<DeviceIdentity> {
     })
 }
 
-/// Connected olayini bekler (timeout'lu).
+/// Waits for the Connected event (with timeout).
 fn wait_connected(events: &std::sync::mpsc::Receiver<MqttEvent>) -> Result<()> {
     let deadline = Duration::from_secs(30);
     loop {
         match events.recv_timeout(deadline) {
             Ok(MqttEvent::Connected) => return Ok(()),
-            Ok(MqttEvent::Disconnected) => bail!("baglanti koptu (TLS/cert hatasi?)"),
+            Ok(MqttEvent::Disconnected) => bail!("connection lost (TLS/cert error?)"),
             Ok(MqttEvent::Message { .. }) => continue,
-            Err(_) => bail!("baglanti zaman asimi (endpoint/policy/cert kontrol edin)"),
+            Err(_) => bail!("connection timeout (check endpoint/policy/certs)"),
         }
     }
 }
 
-/// `accepted` veya `rejected` yaniti gelene kadar bekler.
-/// `marker` beklenen topic'in ortak parcasi (accepted/rejected ayrimini yapar).
+/// Waits until `accepted` or `rejected` response arrives.
+/// `marker` is a common part of the expected topic (distinguishes accepted/rejected).
 fn wait_response(events: &std::sync::mpsc::Receiver<MqttEvent>, marker: &str) -> Result<Value> {
     let deadline = Duration::from_secs(30);
     loop {
         match events.recv_timeout(deadline) {
             Ok(MqttEvent::Message { topic, data }) if topic.contains(marker) => {
                 let parsed: Value = serde_json::from_slice(&data)
-                    .with_context(|| format!("yanit JSON parse edilemedi: {topic}"))?;
+                    .with_context(|| format!("failed to parse JSON response: {topic}"))?;
                 if topic.ends_with("/rejected") {
-                    bail!("provisioning REDDEDILDI: {parsed}");
+                    bail!("provisioning REJECTED: {parsed}");
                 }
                 return Ok(parsed);
             }
-            Ok(MqttEvent::Message { .. }) => continue, // baska topic
+            Ok(MqttEvent::Message { .. }) => continue, // other topic
             Ok(MqttEvent::Connected) => continue,
-            Ok(MqttEvent::Disconnected) => bail!("yanit beklerken baglanti koptu"),
-            Err(_) => bail!("yanit zaman asimi ({marker})"),
+            Ok(MqttEvent::Disconnected) => bail!("connection lost while waiting for response"),
+            Err(_) => bail!("response timeout ({marker})"),
         }
     }
 }

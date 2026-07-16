@@ -1,5 +1,5 @@
-//! Normal calisma: cihaz kendi (provisioned) kimligiyle IoT Core'a baglanip
-//! arka planda MQTT olaylarini dinler.
+//! Normal operation: device connects to IoT Core with its own (provisioned) identity
+//! and listens to MQTT events in the background.
 
 use std::thread::sleep;
 use std::time::Duration;
@@ -10,16 +10,16 @@ use crate::config;
 use crate::device_id::{self, DeviceIdentity};
 use crate::mqtt_util::{self, MqttEvent};
 
-/// Cihaz kimligiyle baglanip sonsuz dinleme dongusune girer.
+/// Connects with device identity and enters infinite listening loop.
 pub fn run(id: &DeviceIdentity) -> Result<()> {
     log::info!(
-        "Sadece baglanti modu. thing={}",
+        "Connection-only mode. thing={}",
         id.thing_name
     );
 
     let mut session = mqtt_util::connect(
         &config::mqtt_url(),
-        &id.thing_name, // client_id == thingName (device policy boyle sinirliyor)
+        &id.thing_name, // client_id == thingName (device policy limits it this way)
         &mqtt_util::Creds {
             root_ca: device_id::root_ca_pem(),
             client_cert: &id.cert_pem,
@@ -27,22 +27,22 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
         },
     )?;
 
-    // Baglantiyi bekle.
+    // Wait for connection.
     loop {
         match session.events.recv_timeout(Duration::from_secs(30)) {
             Ok(MqttEvent::Connected) => break,
-            Ok(MqttEvent::Disconnected) => bail!("cihaz baglantisi koptu"),
+            Ok(MqttEvent::Disconnected) => bail!("device connection lost"),
             Ok(_) => continue,
-            Err(_) => bail!("cihaz baglanti zaman asimi"),
+            Err(_) => bail!("device connection timeout"),
         }
     }
-    log::info!("Cihaz kimligiyle baglanildi. Baglanti acik tutuluyor.");
+    log::info!("Connected with device identity. Connection kept open.");
 
     loop {
-        // Arka planda gelen olaylari ( or. disconnect) bosalt.
+        // Drain incoming events (e.g. disconnect) in the background.
         while let Ok(ev) = session.events.try_recv() {
             if matches!(ev, MqttEvent::Disconnected) {
-                log::warn!("baglanti koptu; esp-mqtt otomatik yeniden baglanacak.");
+                log::warn!("connection lost; esp-mqtt will reconnect automatically.");
             }
         }
 
@@ -50,9 +50,8 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
     }
 }
 
-/// Provisioning + calisma arasindaki gecis noktasi (ileride komut/OTA icin
-/// genisletilebilir).
+/// Transition point between provisioning + operation (can be extended for commands/OTA in the future).
 #[allow(dead_code)]
 pub fn context_note() -> &'static str {
-    "cmd/<thing>/* topic'leri device policy'de subscribe icin acik"
+    "cmd/<thing>/* topics are allowed for subscription in device policy"
 }

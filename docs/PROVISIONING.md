@@ -1,123 +1,103 @@
-# Zero-Touch Provisioning — mimari ve akis
+# Zero-Touch Provisioning — Architecture and Flow
 
-Yaklasim: **AWS IoT Fleet Provisioning by Claim**. Cihaz fabrikadan tum filo
-icin **ortak** bir "claim" (bootstrap) sertifikasiyla cikar. Ilk baglantida
-kendine ait **benzersiz** bir sertifika uretir; MAC + secret bir Lambda hook
-tarafindan DynamoDB'ye karsi dogrulanir. Onaylanirsa IoT Core cihaz icin
-`thing` + `certificate` + `policy` olusturur.
+Approach: **AWS IoT Fleet Provisioning by Claim**. The device leaves the factory with a **common** "claim" (bootstrap) certificate for the entire fleet. Upon first connection, it generates its own **unique** certificate; the MAC + secret are validated against DynamoDB by a Lambda hook. If approved, IoT Core creates the `thing` + `certificate` + `policy` for the device.
 
-## Bilesenler
+## Components
 
-| Katman | Bilesen | Rol |
+| Layer | Component | Role |
 | --- | --- | --- |
-| Cihaz | ESP32-S3-ETH (Rust) | claim ile baglanir, kendi kimligini alir, NVS'ye yazar |
-| AWS | IoT Core Fleet Provisioning template | thing/cert/policy'yi tanimlar |
-| AWS | Lambda pre-provisioning hook | MAC+secret'i DynamoDB'de dogrular (izin ver/reddet) |
-| AWS | DynamoDB `*-device-registry` | izinli cihaz kayitlari (MAC, secret, allowed) |
-| AWS | IoT Rule -> CloudWatch Logs | telemetriyi gozlemlemek icin |
+| Device | ESP32-S3-ETH (Rust) | Connects with claim, gets its own identity, writes to NVS |
+| AWS | IoT Core Fleet Provisioning template | Defines the thing/cert/policy |
+| AWS | Lambda pre-provisioning hook | Validates MAC+secret in DynamoDB (allow/deny) |
+| AWS | DynamoDB `*-device-registry` | Allowed device records (MAC, secret, allowed) |
+| AWS | IoT Rule -> CloudWatch Logs | For monitoring telemetry |
 
-## Akis diyagrami
+## Flow Diagram
 
 ```
   ESP32-S3                         AWS IoT Core                 Lambda        DynamoDB
      |                                  |                          |             |
      |-- TLS connect (CLAIM cert) ----->|                          |             |
      |-- pub $aws/certificates/create ->|                          |             |
-     |<- accepted {certPem,key,token} --|  (benzersiz cert uretir) |             |
+     |<- accepted {certPem,key,token} --|  (generates unique cert) |             |
      |                                  |                          |             |
      |-- pub .../provision {token,      |                          |             |
      |         SerialNumber,MacAddress, |-- pre-provisioning hook ->|             |
      |         Secret} ---------------->|                          |-- get MAC ->|
      |                                  |                          |<- secret ---|
      |                                  |<- allowProvisioning:true-|             |
-     |                                  | (thing+cert+policy olustu)             |
+     |                                  | (thing+cert+policy created)            |
      |<- accepted {thingName} ----------|                          |             |
-     |  (cert+key+thing NVS'ye yazilir) |                          |             |
+     |  (cert+key+thing written to NVS) |                          |             |
      |                                  |                          |             |
      |== reconnect (DEVICE cert) ======>|                          |             |
-     |-- pub dt/<thing>/data ---------->|  (IoT Rule -> CW Logs)   |             |
+     |                                  |                          |             |
 ```
 
-## Cihaz boot mantigi (`src/main.rs`)
+## Device Boot Logic (`src/main.rs`)
 
-1. **Ag**: once `eth::start(...)` — W5500'u esp_eth ile ayaga kaldir, link+DHCP
-   icin 10s bekle. Link/lease yoksa `wifi::start(...)` ile WiFi'ye dus
-   (`cfg.toml`). Not: Ethernet handle no-link durumunda bile CANLI tutulur
-   (drop edilirse SpiDriver::drop panikler; bkz. asagidaki tuzaklar).
-2. NVS'de kimlik var mi? (`DeviceStore::exists`)
-   - **Var** → `load()` → dogrudan telemetri.
-   - **Yok** → `provisioning::run()` → `save()` → telemetri.
-3. `telemetry::run(&id)` — cihaz kimligiyle baglan, periyodik publish.
+1. **Network**: First `eth::start(...)` — W5500 brings up via esp_eth, wait 10s for link+DHCP. If no link/lease, fallback to WiFi (`cfg.toml`) via `wifi::start(...)`. Note: Ethernet handle is kept ALIVE even in no-link condition (if dropped, SpiDriver::drop panics; see pitfalls below).
+2. Is there an identity in NVS? (`DeviceStore::exists`)
+   - **Yes** → `load()` → directly proceed to connection.
+   - **No** → `provisioning::run()` → `save()` → proceed to connection.
+3. `telemetry::run(&id)` — connect with device identity and keep the connection open.
 
-## Donanimda karsilasilan tuzaklar (cozuldu)
+## Hardware Pitfalls Encountered (Resolved)
 
-Bu PoC gercek ESP32-S3-ETH uzerinde dogrulandi; yol boyunca cozulen noktalar:
+This PoC was verified on actual ESP32-S3-ETH hardware; issues resolved along the way:
 
-| Belirti | Kok neden | Cozum |
+| Symptom | Root Cause | Solution |
 | --- | --- | --- |
-| `spi_master: txdata transfer > host maximum` | SPI bus DMA kapali (~64B limit), W5500 ~1.5KB frame gonderir | `SpiDriverConfig::new().dma(Dma::Auto(4096))` (`eth.rs`) |
-| WiFi'ye gecerken panik: `spi_bus_free().unwrap()` INVALID_STATE | No-link'te eth handle drop edilince esp_eth SPI cihazi hala bus'ta | Handle'i drop etme; `Net::Wifi { eth, .. }` icinde canli tut (`main.rs`) |
-| `memory allocation of ~1GB failed` (connect'te) | 5 adet `&str` argumani xtensa register sinirini asinca fat-pointer'lar yanlis okundu | Sertifikalari tek `Creds` struct referansinda gecir (`mqtt_util.rs`) |
-| Genel kararsizlik | TLS+MQTT+serde main task'ta, 8K stack az | `CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384` |
+| `spi_master: txdata transfer > host maximum` | SPI bus DMA off (~64B limit), W5500 sends ~1.5KB frame | `SpiDriverConfig::new().dma(Dma::Auto(4096))` (`eth.rs`) |
+| Panic when switching to WiFi: `spi_bus_free().unwrap()` INVALID_STATE | Dropping eth handle on no-link, but esp_eth SPI device is still on bus | Do not drop the handle; keep it alive inside `Net::Wifi { eth, .. }` (`main.rs`) |
+| `memory allocation of ~1GB failed` (on connect) | 5 `&str` arguments exceeded the register limit for fat-pointer arguments on xtensa, leading to incorrect reads | Pass certs within a single `Creds` struct reference (`mqtt_util.rs`) |
+| General instability | TLS+MQTT+serde in main task, 8K stack was too small | `CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384` |
 
-MAC notu: cihaz kimligi olarak `ESP_MAC_ETH` kullanilir; bu, eFuse taban
-MAC'inden turetilir (taban `..:4C` → ETH `..:4F`). Seed ederken cihazin ilk
-bootta logladigi MAC'i kullanin.
+MAC note: `ESP_MAC_ETH` is used as the device identity; this is derived from the eFuse base MAC (base `..:4C` → ETH `..:4F`). When seeding, use the MAC address logged by the device on its first boot.
 
-## MQTT topic'leri
+## MQTT Topics
 
-| Amac | Topic |
+| Purpose | Topic |
 | --- | --- |
-| Cert uret (istek) | `$aws/certificates/create/json` |
-| Cert uret (yanit) | `$aws/certificates/create/json/{accepted,rejected}` |
-| RegisterThing (istek) | `$aws/provisioning-templates/<template>/provision/json` |
-| RegisterThing (yanit) | `$aws/provisioning-templates/<template>/provision/json/{accepted,rejected}` |
-| Telemetri | `dt/<thingName>/data` |
-| Komut (device policy'de acik) | `cmd/<thingName>/*` |
+| Create Cert (request) | `$aws/certificates/create/json` |
+| Create Cert (response) | `$aws/certificates/create/json/{accepted,rejected}` |
+| RegisterThing (request) | `$aws/provisioning-templates/<template>/provision/json` |
+| RegisterThing (response) | `$aws/provisioning-templates/<template>/provision/json/{accepted,rejected}` |
+| Commands (allowed in device policy) | `cmd/<thingName>/*` |
 
-## Guvenlik modeli
+## Security Model
 
-- **Claim policy** (Terraform `iot.tf`): sadece `iot:Connect` + provisioning
-  topic'leri. Claim cert ile telemetri **gonderilemez**.
-- **Device policy**: politika degiskenleriyle her cihaz yalnizca **kendi**
-  `dt/<thingName>/*` ve `cmd/<thingName>/*` topic'lerine erisir; client_id =
-  thingName zorunlu.
-- **Lambda hook**: MAC kaydi yoksa / `allowed=false` / secret uyusmuyorsa
-  provisioning reddedilir. Sabit-zamanli secret karsilastirmasi kullanir.
+- **Claim policy** (Terraform `iot.tf`): only `iot:Connect` + provisioning topics. Telemetry **cannot** be sent with the claim cert.
+- **Device policy**: using policy variables, each device can only access its own `dt/<thingName>/*` and `cmd/<thingName>/*` topics; client_id = thingName is mandatory.
+- **Lambda hook**: provisioning is rejected if there is no MAC record, if `allowed=false`, or if the secret mismatches. Uses constant-time secret comparison.
 
-## ESP32-S3 guvenlik ozellikleri (PoC vs uretim)
+## ESP32-S3 Security Features (PoC vs Production)
 
-PoC seviyesinde (secilen): sertifikalar sifresiz NVS'de, eFuse **yakilmaz**.
-Uretime giderken:
+At the PoC level (chosen): certificates are in unencrypted NVS, eFuses are **not** burned.
+Going to production:
 
-- **Flash Encryption** + **Secure Boot v2**: NVS/flash'taki cert+key'i ve
-  firmware'i korur (eFuse yakma — geri alinamaz).
-- **DS (Digital Signature) peripheral**: cihaz private key'i eFuse'da sifreli
-  tutulur, RAM'e cikmadan TLS imzalama yapilir. `esp-idf` `esp_ds` API'si;
-  provisioning'de CreateCertificateFromCsr akisina gecilir (CSR'yi DS ile
-  imzalayip AWS'e gonderirsin), boylece private key hic cihazi terk etmez.
-- **Per-device secret**: PoC'de ortak; uretimde cihaz basina benzersiz ve
-  DS/eFuse ile korunmali.
+- **Flash Encryption** + **Secure Boot v2**: protects cert+key in NVS/flash and the firmware (burning eFuses — irreversible).
+- **DS (Digital Signature) peripheral**: device private key is kept encrypted in eFuse, TLS signing is performed without leaving RAM. Using `esp-idf` `esp_ds` API; the provisioning transitions to the `CreateCertificateFromCsr` flow (sign CSR with DS and send to AWS), so the private key never leaves the device.
+- **Per-device secret**: common in PoC; unique per device in production and protected by DS/eFuse.
 
-## Sorun giderme
+## Troubleshooting
 
-| Belirti | Olasi neden |
+| Symptom | Possible Cause |
 | --- | --- |
-| `netif up olmadi` | Ethernet kablosu yok / DHCP sunucusu yok |
-| `baglanti zaman asimi` (claim) | `MQTT_ENDPOINT` yanlis; claim cert/policy eksik; saat/TLS |
-| Provisioning `REDDEDILDI` | MAC DynamoDB'de yok / `allowed=false` / secret uyusmuyor |
-| `certificatePem yok` | buffer_size kucuk (kodda 4096) ya da JSON degil CBOR topic |
-| Telemetri yok ama provision OK | device policy topic prefix ile `config::TELEMETRY_TOPIC_PREFIX` farkli |
+| `netif did not come up` | No Ethernet cable connected / no DHCP server |
+| `connection timeout` (claim) | `MQTT_ENDPOINT` incorrect; claim cert/policy missing; time/TLS issues |
+| Provisioning `REJECTED` | MAC is not in DynamoDB / `allowed=false` / secret mismatch |
+| `certificatePem missing` | buffer_size is small (4096 in code) or JSON topic is not used (CBOR instead) |
+| Connection works, but no telemetry | Telemetry rule prefix and `config::TELEMETRY_TOPIC_PREFIX` differ (Note: telemetry loop has been removed, so this is no longer applicable) |
 
-Loglar: IoT tarafinda CloudWatch `/{project}/telemetry` ve
-`/aws/lambda/{project}-pre-provisioning-hook`. Cihaz tarafinda seri monitor.
+Logs: CloudWatch `/{project}/telemetry` and `/aws/lambda/{project}-pre-provisioning-hook` on the AWS side. Serial monitor on the device side.
 
-## Yeniden provisioning (test)
+## Re-provisioning (Test)
 
-Cihazi sifirdan provision ettirmek icin NVS'yi temizle:
+To provision the device from scratch, erase NVS:
 
 ```sh
-espflash erase-region 0x9000 0x6000   # nvs partition (varsayilan tablo)
-# veya tum flash:
+espflash erase-region 0x9000 0x6000   # NVS partition (default table)
+# or erase the entire flash:
 espflash erase-flash
 ```

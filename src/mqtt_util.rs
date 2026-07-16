@@ -1,10 +1,10 @@
-//! esp-idf-svc MQTT istemcisi icin ince sarmalayici: mutual-TLS istemci kurar
-//! ve olaylari (Connected / Disconnected / Message) bir mpsc kanalina aktarir.
+//! Thin wrapper for esp-idf-svc MQTT client: sets up mutual-TLS client
+//! and routes events (Connected / Disconnected / Message) to an mpsc channel.
 //!
-//! Not: MqttClientConfiguration sertifikalar icin `X509<'static>` ister — bu
-//! yuzden calisma zamaninda (NVS'den) gelen PEM'leri Box::leak ile 'static'a
-//! yukseltiyoruz. Bu kimlikler program boyu yasadigindan sizinti PoC'de sorun
-//! degil (cihaz tek kimlikle calisir).
+//! Note: MqttClientConfiguration expects `X509<'static>` for certificates —
+//! therefore, we upgrade runtime PEMs (from NVS) to 'static using Box::leak.
+//! Since these identities live for the duration of the program, this leak is not a problem
+//! in PoC (the device runs with a single identity).
 
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
@@ -15,7 +15,7 @@ use esp_idf_svc::mqtt::client::{
 };
 use esp_idf_svc::tls::X509;
 
-/// Callback'ten ana goreve aktarilan olaylar (veriler sahiplenilmis kopyalar).
+/// Events transferred from callback to main task (data are owned copies).
 #[derive(Debug)]
 pub enum MqttEvent {
     Connected,
@@ -23,22 +23,22 @@ pub enum MqttEvent {
     Message { topic: String, data: Vec<u8> },
 }
 
-/// Kurulan istemciyi ve olay kanalini birlikte tutar.
+/// Holds the established client and the event channel together.
 pub struct MqttSession {
     pub client: EspMqttClient<'static>,
     pub events: Receiver<MqttEvent>,
 }
 
-/// TLS kimlik bilgileri. Tek referans olarak gecirilir: connect'e 5 ayri &str
-/// gecmek xtensa'da fat-pointer argumanlarinin register sinirini asip yanlis
-/// okunmasina yol aciyordu; struct referansi bunu onler.
+/// TLS credentials. Passed as a single reference: passing 5 separate &str arguments
+/// was exceeding the register limit of fat-pointer arguments in xtensa, causing incorrect reads.
+/// A struct reference prevents this.
 pub struct Creds<'a> {
     pub root_ca: &'a str,
     pub client_cert: &'a str,
     pub private_key: &'a str,
 }
 
-/// PEM string'i (nul'suz olabilir) 'static X509'a yukseltir.
+/// Upgrades PEM string (possibly without null terminator) to 'static X509.
 fn static_x509(pem: &str) -> X509<'static> {
     let mut bytes = pem.as_bytes().to_vec();
     if bytes.last() != Some(&0) {
@@ -48,8 +48,8 @@ fn static_x509(pem: &str) -> X509<'static> {
     X509::pem_until_nul(leaked)
 }
 
-/// Verilen kimlikle IoT Core'a TLS uzerinden baglanan bir istemci kurar.
-/// Baglanti asenkron kurulur; cagiran `MqttEvent::Connected` beklemeli.
+/// Sets up a client connecting to IoT Core over TLS using the given identity.
+/// Connection is established asynchronously; caller should wait for `MqttEvent::Connected`.
 pub fn connect(url: &str, client_id: &str, creds: &Creds) -> Result<MqttSession> {
     let root_ca = creds.root_ca;
     let client_cert = creds.client_cert;
@@ -69,7 +69,7 @@ pub fn connect(url: &str, client_id: &str, creds: &Creds) -> Result<MqttSession>
         client_id: Some(client_id),
         protocol_version: Some(MqttProtocolVersion::V3_1_1),
         keep_alive_interval: Some(Duration::from_secs(60)),
-        // create/accepted yaniti (cert+key+token) 1KB'yi asar -> buffer buyutuldu.
+        // create/accepted response (cert+key+token) exceeds 1KB -> buffer size increased.
         buffer_size: 4096,
         out_buffer_size: 2048,
         server_certificate: Some(static_x509(root_ca)),
@@ -87,8 +87,8 @@ pub fn connect(url: &str, client_id: &str, creds: &Creds) -> Result<MqttSession>
                 let _ = tx.send(MqttEvent::Disconnected);
             }
             EventPayload::Received { topic, data, .. } => {
-                // topic yalnizca ilk chunk'ta gelir; buffer yeterince buyuk
-                // oldugundan mesajlar tek parca gelir.
+                // topic only comes in the first chunk; because buffer is large enough,
+                // messages arrive in a single chunk.
                 if let Some(t) = topic {
                     let _ = tx.send(MqttEvent::Message {
                         topic: t.to_string(),
@@ -99,7 +99,7 @@ pub fn connect(url: &str, client_id: &str, creds: &Creds) -> Result<MqttSession>
             _ => {}
         }
     })
-    .context("MQTT istemcisi kurulamadi")?;
+    .context("Failed to set up MQTT client")?;
 
     Ok(MqttSession { client, events: rx })
 }

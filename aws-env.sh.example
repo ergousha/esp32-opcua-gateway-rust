@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# AWS kimlik bilgilerini kabuga yukler. KULLANIM:
-#   cp aws-env.sh.example aws-env.sh   # sonra gercek degerleri doldur
-#   source ./aws-env.sh                # her yeni terminalde
+# Loads AWS credentials into the shell. USAGE:
+#   cp aws-env.sh.example aws-env.sh   # then fill in the real values
+#   source ./aws-env.sh                # in every new terminal
 #
-# UYARI: aws-env.sh GERCEK SIR icerir; .gitignore'da, ASLA commit'leme.
-# Access key konsoldan uretilir: IAM -> Users -> <user> -> Security credentials
-# -> Create access key (CLI). Sizarsa hemen deactivate/delete et.
+# WARNING: aws-env.sh contains ACTUAL SECRET; it is in .gitignore, NEVER commit it.
+# Access key is generated from the console: IAM -> Users -> <user> -> Security credentials
+# -> Create access key (CLI). If compromised, immediately deactivate/delete it.
 
 export AWS_ACCESS_KEY_ID="AKIA............"
 export AWS_SECRET_ACCESS_KEY="................................"
 export AWS_DEFAULT_REGION="eu-central-1"
 
-# Dogrula:
+# Verify:
 #   source ./aws-env.sh && aws sts get-caller-identity

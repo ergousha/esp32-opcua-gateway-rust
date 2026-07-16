@@ -1,29 +1,29 @@
 variable "aws_region" {
-  description = "AWS bolgesi (IoT Core desteklenen bir bolge secin)."
+  description = "AWS region (choose a region supported by IoT Core)."
   type        = string
   default     = "eu-central-1"
 }
 
 variable "project_name" {
-  description = "Kaynak isimlendirme icin prefix."
+  description = "Prefix for resource naming."
   type        = string
   default     = "esp32-ztp"
 }
 
 variable "provisioning_template_name" {
-  description = "Fleet Provisioning template adi. Firmware ile ayni olmali."
+  description = "Fleet Provisioning template name. Must match the firmware."
   type        = string
   default     = "esp32-s3-fleet-template"
 }
 
 variable "log_retention_days" {
-  description = "CloudWatch log saklama suresi (maliyet icin dusuk tutuldu)."
+  description = "CloudWatch log retention period (kept low for cost reasons)."
   type        = number
   default     = 7
 }
 
 variable "telemetry_topic_prefix" {
-  description = "Cihazlarin publish edecegi telemetri topic prefix'i."
+  description = "Telemetry topic prefix for devices to publish to."
   type        = string
   default     = "dt"
 }

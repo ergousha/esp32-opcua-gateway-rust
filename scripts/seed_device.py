@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""DynamoDB cihaz kayit registry'sine bir cihaz ekler/gunceller.
+"""Adds/updates a device in the DynamoDB device registry.
 
-Fleet Provisioning'de cihazin claim ile gonderdigi MAC + secret, Lambda
-pre-provisioning hook tarafindan bu tabloya karsi dogrulanir. Cihazi buraya
-eklemeden provisioning REDDEDILIR.
+During Fleet Provisioning, the MAC + secret sent by the device using the claim cert is validated
+against this table by the Lambda pre-provisioning hook. Provisioning will be REJECTED unless the
+device is added here.
 
-Kullanim:
+Usage:
     python3 seed_device.py --mac AA:BB:CC:DD:EE:FF --secret change-me-shared-secret
 
-MAC'i cihaz ilk bootta seri porta loglar ("Provisioning basliyor. MAC=...").
+The device logs its MAC address to the serial port on first boot ("Provisioning starting. MAC=...").
 
-Gerekli: boto3  (pip install boto3) ve gecerli AWS kimlik bilgileri.
+Required: boto3 (pip install boto3) and valid AWS credentials.
 """
 import argparse
 import sys
@@ -22,12 +22,12 @@ DEFAULT_TABLE = "esp32-ztp-device-registry"  # terraform project_name-device-reg
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="ESP32 cihazini DynamoDB registry'ye ekle")
-    p.add_argument("--mac", required=True, help="Cihaz MAC'i, or. AA:BB:CC:DD:EE:FF")
-    p.add_argument("--secret", required=True, help="Paylasilan secret (firmware ile ayni)")
-    p.add_argument("--table", default=DEFAULT_TABLE, help=f"DynamoDB tablo adi (varsayilan: {DEFAULT_TABLE})")
-    p.add_argument("--region", default="eu-central-1", help="AWS bolgesi")
-    p.add_argument("--allowed", default="true", choices=["true", "false"], help="Provisioning'e izin ver")
+    p = argparse.ArgumentParser(description="Add an ESP32 device to the DynamoDB registry")
+    p.add_argument("--mac", required=True, help="Device MAC, e.g. AA:BB:CC:DD:EE:FF")
+    p.add_argument("--secret", required=True, help="Shared secret (same as firmware)")
+    p.add_argument("--table", default=DEFAULT_TABLE, help=f"DynamoDB table name (default: {DEFAULT_TABLE})")
+    p.add_argument("--region", default="eu-central-1", help="AWS region")
+    p.add_argument("--allowed", default="true", choices=["true", "false"], help="Allow provisioning")
     args = p.parse_args()
 
     mac = args.mac.upper()
@@ -44,14 +44,14 @@ def main() -> int:
     try:
         table.put_item(Item=item)
     except NoCredentialsError:
-        print("HATA: AWS kimlik bilgisi yok. `aws configure --profile esp32-ztp` calistirin "
-              "ve `export AWS_PROFILE=esp32-ztp` yapin.", file=sys.stderr)
+        print("ERROR: AWS credentials not found. Please run `aws configure --profile esp32-ztp` "
+              "and set `export AWS_PROFILE=esp32-ztp`.", file=sys.stderr)
         return 1
     except ClientError as exc:
-        print(f"HATA: DynamoDB put_item basarisiz: {exc}", file=sys.stderr)
+        print(f"ERROR: DynamoDB put_item failed: {exc}", file=sys.stderr)
         return 1
 
-    print(f"OK: {mac} tabloya eklendi ({args.table}). allowed={item['allowed']}")
+    print(f"OK: {mac} added to table ({args.table}). allowed={item['allowed']}")
     return 0
 
 

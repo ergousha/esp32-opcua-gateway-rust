@@ -1,14 +1,14 @@
 """
 AWS IoT Fleet Provisioning - Pre-Provisioning Hook.
 
-Cihaz claim sertifikasiyla baglanip RegisterThing istegi gonderdiginde,
-IoT Core sertifika/thing OLUSTURMADAN ONCE bu Lambda'yi cagirir.
+When a device connects with the claim certificate and sends a RegisterThing request,
+IoT Core invokes this Lambda BEFORE creating the certificate and thing.
 
-Gorevi: cihazin gonderdigi MAC + secret'i DynamoDB'deki kayitla dogrulamak.
-- Kayit yoksa / secret uyusmuyor / allowed=false  -> provisioning REDDEDILIR.
-- Gecerliyse -> allowProvisioning=true doner ve thing attribute'lari set edilir.
+Its job is to validate the MAC + secret sent by the device against the registry record in DynamoDB.
+- If there is no record / secret mismatch / allowed=false -> provisioning is REJECTED.
+- If valid -> returns allowProvisioning=true and sets the thing attributes.
 
-Event ornegi (payloadVersion 2020-04-01):
+Event example (payloadVersion 2020-04-01):
 {
   "claimCertificateId": "...",
   "certificateId": "...",
@@ -35,7 +35,7 @@ TABLE_NAME = os.environ["DEVICE_TABLE"]
 _dynamodb = boto3.resource("dynamodb")
 _table = _dynamodb.Table(TABLE_NAME)
 
-# IoT Core hook cevabini ~5sn icinde bekler; deny durumunda net loglayin.
+# IoT Core expects the hook response within ~5 seconds; make sure to log deny conditions clearly.
 DENY = {"allowProvisioning": False}
 
 
@@ -45,40 +45,40 @@ def handler(event, context):
     secret = params.get("Secret")
     serial = params.get("SerialNumber")
 
-    logger.info("Pre-provisioning istegi: mac=%s serial=%s template=%s",
+    logger.info("Pre-provisioning request: mac=%s serial=%s template=%s",
                 mac, serial, event.get("templateName"))
 
     if not mac or not secret:
-        logger.warning("REDDEDILDI: MacAddress veya Secret parametresi eksik.")
+        logger.warning("REJECTED: MacAddress or Secret parameter missing.")
         return DENY
 
     try:
         resp = _table.get_item(Key={"mac_address": mac}, ConsistentRead=True)
     except ClientError as exc:
-        logger.error("DynamoDB get_item hatasi: %s", exc)
+        logger.error("DynamoDB get_item error: %s", exc)
         return DENY
 
     item = resp.get("Item")
     if not item:
-        logger.warning("REDDEDILDI: %s kaydi DynamoDB'de yok.", mac)
+        logger.warning("REJECTED: %s record does not exist in DynamoDB.", mac)
         return DENY
 
     if not item.get("allowed", False):
-        logger.warning("REDDEDILDI: %s allowed=false.", mac)
+        logger.warning("REJECTED: %s allowed=false.", mac)
         return DENY
 
-    # Sabit zamanli karsilastirma (secret kisa; timing riski dusuk ama iyi pratik).
+    # Constant time comparison (secret is short; timing risk is low but it is good practice).
     if not _constant_time_eq(str(item.get("secret", "")), str(secret)):
-        logger.warning("REDDEDILDI: %s secret uyusmuyor.", mac)
+        logger.warning("REJECTED: %s secret mismatch.", mac)
         return DENY
 
-    # (Opsiyonel) tek seferlik provisioning: zaten provisioned ise reddet.
-    # PoC'de yeniden provisioning'e izin vermek icin bu blok yorumda.
+    # (Optional) one-time provisioning: reject if already provisioned.
+    # This block is commented out in PoC to allow re-provisioning.
     # if item.get("provisioned", False):
-    #     logger.warning("REDDEDILDI: %s zaten provisioned.", mac)
+    #     logger.warning("REJECTED: %s already provisioned.", mac)
     #     return DENY
 
-    # Kaydi "provisioned" olarak isaretle (best-effort; basarisiz olsa da izin ver).
+    # Mark the record as "provisioned" (best-effort; allow even if this update fails).
     try:
         _table.update_item(
             Key={"mac_address": mac},
@@ -86,12 +86,12 @@ def handler(event, context):
             ExpressionAttributeValues={":t": True, ":s": serial or mac},
         )
     except ClientError as exc:
-        logger.error("provisioned flag guncellenemedi (devam ediliyor): %s", exc)
+        logger.error("Failed to update provisioned flag (continuing anyway): %s", exc)
 
-    logger.info("ONAYLANDI: %s icin provisioning'e izin verildi.", mac)
+    logger.info("APPROVED: provisioning allowed for %s.", mac)
     return {
         "allowProvisioning": True,
-        # Template'e ekstra/override parametre gecebilirsiniz:
+        # You can pass extra/override parameters to the template:
         "parameterOverrides": {
             "MacAddress": mac,
         },

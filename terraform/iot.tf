@@ -3,10 +3,10 @@
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# 1) CLAIM (bootstrap) sertifikasi.
-#    Tum cihazlarin fabrikadan cikarken tasidigi ORTAK sertifika.
-#    Sadece provisioning MQTT topic'lerine erisebilir; telemetri gonderemez.
-#    active=true + csr yok => AWS keypair uretir, private_key output'ta doner.
+# 1) CLAIM (bootstrap) certificate.
+#    COMMON certificate carried by all devices leaving the factory.
+#    Can only access provisioning MQTT topics; cannot send telemetry.
+#    active=true + no csr => AWS generates a keypair, private_key is returned in outputs.
 # ---------------------------------------------------------------------------
 resource "aws_iot_certificate" "claim" {
   active = true
@@ -52,9 +52,9 @@ resource "aws_iot_policy_attachment" "claim" {
 }
 
 # ---------------------------------------------------------------------------
-# 2) CIHAZ (device) politikasi.
-#    Provisioning template bunu her cihazin benzersiz sertifikasina baglar.
-#    Politika degiskenleriyle her cihaz yalnizca KENDI topic'lerine erisir.
+# 2) DEVICE policy.
+#    Provisioning template binds this to each device's unique certificate.
+#    Using policy variables, each device can only access its OWN topics.
 # ---------------------------------------------------------------------------
 resource "aws_iot_policy" "device" {
   name = "${var.project_name}-device-policy"
@@ -66,7 +66,7 @@ resource "aws_iot_policy" "device" {
         Sid    = "Connect"
         Effect = "Allow"
         Action = "iot:Connect"
-        # ClientId, thing adiyla ayni olmali (firmware boyle baglanir).
+        # ClientId must be the same as thing name (this is how firmware connects).
         Resource = "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:client/$${iot:Connection.Thing.ThingName}"
       },
       {
@@ -99,8 +99,8 @@ resource "aws_iot_policy" "device" {
 
 # ---------------------------------------------------------------------------
 # 3) Fleet Provisioning Template.
-#    RegisterThing cagrisinda hangi thing/cert/policy'nin olusacagini tanimlar.
-#    pre_provisioning_hook: her istekte Lambda dogrulamasi zorunlu kilinir.
+#    Defines which thing/cert/policy will be created in the RegisterThing call.
+#    pre_provisioning_hook: Lambda validation is required on each request.
 # ---------------------------------------------------------------------------
 resource "aws_iot_provisioning_template" "fleet" {
   name                  = var.provisioning_template_name
@@ -117,7 +117,7 @@ resource "aws_iot_provisioning_template" "fleet" {
     Parameters = {
       SerialNumber = { Type = "String" }
       MacAddress   = { Type = "String" }
-      # Secret hook'a gider ama thing kaynaginda kullanilmaz.
+      # Secret goes to the hook but is not used in the thing resource.
       Secret                      = { Type = "String" }
       "AWS::IoT::Certificate::Id" = { Type = "String" }
     }
@@ -154,7 +154,7 @@ resource "aws_iot_provisioning_template" "fleet" {
     }
   })
 
-  # Hook resource-policy'si template'ten once hazir olmali.
+  # Hook resource-policy must be ready before the template.
   depends_on = [
     aws_lambda_permission.allow_iot,
     aws_iam_role_policy_attachment.provisioning,
@@ -162,8 +162,8 @@ resource "aws_iot_provisioning_template" "fleet" {
 }
 
 # ---------------------------------------------------------------------------
-# 4) (Opsiyonel) Telemetriyi CloudWatch Logs'a dusuren basit bir IoT Rule.
-#    PoC'de cihazin gercekten publish ettigini gormek icin faydali.
+# 4) (Optional) Simple IoT Rule to route telemetry to CloudWatch Logs.
+#    Useful to see that the device actually publishes in PoC.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_log_group" "telemetry" {
   name              = "/${var.project_name}/telemetry"

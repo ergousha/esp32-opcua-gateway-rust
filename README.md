@@ -131,9 +131,9 @@ and needs a real terminal with a TTY attached — it fails with "Failed to
 initialize input reader" if run from a script or a non-interactive shell.
 
 With an Ethernet cable connected, expect the serial log to show the W5500
-coming up and a DHCP lease (`Ethernet hazir. IP: ...`), then — on first boot —
+coming up and a DHCP lease (`Ethernet ready. IP: ...`), then — on first boot —
 the provisioning flow (`CreateKeysAndCertificate` → `RegisterThing` →
-`Provisioning ONAYLANDI. thingName=...`), and finally periodic
-`telemetri gonderildi seq=...` lines. On subsequent boots it logs
-`Kayitli cihaz kimligi bulundu; provisioning atlaniyor.` and goes straight to
-telemetry. See [`docs/PROVISIONING.md`](docs/PROVISIONING.md) for troubleshooting.
+`Provisioning APPROVED. thingName=...`), and finally a message indicating
+it connected and keeps the connection open. On subsequent boots it logs
+`Registered device identity found; skipping provisioning.` and goes straight to
+the listening loop. See [`docs/PROVISIONING.md`](docs/PROVISIONING.md) for troubleshooting.

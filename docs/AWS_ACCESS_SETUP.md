@@ -1,11 +1,10 @@
-# AWS hesap erisimi + Terraform kurulumu
+# AWS Account Access + Terraform Deployment
 
-Bu rehber, PoC'yi deploy edebilmen icin **AWS'e nasil erisecegini** ve
-**Terraform'u nasil calistiracagini** adim adim anlatir. Sirasiyla ilerle.
+This guide explains step-by-step **how to access AWS** and **how to run Terraform** to deploy the PoC. Proceed in order.
 
 ---
 
-## 1. Gerekli araclar
+## 1. Required Tools
 
 ```sh
 # macOS (brew)
@@ -14,29 +13,23 @@ terraform version   # >= 1.5
 aws --version       # v2
 ```
 
-Ayrica Lambda paketi icin `python3` (paket zip'i Terraform `archive_provider`
-ile otomatik olusturulur; ekstra bir sey gerekmez).
+Additionally, `python3` is required for packaging the Lambda (the zip package is automatically created via the Terraform `archive_provider`; no extra steps are required).
 
 ---
 
-## 2. AWS hesabina erisim (kisisel hesap — IAM user access key)
+## 2. AWS Account Access (Personal Account — IAM User Access Key)
 
-Kisisel AWS hesabini kullaniyorsun. **Root** kullanicisiyla gunluk is yapma;
-onun yerine bir **IAM user** olustur ve onun access key'iyle calis.
+You are using a personal AWS account. Do not do daily work with the **Root** user; instead, create an **IAM user** and work with its access key.
 
-### 2.1 IAM user olustur (bir kez, konsoldan)
+### 2.1 Create an IAM User (Once, from the Console)
 
-1. AWS Console → **IAM** → **Users** → **Create user** (or. `esp32-ztp-admin`).
-2. Yetki: PoC icin **AdministratorAccess** managed policy'sini ekle (en kolayi;
-   daraltilmis set icin bkz. asagisi).
-3. Kullanici olustuktan sonra → **Security credentials** → **Create access key**
-   → tip olarak **Command Line Interface (CLI)** sec → cikan
-   **Access key ID** + **Secret access key** ikilisini kaydet (secret bir daha
-   gosterilmez).
+1. AWS Console → **IAM** → **Users** → **Create user** (e.g., `esp32-ztp-admin`).
+2. Permissions: Add the **AdministratorAccess** managed policy for the PoC (simplest approach; see below for a restricted set).
+3. Once the user is created → **Security credentials** → **Create access key** → select **Command Line Interface (CLI)** as the type → save the resulting **Access key ID** + **Secret access key** pair (the secret will not be displayed again).
 
-> Root hesapta MFA acik olsun; IAM user'da da MFA onerilir.
+> MFA should be enabled on the root account; MFA is also recommended for the IAM user.
 
-### 2.2 CLI'yi yapilandir
+### 2.2 Configure the CLI
 
 ```sh
 aws configure --profile esp32-ztp
@@ -46,83 +39,75 @@ aws configure --profile esp32-ztp
 # Default output format:  json
 ```
 
-Her terminalde profili sec ve kimligi dogrula:
+Select the profile and verify the identity in each terminal:
 
 ```sh
 export AWS_PROFILE=esp32-ztp
-aws sts get-caller-identity   # arn'de olusturdugun IAM user gorunmeli
+aws sts get-caller-identity   # the created IAM user should appear in the ARN
 ```
 
-> Kimlik bilgileri `~/.aws/credentials` altinda tutulur; bu dosyayi asla
-> commit'leme. Access key sizarsa konsoldan hemen deactivate/delete et.
+> Credentials are kept under `~/.aws/credentials`; never commit this file. If an access key leaks, deactivate/delete it from the console immediately.
 
-**Alternatif — env dosyasi:** `aws configure` yerine kimlik bilgilerini kabuga
-env degiskeniyle de yukleyebilirsin. Repo koke `aws-env.sh.example` sablonu
-konuldu:
+**Alternative — Env File:** Instead of `aws configure`, you can load credentials into the shell using env variables. An `aws-env.sh.example` template is provided in the repository root:
 
 ```sh
-cp aws-env.sh.example aws-env.sh   # gercek access key/secret'i doldur
-source ./aws-env.sh                # her yeni terminalde
-aws sts get-caller-identity        # dogrula
+cp aws-env.sh.example aws-env.sh   # fill in actual access key/secret
+source ./aws-env.sh                # in every new terminal
+aws sts get-caller-identity        # verify
 ```
 
-`aws-env.sh` `.gitignore`'da — gercek sirri icerir, commit'lenmez.
+`aws-env.sh` is in `.gitignore` — it contains the actual secret, so it is not committed.
 
-### Gereken IAM izinleri
+### Required IAM Permissions
 
-Terraform su servislerde kaynak olusturur; IAM user'in bunlara yetkili olmali
-(PoC icin `AdministratorAccess` en kolayi, ama asagidaki daraltilmis set de
-yeter):
+Terraform creates resources in these services; your IAM user must be authorized for them (for PoC, `AdministratorAccess` is the easiest, but the restricted set below is also sufficient):
 
 - `iot:*` (Fleet Provisioning template, policy, certificate, topic rule)
-- `dynamodb:*` (tablo)
-- `lambda:*` (hook fonksiyonu)
-- `iam:*` (rol/policy — Terraform rol yaratir; `iam:PassRole` sart)
-- `logs:*` (CloudWatch log gruplari)
+- `dynamodb:*` (table)
+- `lambda:*` (hook function)
+- `iam:*` (role/policy — Terraform creates roles; `iam:PassRole` is required)
+- `logs:*` (CloudWatch log groups)
 
 ---
 
-## 3. (Opsiyonel ama onerilen) Uzak Terraform state
+## 3. (Optional but Recommended) Remote Terraform State
 
-PoC icin local state yeterli. Ekip/tekrarlanabilirlik icin S3 backend:
+A local state is sufficient for PoC. For teams/repeatability, S3 backend is used:
 
 ```sh
-# Bir kez: state bucket olustur (versiyonlama + sifreleme acik)
-aws s3api create-bucket --bucket <sirket>-esp32-ztp-tfstate \
+# Once: create the state bucket (versioning + encryption enabled)
+aws s3api create-bucket --bucket <company>-esp32-ztp-tfstate \
   --region eu-central-1 --create-bucket-configuration LocationConstraint=eu-central-1
-aws s3api put-bucket-versioning --bucket <sirket>-esp32-ztp-tfstate \
+aws s3api put-bucket-versioning --bucket <company>-esp32-ztp-tfstate \
   --versioning-configuration Status=Enabled
-aws s3api put-bucket-encryption --bucket <sirket>-esp32-ztp-tfstate \
+aws s3api put-bucket-encryption --bucket <company>-esp32-ztp-tfstate \
   --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
 ```
 
-Sonra `terraform/versions.tf` icindeki `backend "s3"` blogunu ac (bucket adini
-yaz) ve `terraform init -migrate-state` calistir. Kilit icin modern Terraform'da
-`use_lockfile = true` (S3 native lock) yeterli — ayri DynamoDB lock tablosu
-gerekmez.
+Then uncomment the `backend "s3"` block in `terraform/versions.tf` (write the bucket name) and run `terraform init -migrate-state`. For locking in modern Terraform, `use_lockfile = true` (S3 native lock) is sufficient — no separate DynamoDB lock table is required.
 
 ---
 
-## 4. Terraform ile deploy
+## 4. Deploy with Terraform
 
 ```sh
 cd terraform
-cp terraform.tfvars.example terraform.tfvars   # gerekiyorsa duzenle (region vb.)
+cp terraform.tfvars.example terraform.tfvars   # edit if necessary (region, etc.)
 
 terraform init
-terraform plan     # ne olusacagini incele
-terraform apply    # onayla
+terraform plan     # examine what will be created
+terraform apply    # approve
 ```
 
-Cikan onemli output'lar:
+Important outputs produced:
 
 ```sh
 terraform output iot_endpoint                # firmware config::MQTT_ENDPOINT
 terraform output provisioning_template_name  # firmware config::PROVISIONING_TEMPLATE
-terraform output dynamodb_table              # seed script tablo adi
+terraform output dynamodb_table              # seed script table name
 ```
 
-Claim sertifikalarini firmware'e cikar:
+Extract claim certificates into firmware:
 
 ```sh
 terraform output -raw claim_certificate_pem > ../certs/claim.crt.pem
@@ -131,30 +116,26 @@ terraform output -raw claim_private_key     > ../certs/claim.private.key
 
 ---
 
-## 5. Maliyet
+## 5. Cost
 
-Hepsi serverless + on-demand; **bosta ~0 USD**:
+All are serverless + on-demand; **~0 USD when idle**:
 
-| Servis | Model | PoC maliyeti |
+| Service | Model | PoC Cost |
 | --- | --- | --- |
-| IoT Core | mesaj/baglanti basina | binlerce mesaj = birkac cent |
-| DynamoDB | PAY_PER_REQUEST | okuma/yazma basina; PoC'de ihmal edilebilir |
-| Lambda | istek + GB-sn | provisioning basina 1 kisa cagri; free tier |
-| CloudWatch Logs | GB + saklama | 7 gun retention; minimal |
+| IoT Core | per message/connection | thousands of messages = a few cents |
+| DynamoDB | PAY_PER_REQUEST | per read/write; negligible in PoC |
+| Lambda | request + GB-sec | 1 short invocation per provisioning; free tier |
+| CloudWatch Logs | GB + storage | 7-day retention; minimal |
 
-> Ilk provisioning'te AWS bir cihaz sertifikasi uretir; sertifikanin kendisi
-> ucretsizdir. Asil ucret MQTT mesaj hacmine baglidir.
+> On first provisioning, AWS generates a device certificate; the certificate itself is free. The actual fee depends on the MQTT message volume.
 
 ---
 
-## 6. Temizlik
+## 6. Teardown
 
 ```sh
 cd terraform
 terraform destroy
 ```
 
-> Not: `terraform destroy` provisioning ile **cihazlar tarafindan sonradan
-> uretilen** sertifika/thing'leri silmez (bunlari Terraform yonetmez). Onlari
-> IoT Core konsolundan ya da `aws iot delete-thing` / `delete-certificate` ile
-> temizleyin. Claim sertifikasi ve template Terraform tarafindan silinir.
+> Note: `terraform destroy` does not delete certificates/things **later created by the devices** via provisioning (Terraform does not manage them). Clean them up from the IoT Core console or with `aws iot delete-thing` / `delete-certificate`. The claim certificate and template are deleted by Terraform.
