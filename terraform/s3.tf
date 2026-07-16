@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 
 resource "aws_s3_bucket" "firmware" {
-  bucket_prefix = "${var.project_name}-firmware-"
+  bucket = "${var.project_name}-firmware-${data.aws_caller_identity.current.account_id}"
 }
 
 resource "aws_s3_bucket_public_access_block" "firmware" {
