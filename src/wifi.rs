@@ -6,9 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::wifi::{
-    AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi,
-};
+use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 
 use crate::config;
 
@@ -38,8 +36,12 @@ pub fn start<'d>(
     };
 
     wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-        ssid: ssid.try_into().map_err(|_| anyhow!("SSID exceeds 32 characters"))?,
-        password: psk.try_into().map_err(|_| anyhow!("PSK exceeds 64 characters"))?,
+        ssid: ssid
+            .try_into()
+            .map_err(|_| anyhow!("SSID exceeds 32 characters"))?,
+        password: psk
+            .try_into()
+            .map_err(|_| anyhow!("PSK exceeds 64 characters"))?,
         auth_method,
         ..Default::default()
     }))?;

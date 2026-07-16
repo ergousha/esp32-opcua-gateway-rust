@@ -109,7 +109,10 @@ pub fn mac_addr() -> (String, String) {
     let mut mac = [0u8; 6];
     // ESP_MAC_ETH = 3 (MAC derived for the Ethernet interface).
     unsafe {
-        esp_read_mac(mac.as_mut_ptr(), esp_idf_svc::sys::esp_mac_type_t_ESP_MAC_ETH);
+        esp_read_mac(
+            mac.as_mut_ptr(),
+            esp_idf_svc::sys::esp_mac_type_t_ESP_MAC_ETH,
+        );
     }
     let colon = format!(
         "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",

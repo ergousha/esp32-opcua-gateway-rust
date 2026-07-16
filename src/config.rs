@@ -25,8 +25,6 @@ pub const PROVISIONING_TEMPLATE: &str = "esp32-s3-fleet-template";
 /// protected with ESP32-S3 DS peripheral.
 pub const DEVICE_SECRET: &str = "change-me-shared-secret";
 
-
-
 /// MQTT connection URL (mutual TLS, port 8883).
 pub fn mqtt_url() -> String {
     format!("mqtts://{MQTT_ENDPOINT}:8883")

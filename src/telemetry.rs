@@ -13,10 +13,7 @@ use serde_json::Value;
 
 /// Connects with device identity and enters infinite listening loop.
 pub fn run(id: &DeviceIdentity) -> Result<()> {
-    log::info!(
-        "Connection-only mode. thing={}",
-        id.thing_name
-    );
+    log::info!("Connection-only mode. thing={}", id.thing_name);
 
     let mut session = mqtt_util::connect(
         &config::mqtt_url(),
@@ -57,7 +54,7 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
     }
 
     log::info!("Subscribed to AWS IoT Jobs topics.");
-    
+
     // Request pending jobs right away
     let _ = session.client.publish(&get_topic, QOS1, false, b"{}");
 
@@ -75,26 +72,54 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
                     } else if topic == accepted_topic {
                         if let Ok(json) = serde_json::from_slice::<Value>(&data) {
                             if let Some(execution) = json.get("execution") {
-                                if let Some(job_id) = execution.get("jobId").and_then(|v| v.as_str()) {
+                                if let Some(job_id) =
+                                    execution.get("jobId").and_then(|v| v.as_str())
+                                {
                                     if let Some(doc) = execution.get("jobDocument") {
-                                        if doc.get("operation").and_then(|v| v.as_str()) == Some("firmware_update") {
-                                            if let Some(url) = doc.get("download_url").and_then(|v| v.as_str()) {
+                                        if doc.get("operation").and_then(|v| v.as_str())
+                                            == Some("firmware_update")
+                                        {
+                                            if let Some(url) =
+                                                doc.get("download_url").and_then(|v| v.as_str())
+                                            {
                                                 log::info!("Starting OTA job {}", job_id);
-                                                let update_topic = format!("$aws/things/{}/jobs/{}/update", id.thing_name, job_id);
-                                                
+                                                let update_topic = format!(
+                                                    "$aws/things/{}/jobs/{}/update",
+                                                    id.thing_name, job_id
+                                                );
+
                                                 // Report IN_PROGRESS
-                                                let _ = session.client.publish(&update_topic, QOS1, false, br#"{"status":"IN_PROGRESS"}"#);
-                                                
+                                                let _ = session.client.publish(
+                                                    &update_topic,
+                                                    QOS1,
+                                                    false,
+                                                    br#"{"status":"IN_PROGRESS"}"#,
+                                                );
+
                                                 match crate::ota::perform_ota(url) {
                                                     Ok(_) => {
-                                                        log::info!("Reporting SUCCEEDED and rebooting...");
-                                                        let _ = session.client.publish(&update_topic, QOS1, false, br#"{"status":"SUCCEEDED"}"#);
+                                                        log::info!(
+                                                            "Reporting SUCCEEDED and rebooting..."
+                                                        );
+                                                        let _ = session.client.publish(
+                                                            &update_topic,
+                                                            QOS1,
+                                                            false,
+                                                            br#"{"status":"SUCCEEDED"}"#,
+                                                        );
                                                         sleep(Duration::from_millis(1500));
-                                                        unsafe { esp_idf_svc::sys::esp_restart(); }
+                                                        unsafe {
+                                                            esp_idf_svc::sys::esp_restart();
+                                                        }
                                                     }
                                                     Err(e) => {
                                                         log::error!("OTA failed: {}", e);
-                                                        let _ = session.client.publish(&update_topic, QOS1, false, br#"{"status":"FAILED"}"#);
+                                                        let _ = session.client.publish(
+                                                            &update_topic,
+                                                            QOS1,
+                                                            false,
+                                                            br#"{"status":"FAILED"}"#,
+                                                        );
                                                     }
                                                 }
                                             }
