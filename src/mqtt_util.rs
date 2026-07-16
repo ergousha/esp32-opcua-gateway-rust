@@ -86,15 +86,13 @@ pub fn connect(url: &str, client_id: &str, creds: &Creds) -> Result<MqttSession>
             EventPayload::Disconnected => {
                 let _ = tx.send(MqttEvent::Disconnected);
             }
-            EventPayload::Received { topic, data, .. } => {
+            EventPayload::Received { topic: Some(t), data, .. } => {
                 // topic only comes in the first chunk; because buffer is large enough,
                 // messages arrive in a single chunk.
-                if let Some(t) = topic {
-                    let _ = tx.send(MqttEvent::Message {
-                        topic: t.to_string(),
-                        data: data.to_vec(),
-                    });
-                }
+                let _ = tx.send(MqttEvent::Message {
+                    topic: t.to_string(),
+                    data: data.to_vec(),
+                });
             }
             _ => {}
         }
