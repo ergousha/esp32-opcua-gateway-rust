@@ -6,27 +6,29 @@ This directory contains GitHub-specific configurations for automated workflows a
 
 ### Workflows (`.github/workflows/`)
 
-#### `esp32-build.yml`
-CI pipeline for the firmware. This is a single, bare-metal `no_std` crate
-(esp-hal, `xtensa-esp32s3-none-elf`, no ESP-IDF) rather than a workspace with
-a separate host-testable crate, so every job needs the espup-installed `esp`
-toolchain — even `cargo check`/`clippy`/`doc` compile target-specific
-register/HAL code that only exists for the Xtensa target.
+#### `ci.yml`
+CI pipeline for the firmware. This is a single ESP-IDF-based `std` crate rather
+than a workspace with a separate host-testable crate, so `clippy` and `doc`
+need the espup-installed `esp` toolchain to compile target-specific code.
+- **Path check**: Uses the pull request files API before checking out the code
 - **Build**: Release build verification
-- **Cargo check**: Verify the crate compiles
 - **Rustfmt**: Enforce code formatting
 - **Clippy**: Linting and best practices
 - **Documentation**: Check doc comments and build docs
-- **Check Binary Size**: Reports size via cargo-bloat (non-fatal)
 
-Triggers on: `push` to main, `pull_request` to main
+Triggers on: every `pull_request` to main. One `Firmware CI` job runs all checks
+on a shared runner when firmware source or build inputs change. For unrelated
+changes it stops after the path check, allowing the required status to resolve
+without a checkout or toolchain installation. New commits cancel older PR runs.
 
 #### `security-audit.yml`
 Security vulnerability scanning:
 - Uses `cargo-audit` to check dependencies against the RustSec advisory database
 - Scheduled weekly on Mondays
 
-Triggers on: `push` to main, `pull_request` to main, weekly schedule
+Triggers on: pushes and pull requests to main when `Cargo.toml`, `Cargo.lock`, or
+the audit workflow changes, plus the weekly schedule. Unrelated changes do not
+start a runner, and new commits cancel older runs.
 
 #### `zizmor.yml`
 Static analysis of the workflow files themselves (`.github/workflows/`), to
@@ -42,12 +44,12 @@ Triggers on: daily schedule
 
 #### `release.yml`
 Automated release creation:
-- Verifies the tag matches `Cargo.toml`'s `version` field before releasing
-- Creates GitHub releases from git tags
-- Generates changelog from commit history
-- Triggered when pushing version tags (v*.*.*)
+- Builds the ESP32-S3 firmware and creates a commit-specific GitHub release
+- Uploads the firmware image to S3 to trigger OTA delivery
+- Skips documentation, Terraform, scripts, and other non-firmware changes
 
-Triggers on: push tags matching `v*.*.*`
+Triggers on: pushes to main when firmware source, build inputs, or this workflow
+change
 
 ### Automation
 
@@ -81,12 +83,7 @@ Configure on GitHub via **Settings → Branches → Branch protection rules**:
 1. Require a pull request before merging:
    - ✅ Require approvals (1 minimum)
    - ✅ Require status checks to pass before merging:
-     - `Build for ESP32-S3`
-     - `Cargo check`
-     - `Rustfmt`
-     - `Clippy`
-     - `Documentation`
-     - `security_audit (Security Audit)`
+       - `Firmware CI`
    - ✅ Require branches to be up to date before merging
    - ✅ Require code reviews before merging
    - ✅ Require approval of the most recent reviewable push
@@ -130,11 +127,11 @@ Configure on GitHub via **Settings → Branches → Branch protection rules**:
 
 | Workflow | Push | PR | Schedule | Tag |
 |----------|------|----|-----------|----|
-| esp32-build.yml | ✅ | ✅ | - | - |
-| security-audit.yml | ✅ | ✅ | Weekly | - |
+| ci.yml | - | ✅ (firmware steps conditional) | - | - |
+| security-audit.yml | ✅ (dependency paths) | ✅ (dependency paths) | Weekly | - |
 | zizmor.yml | ✅ (workflows only) | ✅ (workflows only) | - | - |
 | stale.yml | - | - | Daily | - |
-| release.yml | - | - | - | ✅ |
+| release.yml | ✅ (firmware and workflow paths) | - | - | - |
 
 ## Local Development
 
@@ -166,23 +163,20 @@ PRs are labeled with `dependencies` tag and assigned to `eakin`.
 ## Security Scanning
 
 - Runs weekly security audits via `cargo-audit`
-- Also checks on all PRs and pushes
-- Blocks merging if vulnerabilities are found
+- Also checks pushes and pull requests that change Cargo dependency manifests
 
 ## Release Process
 
-To create a release:
+Configure the release workflow after applying the Terraform stack:
 
 ```bash
-# Tag a new version
-git tag -a v1.0.0 -m "Release 1.0.0"
-git push origin v1.0.0
+gh variable set AWS_ROLE_ARN --body "$(terraform -chdir=terraform output -raw github_actions_role_arn)"
+gh variable set AWS_FIRMWARE_BUCKET --body "$(terraform -chdir=terraform output -raw firmware_bucket_name)"
 ```
 
-GitHub Actions will automatically:
-- Verify the tag matches `Cargo.toml`'s version
-- Create a GitHub release
-- Generate changelog from commits
+Merging a firmware-related change to `main` automatically builds the firmware,
+creates a commit-specific GitHub release, and uploads the image to S3. Changes
+outside the firmware paths do not create a release.
 
 ## Maintenance
 

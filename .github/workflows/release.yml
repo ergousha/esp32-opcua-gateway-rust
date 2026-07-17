@@ -3,6 +3,17 @@ name: ESP32 Release
 on:
   push:
     branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - '.cargo/**'
+      - 'rust-toolchain.toml'
+      - 'sdkconfig.defaults'
+      - 'partitions.csv'
+      - 'certs/AmazonRootCA1.pem'
+      - '.github/workflows/release.yml'
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,6 +31,16 @@ jobs:
       contents: write # Required to create GitHub Releases
       id-token: write # Required for AWS OIDC authentication
     steps:
+      - name: Verify release configuration
+        env:
+          AWS_FIRMWARE_BUCKET: ${{ vars.AWS_FIRMWARE_BUCKET }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+        run: |
+          if [[ -z "$AWS_ROLE_ARN" || -z "$AWS_FIRMWARE_BUCKET" ]]; then
+            echo "::error::Set the AWS_ROLE_ARN and AWS_FIRMWARE_BUCKET repository variables."
+            exit 1
+          fi
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
@@ -73,10 +94,12 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
         with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/esp32-ztp-github-actions-role
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: eu-central-1
 
       - name: Upload Firmware to S3 (Triggers OTA)
+        env:
+          AWS_FIRMWARE_BUCKET: ${{ vars.AWS_FIRMWARE_BUCKET }}
         run: |
           VERSION=$(grep -m1 '^version =' Cargo.toml | cut -d '"' -f2)
-          aws s3 cp firmware.bin "s3://esp32-ztp-firmware-${{ secrets.AWS_ACCOUNT_ID }}/firmware_v${VERSION}_${{ github.sha }}.bin"
+          aws s3 cp firmware.bin "s3://${AWS_FIRMWARE_BUCKET}/firmware_v${VERSION}_${GITHUB_SHA}.bin"
