@@ -2,7 +2,7 @@ import os
 import boto3
 import json
 import logging
-import uuid
+import re
 import time
 
 logger = logging.getLogger()
@@ -10,6 +10,17 @@ logger.setLevel(logging.INFO)
 
 s3_client = boto3.client('s3')
 iot_client = boto3.client('iot')
+
+MAX_JOB_ID_LENGTH = 64
+
+
+def build_job_id(version, timestamp):
+    safe_version = re.sub(r'[^A-Za-z0-9_-]+', '-', version).strip('-_') or 'firmware'
+    prefix = 'ota-'
+    suffix = f'-{int(timestamp)}'
+    available_length = MAX_JOB_ID_LENGTH - len(prefix) - len(suffix)
+    return f'{prefix}{safe_version[:available_length]}{suffix}'
+
 
 def handler(event, context):
     logger.info(f"Received event: {json.dumps(event)}")
@@ -40,7 +51,7 @@ def handler(event, context):
         "download_url": presigned_url
     }
 
-    job_id = f"ota-{version.replace('.', '-')}-{int(time.time())}"
+    job_id = build_job_id(version, time.time())
 
     # Get all things to target the job (for now, targeting all devices as requested)
     # AWS IoT Jobs allows max 100 targets in the targetSelection="SNAPSHOT" if listed manually,
