@@ -12,6 +12,16 @@ output "dynamodb_table" {
   value = aws_dynamodb_table.device_registry.name
 }
 
+output "github_actions_role_arn" {
+  description = "IAM role assumed by the release workflow through GitHub OIDC."
+  value       = aws_iam_role.github_actions.arn
+}
+
+output "firmware_bucket_name" {
+  description = "S3 bucket where the release workflow uploads firmware images."
+  value       = aws_s3_bucket.firmware.id
+}
+
 output "claim_certificate_pem" {
   description = "CLAIM certificate to be flashed to device (certs/claim.crt.pem)."
   value       = aws_iot_certificate.claim.certificate_pem

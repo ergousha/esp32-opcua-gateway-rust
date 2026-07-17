@@ -1,104 +1,67 @@
 name: ESP32 Build
 
-# This is a single `std`, ESP-IDF-based crate (esp-idf-svc,
-# xtensa-esp32s3-espidf) — unlike a split workspace with a host-testable
-# crate, every job here needs the espup-installed `esp` toolchain, since even
-# `cargo check`/`clippy`/`doc` must compile target-specific HAL code and link
-# against ESP-IDF (via `ldproxy`, embuild downloads/builds the SDK itself).
+# This is a single `std`, ESP-IDF-based crate. Firmware checks share one runner
+# so the ESP toolchain, SDK build, swap, and Cargo cache are initialized once.
 
 on:
   pull_request:
     branches: [ main ]
+
+concurrency:
+  group: esp32-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_BUILD_JOBS: "2"
   CMAKE_BUILD_PARALLEL_LEVEL: "2"
-  ESPFLASH_VERSION: "4.5.0"
-  ESPFLASH_SHA256: "9408208ee3d2408cd1247da61bf6e85e7611d4380c590b85e61070fe7e2bb069"
 
 jobs:
-  build:
-    name: Build for ESP32-S3
+  firmware_ci:
+    name: Firmware CI
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # Required for AWS OIDC authentication
+      pull-requests: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - name: Install ESP toolchain
-        uses: esp-rs/xtensa-toolchain@ec6d36527049a7f4fb2cb0c1a644668c1bb8a2a4 # v1.7.0
-        with:
-          buildtargets: esp32s3
-          ldproxy: true
+      - name: Check changed paths
+        id: filter
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up swap space
-        uses: pierotofy/set-swap-space@fc79b3f67fa8a838184ce84a674ca12238d2c761 # master
-        with:
-          swap-size-gb: 10
-
-      - name: Cache Rust build
-        if: ${{ !env.ACT }}
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Install cargo-espflash
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          archive="$RUNNER_TEMP/cargo-espflash.zip"
-          curl --fail --location --retry 3 --output "$archive" \
-            "https://github.com/esp-rs/espflash/releases/download/v${ESPFLASH_VERSION}/cargo-espflash-x86_64-unknown-linux-gnu.zip"
-          echo "${ESPFLASH_SHA256}  ${archive}" | sha256sum --check
-          unzip -q "$archive" -d "$HOME/.cargo/bin"
-          chmod +x "$HOME/.cargo/bin/cargo-espflash"
+          changed_files="$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" \
+            --jq '.[].filename')"
 
-      - name: Build for ESP32-S3
-        run: cargo build --release
+          while IFS= read -r path; do
+            case "$path" in
+              src/*|Cargo.toml|Cargo.lock|build.rs|.cargo/*|rust-toolchain.toml|sdkconfig.defaults|partitions.csv|certs/AmazonRootCA1.pem)
+                echo "firmware=true" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+          done <<< "$changed_files"
 
-      - name: Generate Firmware Bin
-        run: cargo espflash save-image --release --chip esp32s3 firmware.bin
+          echo "firmware=false" >> "$GITHUB_OUTPUT"
 
-  fmt:
-    name: Rustfmt
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    # cargo fmt doesn't invoke rustc, so it never needs the espup-installed
-    # `esp` toolchain — force stable to avoid "custom toolchain 'esp' ... is
-    # not installed" from the repo's rust-toolchain.toml.
-    env:
-      RUSTUP_TOOLCHAIN: stable
-    steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: steps.filter.outputs.firmware == 'true'
         with:
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        if: steps.filter.outputs.firmware == 'true'
         with:
           components: rustfmt
 
       - name: Run cargo fmt
-        run: cargo fmt --all -- --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          components: clippy
+        if: steps.filter.outputs.firmware == 'true'
+        run: rustup run stable cargo fmt --all -- --check
 
       - name: Install ESP toolchain
+        if: steps.filter.outputs.firmware == 'true'
         uses: esp-rs/xtensa-toolchain@ec6d36527049a7f4fb2cb0c1a644668c1bb8a2a4 # v1.7.0
         with:
           buildtargets: esp32s3
@@ -107,45 +70,25 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up swap space
+        if: steps.filter.outputs.firmware == 'true'
         uses: pierotofy/set-swap-space@fc79b3f67fa8a838184ce84a674ca12238d2c761 # master
         with:
           swap-size-gb: 10
 
       - name: Cache Rust build
-        if: ${{ !env.ACT }}
+        if: steps.filter.outputs.firmware == 'true' && !env.ACT
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Run clippy
+        if: steps.filter.outputs.firmware == 'true'
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-  doc:
-    name: Documentation
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - name: Install ESP toolchain
-        uses: esp-rs/xtensa-toolchain@ec6d36527049a7f4fb2cb0c1a644668c1bb8a2a4 # v1.7.0
-        with:
-          buildtargets: esp32s3
-          ldproxy: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up swap space
-        uses: pierotofy/set-swap-space@fc79b3f67fa8a838184ce84a674ca12238d2c761 # master
-        with:
-          swap-size-gb: 10
-
-      - name: Cache Rust build
-        if: ${{ !env.ACT }}
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
       - name: Check documentation
+        if: steps.filter.outputs.firmware == 'true'
         run: cargo doc --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
+
+      - name: Build for ESP32-S3
+        if: steps.filter.outputs.firmware == 'true'
+        run: cargo build --release
