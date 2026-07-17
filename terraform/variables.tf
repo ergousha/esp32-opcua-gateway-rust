@@ -29,7 +29,19 @@ variable "telemetry_topic_prefix" {
 }
 
 variable "github_repo" {
-  description = "GitHub repository for OIDC authentication (e.g., owner/repo)"
+  description = "GitHub repository name for OIDC authentication (owner/repository)."
   type        = string
   default     = "ergousha/esp32-opcua-gateway-rust"
+}
+
+variable "github_owner_id" {
+  description = "Permanent numeric ID of the GitHub repository owner."
+  type        = number
+  default     = 2912014
+}
+
+variable "github_repository_id" {
+  description = "Permanent numeric ID of the GitHub repository."
+  type        = number
+  default     = 1302001123
 }

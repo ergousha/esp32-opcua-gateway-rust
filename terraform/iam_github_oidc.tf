@@ -2,6 +2,11 @@
 # GitHub OIDC Provider and Role
 # ---------------------------------------------------------------------------
 
+locals {
+  github_repo_parts = split("/", var.github_repo)
+  github_oidc_sub   = "repo:${local.github_repo_parts[0]}@${var.github_owner_id}/${local.github_repo_parts[1]}@${var.github_repository_id}:ref:refs/heads/main"
+}
+
 resource "aws_iam_openid_connect_provider" "github" {
   url             = "https://token.actions.githubusercontent.com"
   client_id_list  = ["sts.amazonaws.com"]
@@ -21,9 +26,9 @@ data "aws_iam_policy_document" "github_assume_role" {
       values   = ["sts.amazonaws.com"]
     }
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:*"]
+      values   = [local.github_oidc_sub]
     }
   }
 }
