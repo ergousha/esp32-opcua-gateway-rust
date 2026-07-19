@@ -5,12 +5,12 @@ use log::{error, info};
 
 /// Performs an Over-The-Air (OTA) update from the given HTTP(S) URL.
 pub fn perform_ota(url: &str) -> Result<()> {
-    info!("Starting OTA update from: {}", url);
+    info!("Starting OTA firmware download.");
 
     // Initialize HTTP connection for downloading the firmware
     let http_config = HttpConfiguration {
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
-        buffer_size_tx: Some(1024),
+        buffer_size_tx: Some(4096),
         buffer_size: Some(4096),
         ..Default::default()
     };

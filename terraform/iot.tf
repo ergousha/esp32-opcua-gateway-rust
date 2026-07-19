@@ -93,6 +93,33 @@ resource "aws_iot_policy" "device" {
           "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topic/cmd/$${iot:Connection.Thing.ThingName}/*",
         ]
       },
+      {
+        Sid    = "PublishJobRequests"
+        Effect = "Allow"
+        Action = "iot:Publish"
+        Resource = [
+          "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topic/$aws/things/$${iot:Connection.Thing.ThingName}/jobs/$next/get",
+          "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topic/$aws/things/$${iot:Connection.Thing.ThingName}/jobs/*/update",
+        ]
+      },
+      {
+        Sid    = "SubscribeJobResponses"
+        Effect = "Allow"
+        Action = "iot:Subscribe"
+        Resource = [
+          "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topicfilter/$aws/things/$${iot:Connection.Thing.ThingName}/jobs/notify-next",
+          "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topicfilter/$aws/things/$${iot:Connection.Thing.ThingName}/jobs/$next/get/accepted",
+        ]
+      },
+      {
+        Sid    = "ReceiveJobResponses"
+        Effect = "Allow"
+        Action = "iot:Receive"
+        Resource = [
+          "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topic/$aws/things/$${iot:Connection.Thing.ThingName}/jobs/notify-next",
+          "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topic/$aws/things/$${iot:Connection.Thing.ThingName}/jobs/$next/get/accepted",
+        ]
+      },
     ]
   })
 }
