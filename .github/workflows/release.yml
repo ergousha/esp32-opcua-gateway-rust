@@ -75,7 +75,9 @@ jobs:
         run: cargo build --release
 
       - name: Generate Firmware Bin
-        run: cargo espflash save-image --release --chip esp32s3 firmware.bin
+        run: >-
+          cargo espflash save-image --release --chip esp32s3 --flash-size 16mb
+          --partition-table partitions.csv --target-app-partition ota_0 firmware.bin
 
       - name: Create GitHub Release
         env:

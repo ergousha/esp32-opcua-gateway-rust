@@ -9,6 +9,10 @@ CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
 # You might have to increase this further if you spawn your own Rust threads
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
 
+# --- Flash partition layout (NVS + dual 4 MiB OTA slots) ---
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_TWO_OTA_LARGE=y
+
 # --- W5500 Ethernet over SPI (esp_eth -> lwIP netif) ---
 # Saf-Rust w5500-ll yerine ESP-IDF surucusu; TCP/IP + mbedTLS + MQTT icin sart.
 CONFIG_ETH_USE_SPI_ETHERNET=y
