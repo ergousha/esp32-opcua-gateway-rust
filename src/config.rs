@@ -11,14 +11,11 @@ pub struct Config {
     pub wifi_ssid: &'static str,
     #[default("")]
     pub wifi_psk: &'static str,
+    #[default("")]
+    pub iot_endpoint: &'static str,
+    #[default("")]
+    pub provisioning_template: &'static str,
 }
-
-/// AWS IoT ATS data endpoint. Output of `terraform output -raw iot_endpoint`.
-pub const MQTT_ENDPOINT: &str = "a2pw25e7ewpuwe-ats.iot.eu-central-1.amazonaws.com";
-
-/// Fleet Provisioning template name. Must be the SAME as `provisioning_template_name`
-/// in Terraform.
-pub const PROVISIONING_TEMPLATE: &str = "esp32-s3-fleet-template";
 
 /// Shared secret matching the record in DynamoDB.
 /// PoC: common to all devices. In production, it must be unique per device and
@@ -27,5 +24,5 @@ pub const DEVICE_SECRET: &str = "change-me-shared-secret";
 
 /// MQTT connection URL (mutual TLS, port 8883).
 pub fn mqtt_url() -> String {
-    format!("mqtts://{MQTT_ENDPOINT}:8883")
+    format!("mqtts://{}:8883", CONFIG.iot_endpoint)
 }
