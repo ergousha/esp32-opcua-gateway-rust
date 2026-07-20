@@ -67,7 +67,7 @@ pub fn run() -> Result<DeviceIdentity> {
     log::info!("Unique device certificate received.");
 
     // 2) RegisterThing
-    let tmpl = config::PROVISIONING_TEMPLATE;
+    let tmpl = config::CONFIG.provisioning_template;
     let register_accepted = format!("$aws/provisioning-templates/{tmpl}/provision/json/accepted");
     let register_rejected = format!("$aws/provisioning-templates/{tmpl}/provision/json/rejected");
     let register_publish = format!("$aws/provisioning-templates/{tmpl}/provision/json");
