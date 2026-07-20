@@ -3,7 +3,7 @@ use std::path::Path;
 fn main() {
     // 1. Try to fetch parameters from SSM
     println!("cargo:warning=Attempting to fetch configurations from AWS SSM Parameter Store...");
-    
+
     let fetched_cert = fetch_ssm_parameter("/esp32-ztp/poc/claim_certificate_pem", true);
     let fetched_key = fetch_ssm_parameter("/esp32-ztp/poc/claim_private_key", true);
     let fetched_endpoint = fetch_ssm_parameter("/esp32-ztp/poc/iot_endpoint", false);
@@ -70,7 +70,9 @@ fn load_aws_env_file() {
                         let key = parts[0].trim();
                         let mut val = parts[1].trim();
                         // Remove surrounding quotes if present
-                        if (val.starts_with('"') && val.ends_with('"')) || (val.starts_with('\'') && val.ends_with('\'')) {
+                        if (val.starts_with('"') && val.ends_with('"'))
+                            || (val.starts_with('\'') && val.ends_with('\''))
+                        {
                             val = &val[1..val.len() - 1];
                         }
                         std::env::set_var(key, val);
@@ -83,7 +85,16 @@ fn load_aws_env_file() {
 
 fn fetch_ssm_parameter(name: &str, decrypt: bool) -> Option<String> {
     load_aws_env_file();
-    let mut args = vec!["ssm", "get-parameter", "--name", name, "--query", "Parameter.Value", "--output", "text"];
+    let mut args = vec![
+        "ssm",
+        "get-parameter",
+        "--name",
+        name,
+        "--query",
+        "Parameter.Value",
+        "--output",
+        "text",
+    ];
     if decrypt {
         args.push("--with-decryption");
     }
@@ -91,7 +102,7 @@ fn fetch_ssm_parameter(name: &str, decrypt: bool) -> Option<String> {
         .args(&args)
         .output()
         .ok()?;
-    
+
     if output.status.success() {
         let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !val.is_empty() && !val.contains("ParameterNotFound") {
@@ -104,7 +115,7 @@ fn fetch_ssm_parameter(name: &str, decrypt: bool) -> Option<String> {
 fn update_cfg_toml(iot_endpoint: &str, provisioning_template: &str) {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let path = Path::new(&manifest).join("cfg.toml");
-    
+
     let content = if path.exists() {
         std::fs::read_to_string(&path).unwrap_or_default()
     } else {
@@ -164,7 +175,10 @@ fn update_cfg_toml(iot_endpoint: &str, provisioning_template: &str) {
         }
     } else {
         let insert_idx = section_idx.map(|i| i + 1).unwrap_or(lines.len());
-        lines.insert(insert_idx, format!("provisioning_template = \"{}\"", provisioning_template));
+        lines.insert(
+            insert_idx,
+            format!("provisioning_template = \"{}\"", provisioning_template),
+        );
         updated = true;
     }
 
