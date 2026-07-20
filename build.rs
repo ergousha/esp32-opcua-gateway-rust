@@ -64,8 +64,8 @@ fn load_aws_env_file() {
         if let Ok(content) = std::fs::read_to_string(path) {
             for line in content.lines() {
                 let trimmed = line.trim();
-                if trimmed.starts_with("export ") {
-                    let parts: Vec<&str> = trimmed[7..].splitn(2, '=').collect();
+                if let Some(stripped) = trimmed.strip_prefix("export ") {
+                    let parts: Vec<&str> = stripped.splitn(2, '=').collect();
                     if parts.len() == 2 {
                         let key = parts[0].trim();
                         let mut val = parts[1].trim();
@@ -129,7 +129,6 @@ fn update_cfg_toml(iot_endpoint: &str, provisioning_template: &str) {
     let mut updated = false;
 
     let mut endpoint_idx = None;
-    let mut template_idx = None;
     let mut section_idx = None;
 
     for (i, line) in lines.iter().enumerate() {
@@ -138,8 +137,6 @@ fn update_cfg_toml(iot_endpoint: &str, provisioning_template: &str) {
             section_idx = Some(i);
         } else if trimmed.starts_with("iot_endpoint") {
             endpoint_idx = Some(i);
-        } else if trimmed.starts_with("provisioning_template") {
-            template_idx = Some(i);
         }
     }
 
