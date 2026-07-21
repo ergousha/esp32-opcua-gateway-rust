@@ -22,6 +22,7 @@ env:
   CMAKE_BUILD_PARALLEL_LEVEL: "2"
   ESPFLASH_VERSION: "4.5.0"
   ESPFLASH_SHA256: "9408208ee3d2408cd1247da61bf6e85e7611d4380c590b85e61070fe7e2bb069"
+  ACT: false
 
 jobs:
   release:
@@ -69,6 +70,7 @@ jobs:
           swap-size-gb: 10
 
       - name: Cache Rust build
+        # zizmor: ignore[cache-poisoning]
         if: ${{ steps.release.outputs.release_created && !env.ACT }}
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
