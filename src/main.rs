@@ -61,12 +61,20 @@ fn main() -> Result<()> {
         Net::Eth(eth_handle)
     } else {
         log::warn!("Ethernet unavailable; falling back to WiFi...");
-        let wifi = wifi::start(peripherals.modem, sysloop, nvs_part.clone())?;
-        log::info!("Network interface: WiFi");
-        // eth_handle is kept ALIVE (panic prevention measure).
-        Net::Wifi {
-            eth: eth_handle,
-            wifi,
+        match wifi::start(peripherals.modem, sysloop, nvs_part.clone()) {
+            Ok(wifi) => {
+                log::info!("Network interface: WiFi");
+                Net::Wifi {
+                    eth: eth_handle,
+                    wifi,
+                }
+            }
+            Err(e) => {
+                log::error!("WiFi start failed: {:?}", e);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
         }
     };
 
