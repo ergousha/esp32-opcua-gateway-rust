@@ -15,6 +15,12 @@ pub struct Config {
     pub iot_endpoint: &'static str,
     #[default("")]
     pub provisioning_template: &'static str,
+    #[default("opc.tcp://192.168.1.100:4840")]
+    pub opcua_endpoint: &'static str,
+    #[default("ns=2;s=Temperature,ns=2;s=Pressure")]
+    pub opcua_nodes: &'static str,
+    #[default(5000)]
+    pub opcua_poll_interval_ms: u64,
 }
 
 /// Shared secret matching the record in DynamoDB.

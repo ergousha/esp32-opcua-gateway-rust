@@ -16,6 +16,10 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml-cfg = "0.2"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
+async-opcua = { version = "0.19.0", default-features = false, features = ["client"] }
+async-opcua-client = { version = "0.19.0", default-features = false }
+async-opcua-types = { version = "0.19.0", default-features = false }
 
 # NOT: W5500 artik ESP-IDF'in dahili esp_eth SPI surucusuyle (lwIP netif olarak)
 # suruluyor; boylece TCP/IP + mbedTLS + MQTT dogrudan calisiyor. Bu yuzden
@@ -30,3 +34,9 @@ opt-level = "s"
 [profile.dev]
 debug = true
 opt-level = "z"
+
+[patch.crates-io]
+signal-hook-registry = { path = "crates/signal-hook-registry" }
+gethostname = { path = "crates/gethostname" }
+async-opcua-types = { path = "crates/async-opcua-types" }
+tokio = { path = "crates/tokio" }

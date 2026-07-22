@@ -58,7 +58,35 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
     // Request pending jobs right away
     let _ = session.client.publish(&get_topic, QOS1, false, b"{}");
 
+    // Initialize OPC UA Client task
+    let (tx, rx) = std::sync::mpsc::channel::<crate::opcua_client::OpcUaTelemetry>();
+    let opcua_nodes = config::CONFIG
+        .opcua_nodes
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let opcua_cfg = crate::opcua_client::OpcUaClientConfig {
+        endpoint_url: config::CONFIG.opcua_endpoint.to_string(),
+        poll_interval: Duration::from_millis(config::CONFIG.opcua_poll_interval_ms),
+        node_ids: opcua_nodes,
+    };
+
+    if let Err(e) = crate::opcua_client::spawn_opcua_worker(opcua_cfg, tx) {
+        log::error!("Failed to spawn OPC UA worker task: {:?}", e);
+    }
+
+    let telemetry_topic = format!("dt/{}/opcua/telemetry", id.thing_name);
+
     loop {
+        // Drain incoming OPC UA telemetry and publish to AWS IoT Core
+        while let Ok(telem) = rx.try_recv() {
+            if let Ok(json_payload) = serde_json::to_string(&telem) {
+                log::info!("Publishing OPC UA telemetry to MQTT topic {}: {}", telemetry_topic, json_payload);
+                let _ = session.client.publish(&telemetry_topic, QOS1, false, json_payload.as_bytes());
+            }
+        }
         // Drain incoming events (e.g. disconnect) in the background.
         while let Ok(ev) = session.events.try_recv() {
             match ev {

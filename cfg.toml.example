@@ -9,3 +9,6 @@ wifi_ssid = "your-ssid"
 wifi_psk = "your-password"
 iot_endpoint = "your-iot-endpoint"
 provisioning_template = "your-provisioning-template"
+opcua_endpoint = "opc.tcp://192.168.1.100:4840"
+opcua_nodes = "ns=2;s=Temperature,ns=2;s=Pressure"
+opcua_poll_interval_ms = 5000

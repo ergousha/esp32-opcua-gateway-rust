@@ -14,6 +14,7 @@ mod config;
 mod device_id;
 mod eth;
 mod mqtt_util;
+mod opcua_client;
 mod ota;
 mod provisioning;
 mod telemetry;
@@ -23,6 +24,17 @@ use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+
+/// Stub socketpair symbol for ESP-IDF target (Unix Domain Sockets unavailable in ESP-IDF libc).
+#[no_mangle]
+pub unsafe extern "C" fn socketpair(
+    _domain: std::os::raw::c_int,
+    _type: std::os::raw::c_int,
+    _protocol: std::os::raw::c_int,
+    _sv: *mut std::os::raw::c_int,
+) -> std::os::raw::c_int {
+    -1
+}
 
 /// Keeps the active network interface alive throughout main.
 /// Even if fallback to WiFi occurs, the Ethernet handle is kept: if dropped, SpiDriver::drop
