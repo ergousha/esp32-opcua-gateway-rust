@@ -20,8 +20,10 @@ pub(crate) struct Driver {
     /// Thread parker. The `Driver` park implementation delegates to this.
     io: io::Driver,
 
-    /// A pipe for receiving wake events from the signal handler
-    receiver: UnixStream,
+    /// A pipe for receiving wake events from the signal handler.
+    ///
+    /// `None` on ESP-IDF, which has no `AF_UNIX` sockets — see `Driver::new`.
+    receiver: Option<UnixStream>,
 
     /// Shared state. The driver keeps a strong ref and the handle keeps a weak
     /// ref. The weak ref is used to check if the driver is still active before
@@ -40,6 +42,30 @@ pub(crate) struct Handle {
 
 impl Driver {
     /// Creates a new signal `Driver` instance that delegates wakeups to `park`.
+    ///
+    /// LOCAL PATCH (ESP-IDF): this driver is built around a self-pipe made with
+    /// `UnixStream::pair()`, i.e. `socketpair(AF_UNIX)`. lwIP implements no
+    /// `AF_UNIX`, so on ESP-IDF that call fails and the `expect` inside
+    /// `globals()` panics — aborting any thread that builds a runtime with the
+    /// I/O driver enabled. Reaching this code is not optional either: pulling in
+    /// `async-opcua-client` enables tokio's `full` feature, and Cargo's feature
+    /// unification means the firmware cannot opt back out of `signal`.
+    ///
+    /// Signals are not deliverable on this platform in the first place (see the
+    /// `signal-hook-registry` stub in `crates/`), so the driver is constructed
+    /// inert instead: it parks and shuts down normally, and simply never
+    /// dispatches a signal.
+    #[cfg(target_os = "espidf")]
+    pub(crate) fn new(io: io::Driver, _io_handle: &io::Handle) -> std_io::Result<Self> {
+        Ok(Self {
+            io,
+            receiver: None,
+            inner: Arc::new(()),
+        })
+    }
+
+    /// Creates a new signal `Driver` instance that delegates wakeups to `park`.
+    #[cfg(not(target_os = "espidf"))]
     pub(crate) fn new(io: io::Driver, io_handle: &io::Handle) -> std_io::Result<Self> {
         use std::mem::ManuallyDrop;
         use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -75,7 +101,7 @@ impl Driver {
 
         Ok(Self {
             io,
-            receiver,
+            receiver: Some(receiver),
             inner: Arc::new(()),
         })
     }
@@ -109,12 +135,18 @@ impl Driver {
             return;
         }
 
+        // LOCAL PATCH (ESP-IDF): no self-pipe was created, so there is nothing
+        // to drain and no signal could have arrived.
+        let Some(receiver) = self.receiver.as_mut() else {
+            return;
+        };
+
         // Drain the pipe completely so we can receive a new readiness event
         // if another signal has come in.
         let mut buf = [0; 128];
         #[allow(clippy::unused_io_amount)]
         loop {
-            match self.receiver.read(&mut buf) {
+            match receiver.read(&mut buf) {
                 Ok(0) => panic!("EOF on self-pipe"),
                 Ok(_) => continue, // Keep reading
                 Err(e) if e.kind() == std_io::ErrorKind::WouldBlock => break,
