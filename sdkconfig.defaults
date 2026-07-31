@@ -9,9 +9,26 @@ CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
 # You might have to increase this further if you spawn your own Rust threads
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
 
-# --- Flash partition layout (NVS + dual 4 MiB OTA slots) ---
+# --- Flash partition layout ---
+# partitions.csv is the SINGLE source of truth. It is copied into the esp-idf-sys
+# CMake project dir by the ESP_IDF_GLOB_* vars in .cargo/config.toml, so the table
+# generated here is byte-identical to the one espflash writes (the runner in
+# .cargo/config.toml passes --partition-table partitions.csv).
+# Previously this said CONFIG_PARTITION_TABLE_TWO_OTA_LARGE=y, which declared
+# 1700K app slots while espflash flashed 4M slots — two divergent tables.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
-CONFIG_PARTITION_TABLE_TWO_OTA_LARGE=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+CONFIG_PARTITION_TABLE_MD5=y
+
+# --- OTA safety ---
+# Without this, esp_ota_mark_app_valid_cancel_rollback() (ota::mark_valid) is a
+# no-op and a bad OTA image bricks the device permanently. With it, the bootloader
+# marks a freshly OTA'd slot PENDING_VERIFY and reverts to the previous slot if the
+# app reboots before confirming itself. telemetry::run() confirms only after the
+# MQTT session to AWS IoT is established, which is the health gate.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # --- W5500 Ethernet over SPI (esp_eth -> lwIP netif) ---
 # Saf-Rust w5500-ll yerine ESP-IDF surucusu; TCP/IP + mbedTLS + MQTT icin sart.

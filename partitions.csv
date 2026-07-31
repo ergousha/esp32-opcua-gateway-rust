@@ -1,6 +1,57 @@
-# Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     ,        0x6000,
-phy_init, data, phy,     ,        0x1000,
-otadata,  data, ota,     ,        0x2000,
-ota_0,    app,  ota_0,   ,        0x400000,
-ota_1,    app,  ota_1,   ,        0x400000,
+# ============================================================================
+# AUTHORITATIVE FLASH LAYOUT — Waveshare ESP32-S3-ETH (W25Q128, 16 MiB flash)
+# ============================================================================
+#
+# !! OTA-CRITICAL — READ BEFORE EDITING !!
+#
+# The partition table lives at flash offset 0x8000 and is NOT rewritten by an
+# OTA update. Once a unit leaves the bench, this file is frozen for that unit;
+# changing it afterwards requires physical re-flashing over USB. Rules:
+#
+#   1. Every Offset is written out explicitly. Never leave the column blank.
+#      With blank offsets the generator auto-packs partitions, so editing or
+#      resizing ANY earlier row silently shifts every later row — deployed
+#      devices would then read their app/NVS from the wrong address.
+#   2. Spare partitions are reserved up-front, even though nothing uses them
+#      yet, because they cannot be added later without a physical re-flash.
+#   3. Offsets of nvs / phy_init / otadata / ota_0 are frozen at the values
+#      already flashed to existing units, so provisioned devices keep their
+#      NVS device identity (AWS IoT cert + private key) and their running app.
+#
+# Comments must be on their own line — neither gen_esp32part.py nor espflash
+# strips trailing comments from a data row.
+#
+# Map:
+#   0x000000  bootloader
+#   0x008000  partition table
+#   0x009000  nvs        24K   device identity, wifi creds  [frozen]
+#   0x00f000  phy_init    4K   RF calibration               [frozen]
+#   0x010000  otadata     8K   active-slot selector         [frozen]
+#   0x012000  nvs_key     4K   reserved: NVS encryption keys
+#   0x013000  opcua      52K   OPC UA tag-bundle cache
+#   0x020000  ota_0       7M   app slot A                   [frozen offset]
+#   0x720000  ota_1       7M   app slot B
+#   0xe20000  storage  1664K   reserved: filesystem / telemetry spool
+#   0xfc0000  coredump  256K   reserved: panic core dumps
+#   0x1000000 end of 16 MiB flash (exact fit, no unmapped tail)
+#
+# Sizing rationale:
+#   * app slots are 7 MiB because the current release image is ~5.02 MiB
+#     (measured from the ELF PT_LOAD segments) — it does NOT fit the previous
+#     4 MiB slot. 7 MiB leaves ~40% headroom for firmware growth.
+#   * `opcua` is a second, dedicated NVS partition so that a large or corrupt
+#     tag bundle can never evict the device identity stored in `nvs`.
+#     Take it with EspNvsPartition::<NvsCustom>::take("opcua").
+#   * `nvs_key` must be exactly 4K and flagged `encrypted`; it is inert until
+#     flash encryption + NVS encryption are turned on.
+#
+# Name,     Type, SubType,  Offset,    Size,      Flags
+nvs,        data, nvs,      0x9000,    0x6000,
+phy_init,   data, phy,      0xf000,    0x1000,
+otadata,    data, ota,      0x10000,   0x2000,
+nvs_key,    data, nvs_keys, 0x12000,   0x1000,    encrypted
+opcua,      data, nvs,      0x13000,   0xd000,
+ota_0,      app,  ota_0,    0x20000,   0x700000,
+ota_1,      app,  ota_1,    0x720000,  0x700000,
+storage,    data, spiffs,   0xe20000,  0x1a0000,
+coredump,   data, coredump, 0xfc0000,  0x40000,

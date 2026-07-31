@@ -13,10 +13,13 @@
 mod config;
 mod device_id;
 mod eth;
+mod jobs;
 mod mqtt_util;
-mod opcua_client;
+mod opcua;
 mod ota;
 mod provisioning;
+mod settings_store;
+mod shadow;
 mod telemetry;
 mod wifi;
 

@@ -5,6 +5,12 @@
 
 /// WiFi credentials — read from [esp32-opcua-gateway] table inside `cfg.toml`
 /// at compile time via toml-cfg. Access: `config::CONFIG.wifi_ssid`.
+/// Compile-time configuration.
+///
+/// Only bootstrap values live here. Everything about the OPC UA session —
+/// endpoint, namespace, tag list, batching — is delivered at runtime through
+/// the `opcua` device shadow, so that a tag change does not need a firmware
+/// build. See `docs/OPCUA_CLIENT_REQUIREMENTS.md`.
 #[toml_cfg::toml_config]
 pub struct Config {
     #[default("")]
@@ -15,12 +21,6 @@ pub struct Config {
     pub iot_endpoint: &'static str,
     #[default("")]
     pub provisioning_template: &'static str,
-    #[default("opc.tcp://192.168.1.100:4840")]
-    pub opcua_endpoint: &'static str,
-    #[default("ns=2;s=Temperature,ns=2;s=Pressure")]
-    pub opcua_nodes: &'static str,
-    #[default(5000)]
-    pub opcua_poll_interval_ms: u64,
 }
 
 /// Shared secret matching the record in DynamoDB.

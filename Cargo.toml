@@ -5,6 +5,18 @@ edition = "2021"
 resolver = "2"
 publish = false
 
+# `gateway-core` holds every piece of logic that does not need the device:
+# settings/bundle parsing, value mapping, batching, diffing, backoff. It is a
+# separate crate purely so it can be compiled and tested for the *host* target
+# (`cargo test -p gateway-core --target <host>`); the firmware crate itself can
+# only ever be built for xtensa.
+#
+# `crates/` holds vendored `[patch.crates-io]` sources and must stay out of the
+# workspace.
+[workspace]
+members = ["gateway-core"]
+exclude = ["crates"]
+
 [[bin]]
 name = "esp32-opcua-gateway"
 harness = false
@@ -20,6 +32,8 @@ tokio = { version = "1", default-features = false, features = ["rt", "net", "tim
 async-opcua = { version = "0.19.0", default-features = false, features = ["client"] }
 async-opcua-client = { version = "0.19.0", default-features = false }
 async-opcua-types = { version = "0.19.0", default-features = false }
+async-trait = "0.1"
+gateway-core = { path = "gateway-core" }
 
 # NOT: W5500 artik ESP-IDF'in dahili esp_eth SPI surucusuyle (lwIP netif olarak)
 # suruluyor; boylece TCP/IP + mbedTLS + MQTT dogrudan calisiyor. Bu yuzden

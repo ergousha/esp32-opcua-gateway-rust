@@ -13,3 +13,11 @@ build-std = ["std", "panic_abort"]
 MCU = "esp32s3"
 ESP_IDF_VERSION = "v5.5.3"
 ESP_IDF_TOOLS_INSTALL_DIR = "workspace"
+
+# Copy partitions.csv into the esp-idf-sys CMake project dir so that
+# CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv" resolves (ESP-IDF
+# resolves that path against PROJECT_DIR, which for esp-idf-sys is its OUT_DIR,
+# not this workspace). Without this the esp-idf build and espflash would use two
+# different partition tables. See esp-idf-sys build/config.rs: ESP_IDF_GLOB.
+ESP_IDF_GLOB_PARTITIONS_BASE = { value = ".", relative = true }
+ESP_IDF_GLOB_PARTITIONS_0 = "partitions.csv"
