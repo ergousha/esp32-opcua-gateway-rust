@@ -26,3 +26,7 @@ crash.log
 # --- Python ---
 __pycache__/
 *.pyc
+
+# --- Test harness ---
+/test-harness/.venv/
+/test-harness/artifacts/
