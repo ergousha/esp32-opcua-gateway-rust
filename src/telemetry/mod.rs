@@ -171,6 +171,26 @@ fn wait_for_connection(session: &mqtt_util::MqttSession) -> Result<()> {
     }
 }
 
+/// Registers ESP-IDF's eventfd VFS driver, which Tokio's I/O driver requires.
+///
+/// Tokio wakes its reactor through an `eventfd`. On ESP-IDF that syscall is not
+/// available until the eventfd VFS has been registered: `vfs_eventfd.c` returns
+/// `EACCES` while its VFS id is still -1, so without this call
+/// `Runtime::build()` fails with "Permission denied (os error 13)" and the whole
+/// OPC UA thread dies before it ever opens a session — silently, because the
+/// MQTT/OTA path keeps running.
+///
+/// Two descriptors: one for the current-thread runtime's reactor waker, plus a
+/// spare so a future second runtime does not reintroduce the same failure.
+fn register_eventfd() -> Result<()> {
+    use esp_idf_svc::sys::{esp, esp_vfs_eventfd_config_t, esp_vfs_eventfd_register};
+
+    let config = esp_vfs_eventfd_config_t { max_fds: 2 };
+    // Safe: `config` outlives the call, and the driver copies what it needs.
+    esp!(unsafe { esp_vfs_eventfd_register(&config) })
+        .context("registering the eventfd VFS driver for Tokio")
+}
+
 /// Starts the OPC UA thread.
 ///
 /// A dedicated thread rather than a task: `esp-mqtt` runs its callback on its
@@ -180,6 +200,8 @@ fn spawn_driver(
     shared: Arc<Shared>,
     commands: tokio::sync::mpsc::UnboundedReceiver<opcua::Command>,
 ) -> Result<()> {
+    register_eventfd()?;
+
     std::thread::Builder::new()
         .name("opcua".into())
         .stack_size(OPCUA_STACK_BYTES)
