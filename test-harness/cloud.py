@@ -139,6 +139,25 @@ class Cloud:
         self.thing = thing
         self.data = boto3.client("iot-data", region_name=region)
         self.logs = boto3.client("logs", region_name=region)
+        #: Reject a `reported` block AWS last wrote before this instant. Set
+        #: once, at the start of the run; see `require_fresh_since`.
+        self.fresh_since_ms: Optional[int] = None
+        #: When AWS last wrote any `reported` field, as observed by the most
+        #: recent poll. None means the thing has never reported at all.
+        self.last_reported_ts_ms: Optional[int] = None
+
+    def require_fresh_since(self, t0_ms: int) -> None:
+        """Treats any `reported` block older than `t0_ms` as no report at all.
+
+        The shadow persists across boots, so a device that is dead, unflashed
+        or off the network still answers `GetThingShadow` — with whatever it
+        last managed to report, possibly hours ago. Evaluated naively, that
+        document makes a device that never booted look like one stuck in
+        `connecting`, and every downstream assertion then describes firmware
+        that is not running. Anchoring on the run's start turns that into a
+        single honest failure.
+        """
+        self.fresh_since_ms = t0_ms
 
     # -- data plane --------------------------------------------------------
 
@@ -176,8 +195,52 @@ class Cloud:
         return json.loads(resp["payload"].read())
 
     def reported(self) -> dict:
+        return self.reported_with_ts()[0]
+
+    def reported_with_ts(self) -> tuple[dict, Optional[int]]:
+        """Returns the `reported` block and when AWS last wrote any of it.
+
+        AWS stamps every reported leaf in `metadata`, in unix *seconds*; the
+        newest of those is the only evidence the harness has that the document
+        came from this boot rather than a previous one.
+        """
         doc = self.get_shadow() or {}
-        return doc.get("state", {}).get("reported", {}) or {}
+        reported = doc.get("state", {}).get("reported", {}) or {}
+
+        newest: Optional[int] = None
+
+        def walk(node: Any) -> None:
+            nonlocal newest
+            if isinstance(node, dict):
+                ts = node.get("timestamp")
+                if isinstance(ts, int) and not isinstance(ts, bool):
+                    newest = ts if newest is None else max(newest, ts)
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(doc.get("metadata", {}).get("reported", {}) or {})
+        return reported, None if newest is None else newest * 1000
+
+    def stale_note(self) -> Optional[str]:
+        """Explains why the last poll was rejected as stale, if it was."""
+        if self.fresh_since_ms is None:
+            return None
+        if self.last_reported_ts_ms is None:
+            return "thing has never reported to the opcua shadow"
+        if self.last_reported_ts_ms >= self.fresh_since_ms:
+            return None
+        age_s = (self.fresh_since_ms - self.last_reported_ts_ms) / 1000.0
+        written = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.last_reported_ts_ms / 1000.0)
+        )
+        return (
+            f"device has not reported since the run started; shadow last "
+            f"written {written}, {age_s:.0f}s before it — the device is not "
+            f"running this firmware, not merely slow"
+        )
 
     def delete_shadow(self) -> None:
         try:
@@ -199,14 +262,21 @@ class Cloud:
         Polling rather than subscribing keeps the harness free of a device
         certificate: `GetThingShadow` is an IAM-authorised HTTP call, so the
         test needs no MQTT identity of its own.
+
+        A document older than `fresh_since_ms` (see `require_fresh_since`) is
+        never handed to `predicate`. Substituting an empty dict instead would
+        be worse than useless: any predicate phrased as an absence would pass
+        against a device that is not even powered on.
         """
         deadline = time.monotonic() + timeout_s
         last: dict = {}
         while time.monotonic() < deadline:
-            last = self.reported()
+            last, ts_ms = self.reported_with_ts()
+            self.last_reported_ts_ms = ts_ms
+            fresh = self.stale_note() is None
             if on_poll:
-                on_poll(last)
-            if predicate(last):
+                on_poll(last, fresh)
+            if fresh and predicate(last):
                 return True, last
             time.sleep(poll_s)
         return False, last

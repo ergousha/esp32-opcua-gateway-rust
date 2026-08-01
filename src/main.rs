@@ -55,6 +55,17 @@ fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    // Claim the OPC UA type table before TLS and the OPC UA session take their
+    // share of the heap. It is ~9 kB in one block, built lazily on the first
+    // ExtensionObject decode; deferred, that decode lands when the heap is
+    // nearly gone and the allocation aborts the process instead of failing
+    // softly. Paid here, it is paid out of ~230 kB rather than out of nothing.
+    opcua_types::generated::types::preload_types();
+    log::info!(
+        "OPC UA type table preloaded; free heap {}",
+        unsafe { esp_idf_svc::sys::esp_get_free_heap_size() }
+    );
+
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
     let nvs_part = EspDefaultNvsPartition::take()?;

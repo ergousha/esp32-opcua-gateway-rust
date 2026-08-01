@@ -5,6 +5,15 @@ contracts, per-phase assertions, the defects this harness uncovered, and
 troubleshooting — is in
 [`docs/OPCUA_INTEGRATION_TEST.md`](../docs/OPCUA_INTEGRATION_TEST.md).
 
+**Current status (2026-08-01): 48/56 checks pass, so the run exits 1.**
+`preflight`, `reconfig`, `ns_uri`, `reject_security` and `reject_digest` are
+green; `disable` and `reboot` are blocked on one unfixed firmware bug, and
+`server_down`, `telemetry` and the heap assertion have open questions. The
+failures are itemised in §9 of the specification, each marked `OPEN` with what
+is known and what is not. **Read §9.2 before interpreting a failing run** — a
+crash-looping device reports the same fault in every phase and reads as ten
+separate defects.
+
 An end-to-end scenario for the OPC UA gateway: a real ESP32-S3 talking to a real
 OPC UA server over the LAN, configured from a real AWS IoT account.
 
@@ -44,8 +53,14 @@ either.
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 source ../aws-env.sh          # AWS credentials
-source ~/export-esp.sh        # espflash on PATH
+source ~/export-esp.sh        # xtensa toolchain on PATH
+export PATH="$HOME/.cargo/bin:$PATH"   # espflash — export-esp.sh does NOT add this
 ```
+
+`espflash` is installed by `cargo install` into `~/.cargo/bin`, which
+`export-esp.sh` does not export. The runner resolves it from there even if it
+is off PATH, but `cargo build` still needs the toolchain that
+`export-esp.sh` provides.
 
 ## Running
 

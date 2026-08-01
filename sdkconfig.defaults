@@ -41,4 +41,10 @@ CONFIG_MQTT_TASK_STACK_SIZE=6144
 CONFIG_ESP_TLS_INSECURE=n
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+# Free the mbedTLS record buffers between records instead of holding them for
+# the life of the connection. Measured on hardware: with them pinned, the OPC
+# UA session leaves so little heap that 1 kB allocations fail during a
+# reconfiguration and the driver thread aborts. IN_CONTENT_LEN stays at 16384
+# deliberately — shrinking it would risk choking on a large TLS record from
+# AWS IoT, which carries Jobs and OTA as well as telemetry.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y

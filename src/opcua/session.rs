@@ -21,8 +21,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use opcua_client::{ClientBuilder, DataChangeCallback, IdentityToken, Session};
 use opcua_types::{
-    EndpointDescription, ExtensionObject, MonitoredItemCreateRequest, MonitoringMode,
-    MonitoringParameters, NodeId, ReadValueId, TimestampsToReturn, Variant,
+    constants::SECURITY_POLICY_NONE_URI, EndpointDescription, ExtensionObject,
+    MessageSecurityMode, MonitoredItemCreateRequest, MonitoringMode, MonitoringParameters, NodeId,
+    ReadValueId, TimestampsToReturn, UserTokenPolicy, Variant,
 };
 use tokio::task::JoinHandle;
 
@@ -61,11 +62,18 @@ pub struct Connection {
 ///
 /// The stack allocates buffers from these numbers, so desktop defaults
 /// (tens of megabytes) are not merely wasteful here, they fail to allocate.
-/// 64 KiB total across 16 KiB chunks comfortably carries a 50-item
-/// `CreateMonitoredItems` response and a full publish response.
-const MAX_MESSAGE_SIZE: usize = 64 * 1024;
-const MAX_CHUNK_SIZE: usize = 16 * 1024;
-const MAX_CHUNK_COUNT: usize = 8;
+///
+/// Measured on hardware: with 64 KiB / 16 KiB the heap fell from ~232 KiB at
+/// MQTT connect to under 9 KiB two seconds later, and the first
+/// `ExtensionObject` decode aborted the process trying to build the generated
+/// type table. 16 KiB across 8 KiB chunks still clears the ~15–25 KiB that
+/// docs/OPCUA_CLIENT_REQUIREMENTS.md §D5 budgets for a 250-tag publish
+/// response only if that response is chunked — which it is, because
+/// `MAX_CHUNK_COUNT` chunks of `MAX_CHUNK_SIZE` bound the message, not one
+/// contiguous buffer.
+const MAX_MESSAGE_SIZE: usize = 16 * 1024;
+const MAX_CHUNK_SIZE: usize = 8 * 1024;
+const MAX_CHUNK_COUNT: usize = 4;
 const MAX_ARRAY_LENGTH: usize = 1_024;
 const MAX_STRING_LENGTH: usize = 8 * 1024;
 
@@ -114,7 +122,20 @@ impl Connection {
             .client()
             .map_err(|errors| anyhow!("invalid OPC UA client configuration: {errors:?}"))?;
 
-        let endpoint = EndpointDescription::from(instance.endpoint.as_str());
+        // The endpoint has to carry the Anonymous policy explicitly.
+        // `EndpointDescription::from(&str)` leaves `user_identity_tokens`
+        // empty, and because we deliberately skip discovery there is nothing
+        // else to fill it in. ActivateSession then looks for the policy
+        // matching the `IdentityToken::Anonymous` below, finds an empty list,
+        // and fails with `BadSecurityPolicyRejected` — after CreateSession has
+        // already succeeded, so the server looks reachable and the session
+        // still never comes up.
+        let endpoint = EndpointDescription::from((
+            instance.endpoint.as_str(),
+            SECURITY_POLICY_NONE_URI,
+            MessageSecurityMode::None,
+            UserTokenPolicy::anonymous(),
+        ));
         let (session, event_loop) = client
             .connect_to_endpoint_directly(endpoint, IdentityToken::Anonymous)
             .with_context(|| format!("connecting to {}", instance.endpoint))?;

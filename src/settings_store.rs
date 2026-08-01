@@ -65,15 +65,45 @@ impl SettingsStore {
         }
     }
 
+    /// Length of a stored blob, refusing anything larger than we would accept.
+    ///
+    /// The bound matters: the length comes from flash, and trusting it would
+    /// let a corrupt entry drive the allocation below.
+    fn blob_len_within(&self, key: &str, max: usize) -> Result<Option<usize>> {
+        let Some(len) = self.nvs.blob_len(key)? else {
+            return Ok(None);
+        };
+        if len == 0 {
+            return Ok(None);
+        }
+        if len > max {
+            return Err(anyhow!(
+                "cached {key} is {len} B, over the {max} B we accept"
+            ));
+        }
+        Ok(Some(len))
+    }
+
     fn try_load(&self) -> Result<Option<CachedConfig>> {
-        let mut settings_buf = vec![0u8; MAX_SETTINGS_BYTES];
+        // Size each buffer to the blob actually stored rather than to the
+        // maximum we would accept. `load` is called again whenever a shadow
+        // delta arrives, by which point TLS and the OPC UA session hold most
+        // of the heap; asking for the full 10 KiB there aborts the process,
+        // even though a real bundle is a few hundred bytes.
+        let Some(settings_len) = self.blob_len_within(KEY_SETTINGS, MAX_SETTINGS_BYTES)? else {
+            return Ok(None);
+        };
+        let mut settings_buf = vec![0u8; settings_len];
         let Some(raw_settings) = self.nvs.get_blob(KEY_SETTINGS, &mut settings_buf)? else {
             return Ok(None);
         };
         let settings: DesiredSettings = serde_json::from_slice(raw_settings)
             .context("cached settings are not valid JSON")?;
 
-        let mut bundle_buf = vec![0u8; MAX_BUNDLE_BYTES];
+        let Some(bundle_len) = self.blob_len_within(KEY_BUNDLE, MAX_BUNDLE_BYTES)? else {
+            return Ok(None);
+        };
+        let mut bundle_buf = vec![0u8; bundle_len];
         let Some(bundle) = self.nvs.get_blob(KEY_BUNDLE, &mut bundle_buf)? else {
             return Ok(None);
         };

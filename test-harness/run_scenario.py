@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -48,6 +49,53 @@ REPO = HERE.parent
 
 # The firmware reports `state` from `gateway_core::health::DriverState`.
 RUNNING, IDLE, ERROR = "running", "idle", "error"
+
+
+def espflash_bin() -> str:
+    """Absolute path to `espflash`.
+
+    `~/export-esp.sh` exports only the xtensa toolchain, not `~/.cargo/bin`
+    where espflash actually lives, so invoking it by bare name dies with a raw
+    `FileNotFoundError` — after the build, and for a reason the traceback does
+    not name.
+    """
+    found = shutil.which("espflash")
+    if found:
+        return found
+    fallback = Path.home() / ".cargo" / "bin" / "espflash"
+    if fallback.is_file() and os.access(fallback, os.X_OK):
+        return str(fallback)
+    raise SystemExit(
+        "espflash not found on PATH or at ~/.cargo/bin/espflash. Install it "
+        "with `cargo install espflash`, or add ~/.cargo/bin to PATH."
+    )
+
+
+def wait_for_port(port: str, timeout_s: float = 30.0, settle_s: float = 1.5) -> bool:
+    """Waits for the USB-serial node to reappear and hold still after a reset.
+
+    An ESP32-S3 using its built-in USB-JTAG re-enumerates every time the chip
+    resets, so the device node disappears and comes back — possibly as a new
+    inode. A monitor attached during that window holds a handle that never
+    delivers a byte, which on the log is indistinguishable from a device that
+    booted and said nothing.
+    """
+    deadline = time.monotonic() + timeout_s
+    path = Path(port)
+    last_ino: Optional[int] = None
+    stable_since: Optional[float] = None
+    while time.monotonic() < deadline:
+        try:
+            ino = path.stat().st_ino
+        except OSError:
+            last_ino, stable_since = None, None
+        else:
+            if ino != last_ino:
+                last_ino, stable_since = ino, time.monotonic()
+            elif stable_since is not None and time.monotonic() - stable_since >= settle_s:
+                return True
+        time.sleep(0.25)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -169,26 +217,42 @@ class SerialMonitor:
     One long-lived monitor rather than one per phase: the USB-serial port is
     exclusive, and re-attaching resets the chip, which would destroy exactly the
     continuity the later phases assert on.
+
+    `start(reset=True)` is the exception, used once at the top of a run that
+    flashed. Flashing already reset the chip, so the boot log was being emitted
+    while nothing was attached and was lost outright; deliberately driving one
+    more reset is the only way to see a boot from its first line. Every later
+    attach keeps `--no-reset`, so the boot under inspection is the one the
+    phase caused.
     """
 
     def __init__(self, port: str, log: Path) -> None:
         self.port, self.log = port, log
         self.proc: Optional[subprocess.Popen] = None
 
-    def start(self) -> None:
+    def start(self, reset: bool = False) -> None:
+        if not wait_for_port(self.port):
+            raise RuntimeError(
+                f"{self.port} did not settle after the chip reset; the monitor "
+                "would have attached to a node that delivers nothing"
+            )
         handle = open(self.log, "ab")
         env = dict(os.environ)
+        cmd = [
+            espflash_bin(),
+            "monitor",
+            "--port",
+            self.port,
+            "--non-interactive",
+        ]
+        if not reset:
+            cmd.append("--no-reset")
+        cmd += [
+            "--elf",
+            str(REPO / "target/xtensa-esp32s3-espidf/release/esp32-opcua-gateway"),
+        ]
         self.proc = subprocess.Popen(
-            [
-                "espflash",
-                "monitor",
-                "--port",
-                self.port,
-                "--non-interactive",
-                "--no-reset",
-                "--elf",
-                str(REPO / "target/xtensa-esp32s3-espidf/release/esp32-opcua-gateway"),
-            ],
+            cmd,
             cwd=REPO,
             stdin=subprocess.DEVNULL,
             stdout=handle,
@@ -196,7 +260,8 @@ class SerialMonitor:
             env=env,
         )
         time.sleep(2)
-        info(f"serial monitor attached to {self.port} -> {self.log.name}")
+        how = "with a reset, to capture the boot" if reset else "without resetting"
+        info(f"serial monitor attached to {self.port} {how} -> {self.log.name}")
 
     def mark(self) -> int:
         """Current size of the log, for reading only what a phase produced."""
@@ -264,19 +329,50 @@ class Ctx:
         ok, reported = self.cloud.wait_for_reported(
             predicate,
             timeout_s=timeout or self.timeout,
-            on_poll=lambda r: info(
-                f"reported: state={r.get('state')} cfg_v={r.get('cfg_v')} "
-                f"applied={r.get('applied')} failed={r.get('failed')} "
-                f"heap={r.get('free_heap')} err={r.get('last_error')}"
-            ),
+            on_poll=_report_poll,
         )
-        phase.check(label, ok, json.dumps(reported, sort_keys=True)[:300])
+        detail = json.dumps(reported, sort_keys=True)[:300]
+        if not ok:
+            # A stale document is a different failure from a wrong one, and
+            # saying so here is what stops the remaining phases from being
+            # read as findings about the firmware.
+            stale = self.cloud.stale_note()
+            if stale:
+                detail = f"{stale} (last reported: {detail})"
+        phase.check(label, ok, detail)
         return reported
 
 
 # ---------------------------------------------------------------------------
 # phases
 # ---------------------------------------------------------------------------
+
+
+def _poll_printer(fmt: Callable[[dict], str]):
+    """Builds an `on_poll` that never prints a stale document as if it were live.
+
+    Printing the fields of a shadow written by an earlier boot is what makes a
+    dead device look like a slow one — the same plausible line, repeated until
+    the timeout.
+    """
+
+    def show(r: dict, fresh: bool) -> None:
+        if fresh:
+            info("reported: " + fmt(r))
+        else:
+            info("reported: (stale — nothing written since the run started)")
+
+    return show
+
+
+_report_poll = _poll_printer(
+    lambda r: (
+        f"state={r.get('state')} cfg_v={r.get('cfg_v')} "
+        f"applied={r.get('applied')} failed={r.get('failed')} "
+        f"heap={r.get('free_heap')} err={r.get('last_error')}"
+    )
+)
+
 
 PHASES: dict[str, Callable[[Ctx], PhaseResult]] = {}
 
@@ -357,10 +453,17 @@ def provision(ctx: Ctx) -> PhaseResult:
         reported.get("failed") == len(MISSING_ADDRESSES),
         f"failed={reported.get('failed')}",
     )
+    # The firmware reports one object per rejected tag — `{"a": address,
+    # "s": statuscode}`, per `gateway_core::health::FailedTag` — while §4.1 of
+    # the requirements shows bare address strings. Accept either: the
+    # assertion is about *which* tags failed, and a `set()` over the richer
+    # shape raises TypeError and takes the entire phase down with it, which is
+    # how this read as a firmware failure rather than a shape mismatch.
     sample = reported.get("failed_sample") or []
+    sample_addrs = {e.get("a") if isinstance(e, dict) else e for e in sample}
     r.check(
         "the failed tag is named in failed_sample",
-        set(sample) == set(MISSING_ADDRESSES),
+        sample_addrs == set(MISSING_ADDRESSES),
         f"failed_sample={sample}",
     )
     r.check(
@@ -593,7 +696,9 @@ def reject_security(ctx: Ctx) -> PhaseResult:
         lambda x: bool(x.get("last_error"))
         and "Basic256Sha256" in str(x.get("last_error")),
         timeout_s=120,
-        on_poll=lambda x: info(f"reported: last_error={x.get('last_error')} cfg_v={x.get('cfg_v')}"),
+        on_poll=_poll_printer(
+            lambda x: f"last_error={x.get('last_error')} cfg_v={x.get('cfg_v')}"
+        ),
     )
     r.check(
         "device refused the secured config with an explicit error",
@@ -621,7 +726,9 @@ def reject_digest(ctx: Ctx) -> PhaseResult:
     ok, reported = ctx.cloud.wait_for_reported(
         lambda x: "sha256" in str(x.get("last_error", "")).lower(),
         timeout_s=120,
-        on_poll=lambda x: info(f"reported: last_error={x.get('last_error')} cfg_v={x.get('cfg_v')}"),
+        on_poll=_poll_printer(
+            lambda x: f"last_error={x.get('last_error')} cfg_v={x.get('cfg_v')}"
+        ),
     )
     r.check(
         "device refused the bundle on digest mismatch",
@@ -660,7 +767,9 @@ def server_down(ctx: Ctx) -> PhaseResult:
     ok, reported = ctx.cloud.wait_for_reported(
         lambda x: x.get("state") == ERROR,
         timeout_s=180,
-        on_poll=lambda x: info(f"reported: state={x.get('state')} err={x.get('last_error')}"),
+        on_poll=_poll_printer(
+            lambda x: f"state={x.get('state')} err={x.get('last_error')}"
+        ),
     )
     r.check("device noticed the server was gone", ok, f"state={reported.get('state')}")
 
@@ -683,7 +792,9 @@ def server_down(ctx: Ctx) -> PhaseResult:
     ok, reported = ctx.cloud.wait_for_reported(
         lambda x: x.get("state") == RUNNING,
         timeout_s=240,
-        on_poll=lambda x: info(f"reported: state={x.get('state')} applied={x.get('applied')}"),
+        on_poll=_poll_printer(
+            lambda x: f"state={x.get('state')} applied={x.get('applied')}"
+        ),
     )
     r.check("device reconnected on its own once the server came back", ok,
             f"state={reported.get('state')} applied={reported.get('applied')}")
@@ -701,11 +812,15 @@ def disable(ctx: Ctx) -> PhaseResult:
     r = PhaseResult("disable")
     subset = [t for t in TAGS if t.variant is not None]
 
-    ctx.publish_config(6, subset, enabled=False)
+    # A fresh version, not 6: `server_down` already published v6 and the device
+    # applied it. Re-sending v6 with `enabled: false` is by definition a no-op
+    # (requirements §486, `ConfigPlane::handle`), so the driver correctly stays
+    # running and the phase reads as a firmware failure that never happened.
+    ctx.publish_config(7, subset, enabled=False)
     ok, reported = ctx.cloud.wait_for_reported(
         lambda x: x.get("state") == IDLE,
         timeout_s=180,
-        on_poll=lambda x: info(f"reported: state={x.get('state')}"),
+        on_poll=_poll_printer(lambda x: f"state={x.get('state')}"),
     )
     r.check("driver went idle on enabled=false", ok, f"state={reported.get('state')}")
 
@@ -720,11 +835,11 @@ def disable(ctx: Ctx) -> PhaseResult:
     r.check("telemetry stopped while disabled", len(quiet) == 0, f"{len(quiet)} batches in 45 s")
 
     # Re-enable under a fresh version so the device treats it as a new config.
-    ctx.publish_config(7, subset, enabled=True)
-    ctx.applied_version = 7
+    ctx.publish_config(8, subset, enabled=True)
+    ctx.applied_version = 8
     ctx.expect_state(
         r,
-        lambda x: x.get("state") == RUNNING and x.get("cfg_v") == 7,
+        lambda x: x.get("state") == RUNNING and x.get("cfg_v") == 8,
         "driver resumed on enabled=true",
         timeout=240,
     )
@@ -751,11 +866,13 @@ def reboot(ctx: Ctx) -> PhaseResult:
     ctx.monitor.stop()
     time.sleep(1)
     reset = subprocess.run(
-        ["espflash", "reset", "--port", ctx.monitor.port],
+        [espflash_bin(), "reset", "--port", ctx.monitor.port],
         cwd=REPO,
         capture_output=True,
         timeout=60,
     )
+    # `start` waits for the USB-JTAG node to re-enumerate before attaching;
+    # without that the monitor races the reset and captures nothing.
     ctx.monitor.start()
     r.check(
         "device reset over USB",
@@ -789,7 +906,7 @@ def reboot(ctx: Ctx) -> PhaseResult:
 def flash(port: str) -> None:
     banner("FLASHING FIRMWARE")
     cmd = [
-        "espflash",
+        espflash_bin(),
         "flash",
         "--port",
         port,
@@ -849,10 +966,15 @@ def main() -> int:
     if unknown:
         raise SystemExit(f"unknown phases: {unknown}; known: {list(PHASES)}")
 
+    # Anchor shadow freshness to the moment the run starts, so a `reported`
+    # block left over from an earlier boot can never satisfy an assertion.
+    ctx.cloud.require_fresh_since(ctx.t0_ms)
+
     results: list[PhaseResult] = []
     try:
         if monitor:
-            monitor.start()
+            # Only a run that just flashed may spend a reset to catch the boot.
+            monitor.start(reset=bool(args.flash))
         for name in selected:
             banner(f"PHASE: {name}")
             try:

@@ -5048,6 +5048,18 @@ static TYPES: std::sync::LazyLock<opcua::types::TypeLoaderInstance> =
         }
         inst
     });
+/// Builds the generated type table now, instead of on first decode.
+///
+/// `TYPES` is a `LazyLock` holding a decoder per generated type, and filling
+/// its hash maps costs roughly 9 kB in one contiguous block. On a heap-poor
+/// target that first decode lands after TLS and the OPC UA session have
+/// already taken their share, and the allocation aborts the process rather
+/// than returning an error. Calling this during startup — while the heap is
+/// still mostly free — moves the cost somewhere it can be paid.
+pub fn preload_types() {
+    std::sync::LazyLock::force(&TYPES);
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct GeneratedTypeLoader;
 impl opcua::types::TypeLoader for GeneratedTypeLoader {

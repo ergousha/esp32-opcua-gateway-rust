@@ -5,10 +5,7 @@ use std::{
     fmt,
     io::{Read, Write},
     str::FromStr,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        LazyLock,
-    },
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 mod id_ref;
@@ -178,8 +175,6 @@ impl BinaryDecodable for NodeId {
 impl FromStr for NodeId {
     type Err = StatusCode;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        use regex::Regex;
-
         // Parses a node from a string using the format specified in 5.3.1.10 part 6
         //
         // ns=<namespaceindex>;<type>=<value>
@@ -191,24 +186,49 @@ impl FromStr for NodeId {
         //   b = OPAQUE (ByteString)
         //
         // If namespace == 0, the ns=0; will be omitted
+        //
+        // Hand-rolled rather than upstream's `^(ns=(?P<ns>[0-9]+);)?(?P<t>[isgb]=.+)$`.
+        // Building that pattern's NFA allocates ~200 kB on first use, which is
+        // more than the whole free heap on an ESP32-S3 — the process aborts
+        // with "memory allocation of 200000 bytes failed" the first time a tag
+        // address is parsed. The grammar is an optional prefix followed by a
+        // two-character tag; it does not need a regex engine.
 
-        static RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"^(ns=(?P<ns>[0-9]+);)?(?P<t>[isgb]=.+)$").unwrap());
-
-        let captures = RE.captures(s).ok_or(StatusCode::BadNodeIdInvalid)?;
-
-        // Check namespace (optional)
-        let namespace = if let Some(ns) = captures.name("ns") {
-            ns.as_str()
-                .parse::<u16>()
-                .map_err(|_| StatusCode::BadNodeIdInvalid)?
-        } else {
-            0
+        // Optional `ns=<digits>;` prefix. A prefix that starts with `ns=` but
+        // does not complete is an error rather than a string identifier: the
+        // upstream pattern would fail the same way, because `n` is not one of
+        // the accepted type characters.
+        let (namespace, rest) = match s.strip_prefix("ns=") {
+            Some(after) => {
+                let (digits, rest) = after
+                    .split_once(';')
+                    .ok_or(StatusCode::BadNodeIdInvalid)?;
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(StatusCode::BadNodeIdInvalid);
+                }
+                let ns = digits
+                    .parse::<u16>()
+                    .map_err(|_| StatusCode::BadNodeIdInvalid)?;
+                (ns, rest)
+            }
+            None => (0u16, s),
         };
 
-        // Type identifier
-        let t = captures.name("t").unwrap();
-        Identifier::from_str(t.as_str())
+        // `[isgb]=` followed by a non-empty value. The value may not contain a
+        // newline: upstream spelled it `.+`, and `.` excludes `\n` while `$`
+        // anchors at the true end of the haystack. Keeping that quirk means
+        // this patch changes only the allocation behaviour, not which strings
+        // are accepted.
+        let mut chars = rest.chars();
+        if !matches!(chars.next(), Some('i' | 's' | 'g' | 'b')) || chars.next() != Some('=') {
+            return Err(StatusCode::BadNodeIdInvalid);
+        }
+        let value = &rest[2..];
+        if value.is_empty() || value.contains('\n') {
+            return Err(StatusCode::BadNodeIdInvalid);
+        }
+
+        Identifier::from_str(rest)
             .map(|t| NodeId::new(namespace, t))
             .map_err(|_| StatusCode::BadNodeIdInvalid)
     }
