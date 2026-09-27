@@ -1,21 +1,21 @@
-# OPC UA Gateway — Integration Test Architecture & Scenario
+# OPC UA Gateway — Test Architecture & Scenario
 
-Status: **the full scenario has now run against hardware — 48 of 56 checks pass**
-(§9). Eight firmware/infrastructure defects and five harness defects were found
-getting there (§8); eight checks still fail and four of those trace to a single
-unfixed firmware bug (§9.3).
+Status: **the OPC UA client is now tested end to end without hardware.** The
+loopback suite runs the gateway's real client against a real OPC UA server —
+the server half of the same library — in one process on `127.0.0.1`, and passes
+19/19 in about 20 seconds (§9.1). Against the code as it stood after the last
+hardware run, 9 of those 19 fail, reproducing the three open on-device bugs and
+four defects nobody had seen (§8.10–8.16). The on-device scenario has been
+ported from Python to Rust (`gateway-hil`) and **has not yet been re-run on
+hardware** since the port and the fixes.
 
-This document is the full specification of how the OPC UA gateway is tested
-end to end: what the test doubles are, what contract each side is held to, what
-the scenario asserts phase by phase, and how to reproduce the whole thing on a
-different machine.
-
-The companion quick-start is [`test-harness/README.md`](../test-harness/README.md).
-This file is the reference; that one is the cheat sheet.
+This document is the full specification of how the gateway is tested: the
+layers, the test doubles, the contract each side is held to, what every
+scenario asserts, and how to reproduce all of it on another machine.
 
 ---
 
-## 1. What is under test, and what is not
+## 1. What is under test, and where
 
 The unit under test is the **whole gateway path**, from the cloud handing down a
 configuration to a batch of PLC values landing in AWS:
@@ -24,157 +24,219 @@ configuration to a batch of PLC values landing in AWS:
 cloud config  ──▶  device applies it  ──▶  OPC UA subscription  ──▶  telemetry
 ```
 
-Deliberately **not** under test here:
+It is covered in three layers, from cheapest to most faithful:
+
+| Layer | What runs | Needs | Command |
+| --- | --- | --- | --- |
+| **Unit** | `gateway-core`: parsing, validation, digests, encoding, batching, diffing, backoff | nothing | `cargo test -p gateway-core --target host-tuple` |
+| **Loopback integration** | `gateway-opcua` — the firmware's actual OPC UA client — against `opcua-test-server`, both in one process on `127.0.0.1` | nothing | `cargo test -p gateway-opcua --target host-tuple` |
+| **Hardware-in-the-loop** | the firmware on an ESP32-S3 against the same server, configured through a real AWS IoT account | device, AWS credentials, a LAN path from device to host | `cargo run -p gateway-hil --target host-tuple -- …` |
+
+### 1.1 Why the loopback layer exists
+
+The firmware's OPC UA client has no device dependency — it is plain Rust on
+`async-opcua` and tokio — so it runs on a laptop exactly as it runs on the
+ESP32. Once it lives in its own crate, the question "does the client behave?"
+no longer needs a device at all:
+
+- **The same library on both ends.** The server is `async-opcua-server`, the
+  server half of the `async-opcua` stack the client is built on, at the same
+  version. There is no second protocol implementation in the loop whose quirks
+  have to be told apart from the gateway's.
+- **No network, so no firewall.** The previous harness ran its server on the
+  workstation and had the device connect *inbound*. On a managed macOS machine
+  the application firewall refuses that, and there is no user-level way around
+  it (§3.5). Loopback traffic is not filtered: client and server in one process
+  on `127.0.0.1` run on any machine, including CI.
+- **Failures a device run cannot stage.** A server that goes silent without
+  closing the socket, a disable while the server is hung, an endpoint change —
+  each is a few lines against an in-process server and a relay
+  ([`Blackhole`](../opcua-test-server/src/blackhole.rs)).
+- **Seconds, not twenty minutes.** The suite runs in ~20 s and every test owns
+  its own server on an ephemeral port, so they run in parallel.
+
+### 1.2 What only the device can show
+
+| Not covered below the HIL layer | Why | Where |
+| --- | --- | --- |
+| Heap and allocation behaviour | a laptop has gigabytes; the device has ~300 kB and no PSRAM | §8.5–8.8, §9.4 |
+| The ESP-IDF runtime under tokio | eventfd VFS, the inert signal driver | §8.2, §8.3 |
+| NVS caching and boot from cache | the `opcua` partition | `reboot` phase |
+| The MQTT/AWS planes | device policy, shadow, retained bundle, IoT rule | §8.1, all phases |
+
+Deliberately **not** under test anywhere:
 
 | Not tested | Why, and where it is covered |
 | --- | --- |
-| Pure logic (parsing, batching, diffing, digests, encoding) | 92 unit tests in `gateway-core`, run on the host: `cargo test -p gateway-core --target <host-triple>`. Duplicating them against hardware would be slower and prove less. |
-| Fleet provisioning by claim | Already exercised; the device under test is provisioned and reuses its NVS identity. See [`PROVISIONING.md`](PROVISIONING.md). |
-| OTA / Jobs | Separate concern. The scenario only asserts that OPC UA faults never take the OTA path down (§6, `server_down`). |
-| `Sign` / `SignAndEncrypt`, non-anonymous identity | Out of scope by decision D2/D3 in [`OPCUA_CLIENT_REQUIREMENTS.md`](OPCUA_CLIENT_REQUIREMENTS.md). The scenario asserts they are **refused**, not that they work. |
+| Fleet provisioning by claim | Already exercised; the device under test reuses its NVS identity. See [`PROVISIONING.md`](PROVISIONING.md). |
+| OTA / Jobs | Separate concern. The HIL run only asserts that OPC UA faults never take the OTA path down (`server_down`). |
+| `Sign` / `SignAndEncrypt`, non-anonymous identity | Out of scope by decision D2/D3 in [`OPCUA_CLIENT_REQUIREMENTS.md`](OPCUA_CLIENT_REQUIREMENTS.md). Both layers assert they are **refused**, not that they work. |
 
-The guiding rule: **everything is observed from outside the firmware.** No test
-hook, no debug build, no instrumentation. Nothing in production will be able to
-reach inside the device either, so a test that does would be proving something
-the operator can never rely on.
-
-That leaves exactly three observation channels, and the scenario uses all three:
-
-1. **`reported`** on the `opcua` named shadow — driver state, applied/failed
-   counts, last error, free heap.
-2. **Telemetry in CloudWatch Logs** — the actual batch payloads, routed by the
-   `dt/+/opcua` IoT rule.
-3. **The device serial log** — for the things that never reach the cloud:
-   backoff timing, the unencrypted-link warning, boot-from-NVS.
+The guiding rule, in every layer: **observe the gateway from outside.** The
+loopback tests read the health report and the telemetry the client would
+publish — never driver internals. The HIL run reads the shadow, CloudWatch and
+the serial log, because nothing in production can reach inside the device
+either.
 
 ---
 
 ## 2. Architecture
 
 ```
-                          ┌─────────────────────────────┐
-                          │  test-harness/tags.py       │
-                          │  THE TAG CATALOGUE          │
-                          │  (single source of truth)   │
-                          └───────┬─────────────┬───────┘
-                    builds nodes  │             │  builds the bundle
-                                  ▼             ▼
-  ┌───────────────────────────────────┐   ┌──────────────────────────────┐
-  │ opcua_test_server.py (asyncua)    │   │ cloud.py                     │
-  │  opc.tcp://<host>:4855/…          │   │  bundle + sha256             │
-  │  SecurityPolicy None, anonymous   │   │  retained publish            │
-  │  ns: urn:ergousha:opcua-test      │   │  shadow desired/reported     │
-  │  14 nodes + 1 absent address      │   │  CloudWatch telemetry reads  │
-  └──────────────┬────────────────────┘   └───────────┬──────────────────┘
-                 │ opc.tcp (plain TCP, port 4855)     │ HTTPS (IAM)
-                 │                                    │
-                 ▼                                    ▼
-        ┌──────────────────┐            ┌──────────────────────────────────┐
-        │   ESP32-S3       │  mTLS MQTT │          AWS IoT Core            │
-        │   gateway        │───────────▶│  shadow name/opcua   (control)   │
-        │                  │            │  cmd/…/tags/v<N>     (data, ret) │
-        │  USB serial ─────┼──┐         │  dt/<thing>/opcua    (telemetry) │
-        └──────────────────┘  │         └───────────────┬──────────────────┘
-                              │                         │ IoT rule dt/+/opcua
-                              ▼                         ▼
-                     ┌────────────────┐     ┌────────────────────────────┐
-                     │ device-serial  │     │ CloudWatch Logs            │
-                     │ .log           │     │ /esp32-ztp/opcua-telemetry │
-                     └────────┬───────┘     └───────────┬────────────────┘
-                              │                         │
-                              └────────┬────────────────┘
-                                       ▼
-                            ┌──────────────────────┐
-                            │  run_scenario.py     │
-                            │  phases + assertions │
-                            │  artifacts/*.json    │
-                            └──────────────────────┘
+                 ┌──────────────────────────────────────────────────┐
+                 │ opcua-test-server   (host only; a test fixture)  │
+                 │                                                  │
+                 │  catalogue.rs   THE TAG CATALOGUE — single source │
+                 │  documents.rs   bundle + shadow desired (cloud)  │
+                 │  server.rs      TestServer on async-opcua-server │
+                 │  blackhole.rs   TCP relay that can go silent     │
+                 │  main.rs        standalone binary, stdin faults  │
+                 └───────┬──────────────────┬───────────────┬───────┘
+                         │                  │               │
+          in-process, 127.0.0.1    in-process, 127.0.0.1    │ in-process, bound to the LAN
+                         ▼                  ▼               ▼
+  ┌──────────────────────────┐ ┌───────────────────────┐ ┌───────────────────────────────┐
+  │ gateway-opcua/tests      │ │ gateway-opcua/examples│ │ gateway-hil                   │
+  │ the real client, 19      │ │ local_gateway: the    │ │ phases + assertions; drives   │
+  │ scenarios, cargo test    │ │ client on a laptop    │ │ espflash, AWS and the server  │
+  └──────────────────────────┘ └───────────────────────┘ └──────┬──────────────┬─────────┘
+                                                                │ HTTPS (IAM)  │ espflash monitor
+                                                                ▼              ▼
+                                               ┌───────────────────┐   ┌─────────────────┐
+                                               │ AWS IoT Core      │   │ ESP32-S3        │
+                                               │ shadow, retained  │◀──│ firmware, which │
+                                               │ bundle, IoT rule  │   │ embeds the same │
+                                               │ → CloudWatch      │   │ gateway-opcua   │
+                                               └───────────────────┘   └─────────────────┘
 ```
+
+The firmware links `gateway-opcua` exactly as the tests do: through
+`gateway_opcua::new(options) -> (Client, Driver)` and `spawn_thread`. The tests
+even run the driver the same way — on its own thread, on a current-thread
+runtime.
 
 ### 2.1 Why a single tag catalogue
 
-`tags.py` is read by the server (to create nodes) **and** by the publisher (to
-build the bundle). If the two were maintained separately, a one-character typo
-in an address would produce `BadNodeIdUnknown` on the device and look exactly
-like a gateway bug. Sharing the catalogue makes that class of false positive
-impossible.
+[`catalogue.rs`](../opcua-test-server/src/catalogue.rs) is read by the server
+(to create nodes) **and** by the document builders (to build the bundle). If the
+two were maintained separately, a one-character typo in an address would produce
+`BadNodeIdUnknown` and look exactly like a gateway bug. Each tag also declares
+the JSON encoding the gateway must produce for it, so a new value type is one new
+entry: both the loopback suite and the HIL `telemetry` phase pick up its
+assertion without further edits.
 
-### 2.2 Why a self-check client
+### 2.2 Why no replica client
 
-`selfcheck_client.py` performs the *same* call sequence as
-[`src/opcua/driver.rs`](../src/opcua/driver.rs): connect anonymously, read
-`Server_NamespaceArray` (`i=2255`), one subscription per distinct scan rate,
-chunked `CreateMonitoredItems` at 50 per request, tolerate per-item failures.
+The Python harness shipped `selfcheck_client.py`, a second client that replayed
+the driver's call sequence in another library, so that "is the harness wrong or
+is the device wrong?" could be answered in seconds. That question now has a
+direct answer: the HIL `preflight` phase runs **the firmware's own client**
+(`gateway-opcua`) against the server over loopback. If that passes and the
+device fails, the fault is in the device, the network path or the cloud — not
+in the server and not in the client logic.
 
-It exists purely to answer one question when something breaks: *is the harness
-wrong, or is the device wrong?* If the self-check passes and the device fails,
-the fault is in the firmware or the network path. That question came up for real
-during bring-up (§8, §9) and the self-check settled it in seconds each time.
+### 2.3 Why the documents are not built with `gateway-core`
 
-### 2.3 Why the cloud side needs no device certificate
+[`documents.rs`](../opcua-test-server/src/documents.rs) writes the tag bundle and
+the shadow's `state.desired` with plain `serde_json`. They stand in for a
+producer the firmware does not control (the cloud side), so they are written
+independently of the parser they are fed to. Built with `gateway-core`'s own
+types, a schema bug would agree with itself and pass.
 
-Everything the harness does with AWS goes through IAM-authorised HTTP APIs —
+### 2.4 Why the cloud side needs no device certificate
+
+Everything `gateway-hil` does with AWS goes through IAM-authorised HTTPS —
 `UpdateThingShadow`, `GetThingShadow`, `Publish` (with `retain`), and CloudWatch
 `FilterLogEvents`. There is no MQTT client and therefore no X.509 identity to
 provision for the test itself. Telemetry is observed through the IoT rule rather
 than by subscribing, which is what keeps this true.
 
+### 2.5 Servers differ; the gateway must not
+
+`async-opcua-server` accepts a monitored item for a NodeId that does not exist
+and reports `BadNodeIdUnknown` in the first notification instead; most PLCs, and
+the Python `asyncua` server, reject it in `CreateMonitoredItems`. The
+specification allows both. The first loopback run showed that the gateway's idea
+of a *failed* tag depended on which one it was talking to (§8.16), and the fix
+went into the gateway, not the fixture — the test server stays lenient on
+purpose, because real servers are.
+
 ---
 
 ## 3. Prerequisites
 
-### 3.1 Hardware
+### 3.1 For the host layers
+
+Only a Rust toolchain. The espup `esp` toolchain pinned in `rust-toolchain.toml`
+works (it ships host `std`), and so does upstream stable:
+
+```sh
+cargo test -p gateway-core -p gateway-opcua -p opcua-test-server --target host-tuple
+RUSTUP_TOOLCHAIN=stable cargo test -p gateway-opcua --target host-tuple   # same, on stable
+```
+
+`--target host-tuple` is required: `.cargo/config.toml` defaults every build to
+`xtensa-esp32s3-espidf`.
+
+### 3.2 Hardware (HIL only)
 
 - Waveshare ESP32-S3-ETH, connected over USB (native USB-Serial-JTAG, no driver
   needed). It appears as `/dev/cu.usbmodem*` on macOS.
 - The device must already be provisioned (it reuses its NVS identity). This one
   is thing `28848553144F`.
 
-### 3.2 Toolchain
+### 3.3 Toolchain (HIL only)
 
 ```sh
-. ~/export-esp.sh                 # espup toolchain + espflash on PATH
-cargo install espflash --locked   # one-time
+. ~/export-esp.sh                     # espup toolchain
+cargo install espflash --locked       # one-time; lands in ~/.cargo/bin
+cargo build --release                 # the firmware image the run flashes
 ```
 
-### 3.3 Python harness
+`export-esp.sh` does not put `~/.cargo/bin` on `PATH`; the runner finds
+`espflash` there regardless.
+
+### 3.4 AWS (HIL only)
 
 ```sh
-cd test-harness
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+source aws-env.sh                     # credentials for the account holding the thing
 ```
 
-### 3.4 AWS
+The IoT data endpoint is read from `cfg.toml` (`iot_endpoint`, the same value the
+firmware is built with); pass `--iot-endpoint` to override. The device policy
+**must** grant the named-shadow topics — see §8.1; this was missing and is the
+single most likely thing to be missing again in a fresh account.
 
-```sh
-source aws-env.sh                 # credentials for the account holding the thing
-```
+### 3.5 Network — the part that actually bites (HIL only)
 
-The device policy **must** grant the named-shadow topics. See §8.1 — this was
-missing and is the single most likely thing to be missing again in a fresh
-account.
+The OPC UA server runs inside `gateway-hil` on the workstation and the **device
+connects inbound to it**. Three things must hold:
 
-### 3.5 Network — the part that actually bites
-
-The OPC UA server runs on the workstation and the **device connects inbound to
-it**. Three things must hold:
-
-1. The server binds `0.0.0.0`, not `127.0.0.1`.
+1. The server binds `0.0.0.0` (the runner does this), not `127.0.0.1`.
 2. `--server-host` is a LAN address the device can route to (same subnet as the
-   device's DHCP lease is simplest).
-3. **The workstation's firewall allows inbound TCP 4855 to the Python process.**
+   device's DHCP lease is simplest). The runner refuses a loopback address.
+3. **The workstation's firewall admits inbound TCP on `--server-port`.**
 
-Point 3 is not hypothetical: a macOS Application Firewall rule blocked the
-on-device run on the machine this was originally developed on. Verify it from a
-*different* host before blaming the firmware:
+Point 3 is not hypothetical: the macOS Application Firewall on a managed machine
+blocked every on-device run from the workstation this was developed on, and a
+managed profile cannot be overridden locally. Verify from a *different* host
+before blaming the firmware:
 
 ```sh
 nc -z -w 3 <workstation-lan-ip> 4855 && echo reachable
 ```
 
-Testing from the workstation itself proves nothing — loopback bypasses the
-host firewall entirely.
+Testing from the workstation itself proves nothing — loopback bypasses the host
+firewall entirely, which is exactly why the loopback layer works there.
+
+If the workstation cannot admit the connection, run `gateway-hil` from a machine
+that can (any Linux box on the device's LAN — it is plain Rust with no
+workstation-specific dependency), or run the standalone server there and keep
+only the AWS side local:
+
+```sh
+cargo run -p opcua-test-server --target host-tuple -- --bind 0.0.0.0 --host <that-host-ip>
+```
 
 **On WSL2 there is a fourth requirement.** WSL2's default networking is NAT, so
 the server binds an address (e.g. `172.20.x.x`) that exists only inside the VM
@@ -190,22 +252,20 @@ netsh advfirewall firewall add rule name="OPCUA test 4855" dir=in `
 ```
 
 The WSL IP changes across reboots, so re-check it (`hostname -I`) and update the
-proxy. `Test-NetConnection` from the Windows host proves the proxy works but
-says nothing about the LAN path — verify from a third machine.
+proxy.
 
-This is safe with respect to the endpoint URL the server advertises. The
-harness starts the server bound to `0.0.0.0`, so it advertises
-`opc.tcp://0.0.0.0:4855/…`, which would break a client that followed the
-discovery response — but the firmware connects straight to its configured
-endpoint and skips discovery precisely because "servers behind NAT or Docker
-routinely advertise unreachable hostnames" (`src/opcua/session.rs`).
+The advertised endpoint URL does not matter: the firmware connects straight to
+its configured endpoint and skips discovery precisely because "servers behind
+NAT or Docker routinely advertise unreachable hostnames"
+(`gateway-opcua/src/session.rs`).
 
 ---
 
 ## 4. The tag catalogue
 
 15 addresses: 14 nodes the server creates, and 1 it deliberately does not.
-Every entry earns its place by proving a distinct behaviour.
+Every entry earns its place by proving a distinct behaviour. Defined in
+[`opcua-test-server/src/catalogue.rs`](../opcua-test-server/src/catalogue.rs).
 
 | Address | OPC UA type | Scan | Behaviour | What it proves |
 | --- | --- | --- | --- | --- |
@@ -220,21 +280,24 @@ Every entry earns its place by proving a distinct behaviour.
 | `Line1.BatchId` | Guid | 1 s | constant | **`{"$t":"guid","v":"…"}`** |
 | `Line1.Profile` | Double[5] | 1 s | varies | array Variant → JSON array |
 | `Line1.Static` | Double | 1 s | **never changes** | report-by-exception: must be reported **once**, not every second. This is the canary that distinguishes a real subscription from a polling loop. |
-| `Line1.Faulty` | Double | 1 s | `BadDeviceFailure` | a Bad StatusCode travels as the optional **4th** row element |
+| `Line1.Faulty` | Double | 1 s | `BadDeviceFailure` while the fault is injected | a Bad StatusCode travels as the optional **4th** row element |
 | `Line2.Level` | Double | 5 s | slow ramp | a second scan rate ⇒ a second subscription |
 | `Line2.Mode` | Int16 | 5 s | cycles 1–3 | Int16 → bare JSON number |
 | `Line1.DoesNotExist` | — **absent** | 1 s | — | one unknown NodeId is reported as failed **without** taking the other 14 down (requirements finding A4) |
 
-`Line1.Faulty` is written with `Server.write_attribute_value()` rather than the
-public `write_value()`, because the public path validates the StatusCode and
-refuses to store a Bad one — which is exactly the case the gateway must handle.
+The server steps values every 500 ms and writes each as a full `DataValue`
+(value, status, source and server timestamps), which is how `Line1.Faulty` gets
+its Bad status. The fault starts injected and is written only on a transition,
+never re-written every tick — that would hide whether the gateway reports by
+exception. `set_fault(false)` turns it into a Good `123.45`.
 
 ---
 
 ## 5. Wire contracts
 
 All four payloads below are from the real bring-up run against thing
-`28848553144F`.
+`28848553144F`. `opcua-test-server` produces byte-identical bundles for the same
+tag list.
 
 ### 5.1 Tag bundle — retained on `cmd/<thing>/opcua/tags/v1`
 
@@ -245,9 +308,9 @@ All four payloads below are from the real bring-up run against thing
 {"v":1,"g":[{"r":1000,"a":["Line1.Temp","Line1.Pressure","Line1.Running","Line1.State","Line1.Counter","Line1.BigCounter","Line1.Serial","Line1.Blob","Line1.BatchId","Line1.Profile","Line1.Static","Line1.Faulty","Line1.DoesNotExist"]},{"r":5000,"a":["Line2.Level","Line2.Mode"]}]}
 ```
 
-The digest is computed over **exactly these bytes**, so the publisher serialises
-with `separators=(",", ":")` and no key sorting. That is a contract, not a
-formatting preference — reformat the JSON and the device correctly rejects it.
+The digest is computed over **exactly these bytes**, so the builder serialises
+without whitespace and in this field order. That is a contract, not a formatting
+preference — reformat the JSON and the device correctly rejects it.
 
 ### 5.2 Shadow `state.desired` — `$aws/things/<thing>/shadow/name/opcua`
 
@@ -265,8 +328,10 @@ formatting preference — reformat the JSON and the device correctly rejects it.
 ```
 
 The device applies a bundle only when `bundle.v == cfg.v` **and**
-`sha256(bundle) == cfg.sha256`. The two planes therefore cannot desynchronise
-silently, and re-delivering the same `cfg.v` is a no-op.
+`sha256(bundle) == cfg.sha256` — in one place, `gateway_opcua::AppliedConfig::new`,
+whether the bundle came from MQTT, from NVS or from a file on a laptop. The two
+planes therefore cannot desynchronise silently, and re-delivering the same
+`cfg.v` is a no-op.
 
 ### 5.3 Telemetry batch — `dt/<thing>/opcua`
 
@@ -284,87 +349,125 @@ Row shape is `[address, source_ts_ms, value]` with an optional 4th element
 carrying the StatusCode **only when it is not Good** — the overwhelmingly common
 case stays three elements. `2156396544` is `0x808B0000`, `BadDeviceFailure`.
 
+`v` is the configuration version the rows were **collected** under. Every sample
+carries it from the subscription that produced it, and a batch never mixes two
+(§8.17).
+
 ### 5.4 Shadow `state.reported`
 
 ```json
 {"fw":"0.0.1","cfg_v":1,"state":"running","applied":14,"failed":1,
- "failed_sample":["Line1.DoesNotExist"],"srv_publish_ms":1000,
+ "failed_sample":[{"a":"Line1.DoesNotExist","s":2150891520}],"srv_publish_ms":1000,
  "last_error":null,"uptime_s":312,"free_heap":118432}
 ```
 
+`failed_sample` entries are `{a: address, s: StatusCode}`; §4.1 of the
+requirements still shows bare strings (§9.5).
+
 ---
 
-## 6. The scenario
+## 6. The scenarios
+
+### 6.1 Loopback suite — `gateway-opcua/tests/scenario.rs`
+
+Each test starts its own server on an ephemeral loopback port and its own
+driver. They observe the client through `Client::reported()` (the future shadow
+`reported`) and `Client::drain()` run through the real batcher (the future
+telemetry payload).
+
+| Test | Asserts | Mirrors |
+| --- | --- | --- |
+| `catalogue_documents_pass_the_gateways_own_parser` | the independently-built documents parse with `gateway-core` and expand to the expected NodeIds | `preflight` |
+| `documents_fit_their_transport_budgets` | bundle ≤ `MAX_BUNDLE_BYTES`, shadow < 8 KB | `preflight` |
+| `a_secured_configuration_is_refused_never_downgraded` | `Basic256Sha256` / `SignAndEncrypt` refused, naming the value | `reject_security` |
+| `a_bundle_whose_digest_does_not_match_is_refused` | digest mismatch refused, error names `sha256` | `reject_digest` |
+| `a_bundle_for_another_version_is_refused` | `bundle.v != cfg.v` refused | — |
+| `provision_applies_every_present_tag_and_names_the_absent_one` | `running`, 14 applied, 1 failed with `BadNodeIdUnknown`, one session; re-applying the running config is a no-op | `provision` |
+| `telemetry_matches_the_wire_contract_for_every_type` | every catalogue encoding; `f32` shortest decimal; `i64`/`u64` exact past 2⁵³; base64, GUID, arrays; Good omitted, Bad as element 4; `Line1.Static` exactly once; 5 s group slower than 1 s | `telemetry` |
+| `status_transitions_are_reported_as_they_happen` | Bad → Good → Bad on `Line1.Faulty` reaches telemetry each time | — |
+| `reconfiguration_is_applied_live_on_the_same_session` | v2 applied without reconnecting; every later sample stamped v2; removed tags stop; nothing delivered twice | `reconfig` |
+| `a_new_endpoint_is_a_new_session` | a config naming another server connects to it, and survives the old one disappearing | — |
+| `namespace_uri_rescues_a_wrong_index` | `ns: 99` + `ns_uri` → all applied | `ns_uri` |
+| `a_wrong_namespace_without_a_uri_fails_loudly` | `ns: 99` alone → `error`, "monitored items were rejected" | — |
+| `server_loss_is_noticed_backed_off_and_recovered_from` | killed server → `error` within 5 s, "session lost"; ≤ 7 reconnect attempts in 6 s; same endpoint back → `running`, all items re-created | `server_down` |
+| `a_silent_link_is_noticed_by_the_keepalive` | a link that swallows bytes without closing → `error` via keep-alive; link back → `running` | — |
+| `an_unreachable_endpoint_is_retried_with_backoff` | a port that refuses at boot → `error` naming the endpoint, 2–8 attempts in 6 s | — |
+| `disable_idles_the_driver_and_stops_telemetry_then_resumes` | `idle` within 6 s, config kept, no samples while disabled, re-enable resumes | `disable` |
+| `disable_completes_while_the_server_is_down` | disable after a server loss → `idle` | `disable` (§8.11) |
+| `disable_completes_while_the_server_is_hung` | disable while `CloseSession` can never be answered → `idle` within the 3 s bound; the next config is taken up | `disable` (§8.11) |
+| `every_catalogue_encoding_is_exercised` | the catalogue covers every encoding | — |
+
+### 6.2 On-device scenario — `gateway-hil`
 
 Ten phases, run in order because they share state — `reconfig` is only
 meaningful once `provision` has applied something. Individually selectable with
 `--phases` so a single failure can be re-run without repeating the whole thing.
 
-### Phase 1 — `preflight` (no device involved)
+#### Phase 1 — `preflight` (no device involved)
 
 | | |
 | --- | --- |
-| **Action** | Start the server; run `selfcheck_client.py` against it; size-check the bundle and the shadow document. |
-| **Asserts** | Server answers the firmware's exact call sequence; 14 items applied and exactly `Line1.DoesNotExist` failed; the static tag reported once; the faulty tag carries a Bad status; bundle ≤ 10 KiB (`MAX_BUNDLE_BYTES`); desired document < 8 KB. |
-| **Why first** | If this fails, nothing downstream is interpretable. |
+| **Action** | Start the server; run the firmware's own OPC UA client (`gateway-opcua`) against it over loopback; size-check the bundle and the shadow document. |
+| **Asserts** | The client reaches `running` with 14 items applied and exactly the absent tag failed; bundle ≤ 10 KiB (`MAX_BUNDLE_BYTES`); desired document < 8 KB. |
+| **Why first** | If this fails, nothing downstream is interpretable. It does **not** prove the device can reach the host (§3.5). |
 
-### Phase 2 — `provision`
+#### Phase 2 — `provision`
 
 | | |
 | --- | --- |
 | **Action** | Publish bundle v1 retained, then `state.desired` pointing at it. |
-| **Asserts** | `state=running`, `cfg_v=1`; `applied=14`; `failed=1`; `failed_sample=["Line1.DoesNotExist"]`; **the other 14 tags still run** (finding A4); `free_heap > 40 KB`; serial log contains the `UNENCRYPTED and UNAUTHENTICATED` warning (NFR §7) and `OPC UA synced: 2 subscriptions`. |
+| **Asserts** | `state=running`, `cfg_v=1`; `applied=14`; `failed=1`; `failed_sample` names `Line1.DoesNotExist`; **the other 14 tags still run** (finding A4); `free_heap > 40 KB`; serial log contains the `UNENCRYPTED and UNAUTHENTICATED` warning (NFR §7) and `OPC UA synced: 2 subscriptions`. |
 
-### Phase 3 — `telemetry`
+#### Phase 3 — `telemetry`
 
 | | |
 | --- | --- |
-| **Action** | Wait for ≥3 batches to reach CloudWatch. |
-| **Asserts** | Every batch stamped with the applied `cfg.v`; the absent tag never produces a sample; **per-type encoding** for all 9 encodable types, driven off the catalogue's `expects` field; Good status omitted (3-element row); Bad status present as element 4 with `0x808B0000`; `Line1.Static` reported ≤2 times while `Line1.Temp` reported many (report-by-exception); the 5 s group reports less often than the 1 s group; no batch exceeds `batch_max_bytes`. |
+| **Action** | Wait for ≥3 batches to reach CloudWatch, counting only batches written since the run started. |
+| **Asserts** | Every batch stamped with the applied `cfg.v`; the absent tag never produces a sample; **per-type encoding** for every catalogue tag; Good status omitted (3-element row); Bad status present as element 4 with `0x808B0000`; `Line1.Static` reported ≤2 times while `Line1.Temp` reported many (report-by-exception); the 5 s group reports less often than the 1 s group; no batch exceeds `batch_max_bytes`. |
 
-### Phase 4 — `reconfig`
+#### Phase 4 — `reconfig`
 
 | | |
 | --- | --- |
 | **Action** | Publish v2: drop the `Line2.*` group and the absent tag, move `Line1.Temp` from the 1 s to the 5 s group. |
 | **Asserts** | `cfg_v=2` with `state=running` and **no reboot or reflash**; all v2 tags applied, `failed=0`; serial log shows `config v1 -> v2`; telemetry re-stamped `v:2` and the removed addresses stop appearing. |
 
-### Phase 5 — `ns_uri`
+#### Phase 5 — `ns_uri`
 
 | | |
 | --- | --- |
 | **Action** | Publish v3 with a deliberately **wrong** `ns: 99` but a correct `ns_uri`. |
-| **Asserts** | Device resolves the URI against the server's NamespaceArray, renumbers every NodeId, and applies all items. Without URI resolution every item would be rejected and the driver would bail with "all items rejected". Serial log must **not** contain a namespace-fallback warning. |
+| **Asserts** | Device resolves the URI against the server's NamespaceArray, renumbers every NodeId, and applies all items. Serial log must **not** contain a namespace-fallback warning. |
 
-### Phase 6 — `reject_security`
+#### Phase 6 — `reject_security`
 
 | | |
 | --- | --- |
 | **Action** | Publish v4 with `sec_policy: "Basic256Sha256"`, `sec_mode: "SignAndEncrypt"`. |
-| **Asserts** | `last_error` names the offending value; `cfg_v` **stays 3**. The point is the negative: a gateway that silently downgrades to an unsecured channel is worse than one that refuses. |
+| **Asserts** | `last_error` names the offending value; `cfg_v` **stays 3**. A gateway that silently downgrades to an unsecured channel is worse than one that refuses. |
 
-### Phase 7 — `reject_digest`
+#### Phase 7 — `reject_digest`
 
 | | |
 | --- | --- |
 | **Action** | Publish v5 whose shadow `cfg.sha256` is 64 zeros while the bundle is real. |
-| **Asserts** | Bundle refused with a digest error; `cfg_v` stays 3. Proves the two planes cannot be desynchronised by a torn or stale publish. |
+| **Asserts** | Bundle refused with a digest error; `cfg_v` stays 3. |
 
-### Phase 8 — `server_down`
+#### Phase 8 — `server_down`
 
 | | |
 | --- | --- |
-| **Action** | Re-establish a good config (v6), then `SIGKILL` the OPC UA server mid-session. Restart it afterwards. |
+| **Action** | Re-establish a good config (v6), then stop the OPC UA server mid-session. Restart it on the same endpoint afterwards. |
 | **Asserts** | Device reaches `state=error`; retry delays in the serial log show real backoff, not a tight loop; **the MQTT/OTA path stays alive** while OPC UA is down; the device reconnects **by itself** once the server returns and re-creates every item. |
 
-### Phase 9 — `disable`
+#### Phase 9 — `disable`
 
 | | |
 | --- | --- |
-| **Action** | `enabled: false`, wait, then re-enable under a fresh version. |
+| **Action** | `enabled: false` under a fresh version, wait, then re-enable under another. |
 | **Asserts** | Driver goes `idle`; **zero** telemetry batches in a 45 s window (measured after a 30 s drain, because the IoT-rule→CloudWatch hop lags); re-enabling returns it to `running`. |
 
-### Phase 10 — `reboot`
+#### Phase 10 — `reboot`
 
 | | |
 | --- | --- |
@@ -375,14 +478,42 @@ meaningful once `provision` has applied something. Individually selectable with
 
 ## 7. Running it
 
+### 7.1 Host
+
+```sh
+cargo test -p gateway-core -p gateway-opcua -p opcua-test-server --target host-tuple
+
+# one test, with the driver's own log lines (the device's serial-console view)
+RUST_LOG=info cargo test -p gateway-opcua --target host-tuple -- --nocapture server_loss
+```
+
+The client on a laptop — against the in-process test server by default, or any
+server with `--endpoint`. Telemetry goes to stdout exactly as it would be
+published; health changes to stderr:
+
+```sh
+cargo run -p gateway-opcua --example local_gateway --target host-tuple
+cargo run -p gateway-opcua --example local_gateway --target host-tuple -- \
+    --endpoint opc.tcp://192.168.1.50:4840 --ns-uri urn:plc:ns --bundle tags.json
+```
+
+The standalone server, for a device to dial, with fault injection on stdin
+(`fault on`/`fault off`, `freeze`/`thaw`, `quit`):
+
+```sh
+cargo run -p opcua-test-server --target host-tuple -- --bind 0.0.0.0 --host <lan-ip>
+```
+
+### 7.2 Hardware-in-the-loop
+
 ```sh
 source aws-env.sh
 . ~/export-esp.sh
-cd test-harness
+cargo build --release                     # the image --flash writes
 
-.venv/bin/python run_scenario.py \
+cargo run -p gateway-hil --target host-tuple -- \
     --thing 28848553144F \
-    --server-host 192.168.50.28 \      # LAN IP the DEVICE can reach
+    --server-host 192.168.50.28 \         # LAN IP the DEVICE can reach
     --port /dev/cu.usbmodem21401 \
     --flash \
     --cleanup
@@ -390,28 +521,24 @@ cd test-harness
 
 | Flag | Effect |
 | --- | --- |
-| `--flash` | Build must already exist; flashes it with `partitions.csv` into `ota_0` first. |
+| `--flash` | Flashes the existing release build with `partitions.csv` into `ota_0` first. |
 | `--phases a,b` | Run a subset. |
-| `--cleanup` | Clear the retained tag bundles afterwards, so a later boot cannot pick up a stale config from a forgotten run. |
-| `--artifacts DIR` | Where the serial log, server log and JSON summary land (default `test-harness/artifacts/`). |
+| `--cleanup` | Clear the retained tag bundles the run published, so a later boot cannot pick up a stale config from a forgotten run. |
+| `--artifacts DIR` | Where the serial log and JSON summary land (default `gateway-hil/artifacts/`). |
+| `--iot-endpoint HOST` | IoT data endpoint, if not the one in `cfg.toml`. |
 
-Exit code is 0 only if every check in every phase passed.
-
-Before the scenario, the host-side unit tests should be green:
-
-```sh
-cargo test -p gateway-core --target aarch64-apple-darwin   # 92 tests
-```
+Exit code is 0 only if every check in every phase passed, 1 on a failed check,
+2 if the run itself could not proceed.
 
 ---
 
-## 8. Defects found during bring-up
+## 8. Defects found
 
 §8.1–8.3 were found before a single scenario phase ran. §8.4–8.8 were found by
 the first run that reached hardware, each one uncovered only after the previous
-was fixed — the device could not get past `connecting` until §8.4, and each
-subsequent fix exposed the next allocation. §8.9 collects the harness's own
-bugs, which the first hardware run also flushed out.
+was fixed. §8.9 collects the old harness's own bugs. §8.10–8.16 were found by the
+loopback suite on its first run — each is a failing test against the previous
+code, listed in §9.1 — and §8.17–8.19 while moving the client into its own crate.
 
 ### 8.1 The device policy had no shadow permissions — the config plane could never work
 
@@ -451,7 +578,10 @@ MQTT, Jobs and OTA all kept running, and the only symptom was that no OPC UA
 data ever appeared.
 
 Fixed with `register_eventfd()` in [`src/telemetry/mod.rs`](../src/telemetry/mod.rs),
-called before the runtime is built.
+called before the runtime is built. Since the move to `gateway-opcua`, a runtime
+that cannot be built is also no longer silent: `spawn_thread` returns the error,
+and the firmware puts it in `reported.last_error` with `state: error` while
+keeping MQTT and OTA up.
 
 ### 8.3 Tokio's signal driver panicked the OPC UA thread on every boot
 
@@ -489,7 +619,7 @@ session:1 Cannot find user token type Anonymous for this endpoint, cannot connec
 BadSecurityPolicyRejected
 ```
 
-`src/opcua/session.rs` built its endpoint with `EndpointDescription::from(&str)`,
+`src/opcua/session.rs` (now `gateway-opcua/src/session.rs`) built its endpoint with `EndpointDescription::from(&str)`,
 and that conversion leaves `user_identity_tokens` **empty**
 (`crates/async-opcua-types/src/impls.rs`). Because the firmware deliberately
 skips discovery (§2 of that file's header — servers behind NAT advertise
@@ -552,7 +682,7 @@ MQTT connect and under 9 kB two seconds later.
 Fixed with `preload_types()` in the vendored crate, called from `main()` before
 `Peripherals::take()`. The table is then paid for out of ~292 kB.
 
-Two size budgets were cut alongside it, in `src/opcua/session.rs`:
+Two size budgets were cut alongside it, in `gateway-opcua/src/session.rs`:
 `MAX_MESSAGE_SIZE` 64 KiB → 16 KiB, `MAX_CHUNK_SIZE` 16 KiB → 8 KiB,
 `MAX_CHUNK_COUNT` 8 → 4.
 
@@ -596,67 +726,47 @@ well as telemetry — a worse failure than the one being fixed.
 This helped (43 → 45 of 56, device stable at the end of the run rather than
 frozen) but did **not** eliminate the aborts. See §9.4.
 
-### 8.9 Harness defects
 
-Unlike §8.1–8.3, these are bugs in the test harness itself. Each made a healthy
-device look broken, which is the expensive kind of test bug.
+### 8.9 Harness defects (Python harness, retired)
 
-| # | Defect | Effect |
+Bugs in the test harness itself, found by the first hardware runs. Each made a
+healthy device look broken, which is the expensive kind of test bug. The Rust
+runner keeps every fix.
+
+| # | Defect | Effect, and what the harness does now |
 | --- | --- | --- |
-| a | `README` claimed `export-esp.sh` puts `espflash` on `PATH`; it only adds the xtensa toolchain | Run died with a bare `FileNotFoundError` after the build. `espflash_bin()` now resolves `~/.cargo/bin` explicitly. |
-| b | Monitor attached after flashing with `--no-reset` | An ESP32-S3 re-enumerates its USB-JTAG on every reset, so the monitor held a node that never delivered a byte — 227 bytes captured, and every log assertion failed. `wait_for_port()` now waits for a stable inode, and a run that flashed spends one deliberate reset to catch the boot. |
-| c | `reported` was read without checking its age | A shadow written **4.6 hours earlier** satisfied the predicates: a device that had never booted reported `state=connecting` 37 times and produced eight failures describing firmware that was not running. `Cloud.require_fresh_since(t0_ms)` now rejects any document older than the run. |
-| d | `set(failed_sample)` assumed bare strings | The firmware reports `{"a": addr, "s": statuscode}` (`gateway_core::health::FailedTag`) while §4.1 of the requirements shows strings. The `TypeError` took the whole `provision` phase down — 1 check instead of 8. The harness now accepts either shape; **the spec/implementation mismatch itself is still open** (§9.5). |
-| e | `disable` republished config **v6**, which `server_down` had already published | Re-delivery of an applied `cfg.v` is a no-op by definition (requirements §7, *Idempotency*, `ConfigPlane::handle`), so `enabled: false` never reached the driver and the phase reported a firmware failure that never happened. Versions are now 1–8 with no collisions. |
+| a | Docs claimed `export-esp.sh` puts `espflash` on `PATH`; it only adds the xtensa toolchain | The run died after the build. `device::espflash()` resolves `~/.cargo/bin` explicitly. |
+| b | Monitor attached after flashing with `--no-reset` | An ESP32-S3 re-enumerates its USB-JTAG on every reset, so the monitor held a node that never delivered a byte — every log assertion failed. `wait_for_port()` waits for a stable inode, and a run that flashed spends one deliberate reset to catch the boot. |
+| c | `reported` was read without checking its age | A shadow written **4.6 hours earlier** satisfied the predicates, and eight failures described firmware that was not running. `Cloud::require_fresh_since(t0_ms)` rejects any document older than the run. |
+| d | `failed_sample` assumed bare strings | The firmware reports `{"a", "s"}` objects; the harness accepts either shape. The spec mismatch itself is still open (§9.5). |
+| e | `disable` republished an already-applied version | A no-op by definition, so the phase reported a failure that never happened. Versions are 1–8 with no collisions. |
+| f | `telemetry` counted batches from up to 120 s before the run | A previous run's batches could fail the version check (a possible reading of §9.6). The window now starts no earlier than the run. |
 
----
+### 8.10 The library's own reconnect loop hid a dead server (was §9.7)
 
-## 9. Current status
+```
+✗ device noticed the server was gone — state=running
+```
 
-Last full run: **2026-08-01, 48/56 checks passed, exit code 1.**
-Artifacts: `test-harness/artifacts/{device-serial,opcua-server}-20260801-191812.log`.
+`async-opcua`'s session event loop reconnects on its own when the transport
+drops — up to 10 times, backing off from 1 s to 30 s — and the driver's
+liveness check was `event_loop.is_finished()`. While the library retried, the
+handle was not finished, so a dead server was reported as `running` for minutes
+and the driver's own backoff never engaged.
 
-### 9.1 Scorecard
+This also recasts an earlier observation: the "1 s → 2 s → 4 s → 8 s → 16 s"
+retry spacing verified on hardware was the **library's** schedule, not the
+driver's (whose delays are jittered).
 
-| Phase | Result | Note |
-| --- | --- | --- |
-| `preflight` | **3/3** | |
-| `provision` | 7/8 | only the heap assertion fails — §9.4 |
-| `telemetry` | 21/22 | §9.6 |
-| `reconfig` | **4/4** | live reconfiguration, no reboot, telemetry re-stamped |
-| `ns_uri` | **3/3** | `ns: 99` rescued via NamespaceArray |
-| `reject_security` | **2/2** | `Basic256Sha256` refused, no silent downgrade |
-| `reject_digest` | **2/2** | digest mismatch refused |
-| `server_down` | 4/6 | §9.7 |
-| `disable` | 1/3 | §9.3 |
-| `reboot` | 1/3 | §9.3, §9.8 |
+**Fixed** by making the driver's backoff the only retry mechanism:
+`session_retry_limit(0)` for the initial connect and
+`Session::disable_reconnects()` once the session is up, so a lost transport ends
+the event loop and the driver sees it at once. Steady state is now event-driven —
+the driver awaits the session's end rather than polling every 500 ms.
+Loopback: `server_loss_is_noticed_backed_off_and_recovered_from` — `error`
+within 5 s, not "never".
 
-Verified end to end and worth stating plainly: two-plane configuration, the full
-§5.3 wire-format matrix (`i64`/`u64`/`b64`/`guid` tagging past 2⁵³, `f32`
-shortest-decimal widening, Bad status as the 4th element, report-by-exception on
-an unchanging tag), live reconfiguration, `ns_uri` rescue, and both refusal
-paths.
-
-### 9.2 How to read a failing run
-
-Two failure modes here are *not* firmware defects and have both been mistaken for
-them:
-
-1. **A stale `reported` block.** Guarded since §8.9c — a rejected document now
-   prints `reported: (stale — …)` and the failure says so explicitly.
-2. **A device that is crash-looping.** Symptom: every phase from some point on
-   reports an *identical* snapshot, including the same `uptime_s`. That is one
-   fault reported ten times, not ten faults. Check
-   `grep -c "memory allocation of" <serial log>` before reading further.
-
-### 9.3 OPEN — `Command::Disable` never completes (firmware, unfixed)
-
-**This single bug accounts for four of the eight remaining failures.**
-
-The device logs `OPC UA disabled by configuration` and telemetry does stop — the
-"telemetry stopped while disabled" check passes. But there are **zero
-`-> idle` transitions in the entire run**, and `set_state` logs unconditionally
-on change. The two lines that follow explain it:
+### 8.11 `Session::disconnect` could wait forever (was §9.3)
 
 ```
 OPC UA disabled by configuration
@@ -664,39 +774,193 @@ W session:1 Failed to close session, channel will be closed anyway: BadConnectio
 E Failed to send disconnect message, queue full: BadConnectionClosed
 ```
 
-`connection.shutdown().await` in `src/opcua/driver.rs` (the `Command::Disable`
-arm) does not return, so `set_state(&shared, DriverState::Idle)` on the very
-next line never runs. Observed consequences:
+`disconnect()` sends `CloseSession`, closes the channel, and then waits for the
+event loop to publish `SessionState::Disconnected`. The event loop only
+publishes that from a **connected** transport closing. Mid-reconnect (§8.10) it
+never did, so `connection.shutdown().await` never returned, `Idle` was never
+reported, and the wedged driver ignored every later configuration — which is
+why `reboot` also failed.
 
-- the shadow reports `state: running` indefinitely while the driver is dead —
-  an operator cannot distinguish a disabled gateway from a working one;
-- AWS re-sends the delta every 30 s (nine times in the captured run) because
-  `reported` never acknowledges it;
-- 19 s later the client is still attempting `ActivateSession` on the session it
-  was told to close;
-- the driver task is wedged, so the **next** config (v8) is never applied
-  either — which is why `reboot` also fails, reporting `cfg_v=6`.
+**Fixed** twice over: after §8.10 a lost session has already ended, so shutdown
+skips `disconnect` entirely; and a live session gets 3 s to acknowledge
+`CloseSession` before it is abandoned regardless. Loopback:
+`disable_completes_while_the_server_is_down` and
+`disable_completes_while_the_server_is_hung` — the latter stages the harder case
+the device run could not, a session that still looks healthy while the server
+never answers.
 
-Candidate fixes, both design decisions rather than mechanical: set `Idle`
-*before* initiating shutdown, or bound the shutdown with a timeout. The right
-answer depends on how long a graceful close is worth waiting for.
+### 8.12 A server down at boot left the driver in `connecting` forever
+
+`Connection::connect` awaited `Session::wait_for_connection()`, which "never
+returns" (its own documentation) if the event loop ends. The event loop ends when
+the library's retries run out, so against a server that was down at boot the
+driver sat in `connecting` through the whole internal retry schedule and then
+**for good** — no `error`, no `last_error`, no backoff. **Fixed** by racing
+`wait_for_connection` against the event loop and a deadline. Loopback:
+`an_unreachable_endpoint_is_retried_with_backoff`.
+
+### 8.13 A silent link was never noticed
+
+A peer that stops answering without closing the socket — a pulled cable, a hung
+PLC — sends no RST, so nothing closes the transport until TCP gives up. The
+client does send keep-alive reads, but `max_failed_keep_alive_count` defaults to
+**0, "never close"**. **Fixed** by closing the session after 2 failed keep-alives,
+with the request timeout tied to the configured keep-alive (2×, clamped to
+5–20 s): roughly 70 s to notice at the default 10 s keep-alive, about 16 s at
+1 s. Loopback: `a_silent_link_is_noticed_by_the_keepalive`, using
+`opcua_test_server::Blackhole`.
+
+### 8.14 A live reconfiguration never deleted the old subscriptions
+
+`resync` created new subscriptions for the new configuration and left the old
+ones in place. They kept delivering — removed tags reappeared in telemetry,
+tags present in both versions arrived twice, and every reconfiguration leaked a
+set of subscriptions on a device that is short of heap already. **Fixed** by
+deleting the previous subscriptions first, and by a generation flag in their
+sink so a notification already in flight is dropped rather than misfiled.
+Loopback: `reconfiguration_is_applied_live_on_the_same_session`.
+
+### 8.15 A new endpoint was resynchronised on the old session
+
+`resync` diffed only the tag lists. A configuration that moved the gateway to a
+different PLC (or changed its session parameters) was applied by rebuilding the
+subscriptions **on the old session** — the gateway kept reading the old PLC
+under the new configuration version. **Fixed**: any change to `instance` is a new
+session. Loopback: `a_new_endpoint_is_a_new_session`.
+
+### 8.16 Unknown NodeIds counted as applied on a lenient server
+
+On its first run the loopback suite reported 15 applied, 0 failed. As §2.5
+explains, `async-opcua-server` accepts a monitored item for a node that does not
+exist and reports the problem only in the data, which is legal. On such a server
+a typo'd address counts as *applied*, never reaches `failed_sample`, and finding
+A4 silently stops holding. **Fixed** in the gateway: before subscribing, each
+chunk's `NodeClass` is read (one integer per tag, one request per 50) and
+`BadNodeIdUnknown`/`BadNodeIdInvalid` tags are failed without being subscribed.
+A failure of that read is not fatal; the server then judges as before. Loopback:
+`provision_applies_every_present_tag_and_names_the_absent_one`.
+
+### 8.17 Telemetry could be stamped with the wrong config version (was §9.6)
+
+Samples carried no version; the publisher stamped each batch with the version it
+was built for. The firmware rebuilds the publisher the moment a configuration is
+*dispatched*, while the driver is still delivering samples from the old
+subscription — so those went out labelled with the new version. **Fixed** at the
+source: each sample carries the version of the subscription that produced it,
+and the batcher closes a batch when the version changes
+(`FlushReason::Version`). A batch's `v` is true by construction.
+`gateway-core` unit tests: `a_new_config_version_closes_the_batch`,
+`versions_never_mix_within_a_batch`.
+
+### 8.18 A failed resync leaked its session
+
+When a resynchronisation failed, the `Connection` was dropped without
+`shutdown()`. Dropping a tokio `JoinHandle` detaches the task rather than
+cancelling it, so the old event loop kept running — holding the session and its
+subscriptions — behind a driver that believed it had none. **Fixed**: every error
+path shuts the connection down, and `Connection` aborts its event loop on drop as
+a safety net.
+
+### 8.19 The partition-table glob nested itself until the firmware build failed
+
+```
+Using esp-idf v5.5.3 at '…/.embuild/espressif/esp-idf/v5.5.3'
+Error: File name too long (os error 63)
+```
+
+`ESP_IDF_GLOB_PARTITIONS_0 = "partitions.csv"` in `.cargo/config.toml` was
+unanchored. `embuild` walks the glob base (the repo root) following links, and an
+unanchored pattern matches at **any depth** — so each build copied every
+`partitions.csv` it found into its OUT_DIR under its relative path, including the
+ESP-IDF examples under `.embuild/` and the copies left in *earlier* esp-idf-sys
+OUT_DIRs under `target/`. One OUT_DIR already held 572 nested copies, the longest
+path 951 bytes; the next rebuild passed macOS's 1024 and failed. This would have
+struck CI as well, whose `target/` is cached. **Fixed** by anchoring the pattern:
+`"/partitions.csv"`.
+
+---
+
+## 9. Current status
+
+### 9.1 Scorecard
+
+**Host (2026-09-27).**
+
+| Suite | Result |
+| --- | --- |
+| `gateway-core` unit | **94/94** |
+| `opcua-test-server` unit | **9/9** (incl. the §5.1 bundle, byte for byte) |
+| `gateway-opcua` loopback | **19/19**, ~20 s |
+| `gateway-hil` unit, and its `preflight` phase run locally | **2/2**, **3/3** |
+| Firmware `cargo build --release` | clean; image 5.32 MB of the 7.34 MB `ota_0` slot |
+| `clippy -D warnings`, `rustdoc -D warnings`, `rustfmt --check` | clean — firmware (xtensa) and host crates (esp toolchain and stable 1.96) |
+| `cargo audit` | clean, with RUSTSEC-2023-0071 ignored for the reason recorded in `.cargo/audit.toml` |
+
+The loopback suite was run four times in a row without a failure. Measured
+there: a killed server is `error` before `stop()` returns, a silent link is
+noticed after 16.0 s at a 1 s keep-alive, and a disable against a hung server
+completes in 3.05 s.
+
+The same loopback suite against the driver and session as they stood after the
+last hardware run fails **9 of 19**:
+
+| Failing test | Defect |
+| --- | --- |
+| `server_loss_is_noticed_backed_off_and_recovered_from` | §8.10 |
+| `disable_completes_while_the_server_is_down` | §8.10 |
+| `disable_completes_while_the_server_is_hung` | §8.11 |
+| `an_unreachable_endpoint_is_retried_with_backoff` | §8.12 |
+| `a_silent_link_is_noticed_by_the_keepalive` | §8.13 |
+| `reconfiguration_is_applied_live_on_the_same_session` | §8.14 |
+| `a_new_endpoint_is_a_new_session` | §8.15 |
+| `provision_applies_every_present_tag_and_names_the_absent_one` | §8.16 |
+| `telemetry_matches_the_wire_contract_for_every_type` | §8.16 |
+
+**Hardware.** The last full run was 2026-08-01 with the retired Python harness:
+48/56. The eight failures traced to §9.3, §9.4, §9.6 and §9.7; three of those
+four are fixed and verified on the host. **The Rust runner has not been run
+against hardware yet** — the development workstation's firewall still blocks the
+device's inbound connection (§3.5). Expected on the next run: `disable`,
+`reboot` and `server_down` go green; the heap assertion in `provision` remains
+open (§9.4).
+
+### 9.2 How to read a failing run
+
+Two failure modes are *not* firmware defects and have both been mistaken for
+them:
+
+1. **A stale `reported` block.** Guarded since §8.9c — a rejected document prints
+   `reported: (stale — …)` and the failure says so explicitly.
+2. **A device that is crash-looping.** Symptom: every phase from some point on
+   reports an *identical* snapshot, including the same `uptime_s`. That is one
+   fault reported ten times, not ten faults. Check
+   `grep -c "memory allocation of" <serial log>` before reading further.
+
+And one new rule: **if the loopback suite fails, fix that first.** A behaviour
+it covers cannot be diagnosed faster on the device.
+
+### 9.3 FIXED — `Command::Disable` never completed
+
+Root cause and fix in §8.11 (and §8.10, which caused it). Four of the eight
+hardware failures traced here.
 
 ### 9.4 OPEN — heap headroom is still marginal
 
-`provision` asserts `free_heap > 40_000`; the run reports **32428**. This moved
-from 23828 after §8.8, so the fixes are working, but the assertion should be
-read as the harness correctly reporting reality rather than a threshold to
+`provision` asserts `free_heap > 40_000`; the last run reported **32428**. This
+moved from 23828 after §8.8, so the fixes are working, but the assertion should
+be read as the harness correctly reporting reality rather than a threshold to
 relax.
 
-**Six aborts still occur, all at device uptime 20–36 s** — the initial-sync
-peak — at sizes 2048–5120 bytes. The device recovers and the final boot ran
-stably for 677 s, but early phases are still being run against a device that
-may reboot underneath them.
+**Six aborts occurred, all at device uptime 20–36 s** — the initial-sync peak —
+at sizes 2048–5120 bytes. The device recovered and the final boot ran stably for
+677 s, but early phases were run against a device that may reboot underneath
+them.
 
-The remaining lever not taken is trimming the OPC UA buffers further
-(`MAX_MESSAGE_SIZE` 16 K → 8 K, `MAX_CHUNK_SIZE` 8 K → 4 K), which pushes
-further below the §D5 250-tag cap. Shrinking `MBEDTLS_SSL_IN_CONTENT_LEN` was
-considered and rejected — see §8.8.
+§8.14 may account for part of this: every reconfiguration in that run leaked the
+previous subscriptions. The next hardware run will tell. The remaining lever not
+taken is trimming the OPC UA buffers further (`MAX_MESSAGE_SIZE` 16 K → 8 K,
+`MAX_CHUNK_SIZE` 8 K → 4 K), which pushes further below the §D5 250-tag cap.
+Shrinking `MBEDTLS_SSL_IN_CONTENT_LEN` was considered and rejected — see §8.8.
 
 > There is no PSRAM on this board. `espflash board-info` reports only
 > "Embedded Flash", and `OPCUA_CLIENT_REQUIREMENTS.md` §D5 states the cap is for
@@ -707,34 +971,19 @@ considered and rejected — see §8.8.
 `gateway_core::health::FailedTag` serialises `{"a": address, "s": statuscode}`;
 §4.1 of `OPCUA_CLIENT_REQUIREMENTS.md` shows `["Chan1.Dev1.Bad", …]`. The
 firmware's shape is richer and looks deliberate — it carries the StatusCode the
-operator needs — but the two disagree.
+operator needs — but the two disagree. **Decide which is normative and correct the
+other**; this is a wire contract, and the shadow has other consumers. Both test
+layers accept either shape until then.
 
-The harness now accepts either (§8.9d) rather than force the question. **Decide
-which is normative and correct the other**; this is a wire contract, and the
-shadow has other consumers.
+### 9.6 FIXED — telemetry batches carried two config versions
 
-### 9.6 OPEN — telemetry batches carry two config versions
+A real race, fixed in §8.17. The observation itself (`versions=[1, 7]`) may also
+have been the harness reading an earlier run's batches (§8.9f); both causes are
+gone.
 
-`batches are stamped with the applied config version — versions=[1, 7]`.
-A single observation window contained batches stamped with two different
-`cfg.v`. This may be a benign boundary effect (a batch in flight when the config
-changed) or a real ordering bug in the publisher. **Not yet investigated** — it
-needs a run where the device does not reboot mid-phase to be conclusive.
+### 9.7 FIXED — the driver did not notice a dead server
 
-### 9.7 OPEN — the driver does not notice a dead server
-
-`server_down` 4/6:
-
-```
-✗ device noticed the server was gone — state=running
-✗ reconnect uses backoff, not a tight loop — retry delays observed: []
-```
-
-The PLC is SIGKILLed mid-session and the driver keeps reporting `running`.
-Backoff itself is implemented and was observed working earlier in bring-up
-(1 s → 2 s → 4 s → 8 s → 16 s when the endpoint was unreachable at startup), so
-this is specifically about **detecting loss of an established session**, not
-about the retry schedule. Distinct from §9.3 and earlier in the run.
+Root cause and fix in §8.10; the silent-link variant in §8.13.
 
 ### 9.8 OPEN — the boot-time cached-config line is not observed
 
@@ -742,23 +991,21 @@ about the retry schedule. Distinct from §9.3 and earlier in the run.
 replied — not logged`. The firmware does emit
 `booting with cached OPC UA config v1 (15 tags)` — it appears in the serial logs
 — so this is more likely a capture-window or pattern issue in the phase than a
-missing behaviour. §8.9b fixed the *initial* attach; the re-attach inside
-`reboot` deliberately keeps `--no-reset` so the boot under inspection is the one
-the phase caused, and that path may still be racing.
+missing behaviour. In the last run it was also downstream of §9.3: the wedged
+driver never applied v8, so the device came back on v6. Re-check on the next run.
 
 ### 9.9 Environment prerequisites discovered the hard way
 
-- **WSL2 NAT.** The harness serves from inside WSL, which the device cannot
-  route to. Requires a `netsh interface portproxy` on the Windows host plus an
-  inbound rule for 4855, and `--server-host` set to the *host's* LAN IP. The WSL
-  IP changes across reboots.
+- **A managed macOS firewall** blocks inbound TCP to the server and cannot be
+  overridden locally (§3.5). This is what the loopback layer exists to route
+  around; for the HIL run, use a host that can admit the connection.
+- **WSL2 NAT.** Requires a `netsh interface portproxy` on the Windows host plus
+  an inbound rule, and `--server-host` set to the *host's* LAN IP (§3.5).
 - **A stale `opcua` NVS partition wins silently.** `provision` always publishes
-  **v1**; if the device holds a cached v1 pointing at a different server it
-  keeps dialling the old address and ignores the shadow entirely (idempotency,
-  requirements §7, *Idempotency*). Clear it with
-  `espflash erase-region --port <port> 0x13000 0xd000` — that is the `opcua`
-  partition only; identity lives in `nvs` at `0x9000` and survives, unlike a
-  full `erase-flash`.
+  **v1**; if the device holds a cached v1 pointing at a different server it keeps
+  dialling the old address and ignores the shadow (idempotency, requirements §7).
+  Clear it with `espflash erase-region --port <port> 0x13000 0xd000` — the `opcua`
+  partition only; identity lives in `nvs` at `0x9000` and survives.
 - **WiFi association is ~50/50 on a 40 MHz 2.4 GHz channel**, and a single
   association timeout at boot is **terminal** — the firmware logs
   `WiFi start failed` and stops, with no retry, until someone resets the board.
@@ -770,37 +1017,46 @@ the phase caused, and that path may still be racing.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `ConnectionReset` waiting for server ACK; server logs no connection | Host firewall blocking inbound to the Python process | §3.5. Verify with `nc` from another host — never from the workstation. |
+| `cargo test` builds for xtensa and fails | `.cargo/config.toml` defaults to `xtensa-esp32s3-espidf` | Add `--target host-tuple` for every host crate. |
+| Firmware build: `File name too long (os error 63)` | Unanchored partition-table glob | §8.19; `cargo clean -p esp-idf-sys --release` removes the nested copies. |
+| Device: `ConnectionReset` waiting for the server's ACK; server sees nothing | Host firewall blocking inbound TCP | §3.5. Verify with `nc` from another host — never from the workstation. |
 | MQTT connects then drops repeatedly, Jobs also broken | Device policy missing the named-shadow topics | §8.1 |
-| `could not start the OPC UA runtime: Permission denied (os error 13)` | eventfd VFS not registered | §8.2 |
+| `state: error`, `last_error: "OPC UA did not start: …"` | The OPC UA runtime could not be built | §8.2; the eventfd VFS registration. MQTT/OTA stay up by design. |
 | `panicked at .../signal/unix.rs`, device reboot-loops | Vendored tokio patch lost | §8.3 |
 | `shadow document unusable: shadow has no desired state` | No config published yet | Normal before `provision`. |
 | `tag bundle rejected: bundle sha256 …` | Bundle bytes differ from what the digest was computed over | Republish; do not reformat the JSON (§5.1). |
-| All items fail, driver reports "all N monitored items were rejected" | Wrong namespace or `id_type` | Check `ns_uri` is published by the server; phase `ns_uri` covers this deliberately. |
+| All items fail: "all N monitored items were rejected" | Wrong namespace or `id_type` | Check `ns_uri` is published by the server; `ns_uri` phase and `a_wrong_namespace_without_a_uri_fails_loudly` cover this. |
+| `last_error: "session lost: …"`, then `running` again | The server went away and came back | Expected; backoff is 1 s doubling to 60 s with jitter. |
 | `reported` never updates | Reports are throttled to state-change or every 30 s | Wait, or trigger a state change. |
 | Telemetry absent from CloudWatch but the device says it published | `dt/+/opcua` rule or its log group missing | §8.1's terraform also creates them. |
-| Server exits at start with `OSError: [Errno 22]` on stdin | kqueue refuses `/dev/null` as a read pipe | Harmless; the server logs a warning and runs without the fault-injection channel. |
-| `FileNotFoundError: 'espflash'` after the build | `export-esp.sh` does not add `~/.cargo/bin` | §8.9a. `export PATH="$HOME/.cargo/bin:$PATH"`. |
+| `espflash not found` | `export-esp.sh` does not add `~/.cargo/bin` | `cargo install espflash`; the runner looks in `~/.cargo/bin` itself. |
 | Serial log is a few hundred bytes; every log assertion fails | Monitor attached while the USB-JTAG was re-enumerating | §8.9b |
-| Every phase reports the same `reported` snapshot, same `uptime_s` | Device is crash-looping; one fault reported many times | §9.2. `grep -c "memory allocation of" <serial log>`. |
+| Every phase reports the same `reported` snapshot, same `uptime_s` | Device is crash-looping | §9.2. `grep -c "memory allocation of" <serial log>`. |
 | `reported: (stale — nothing written since the run started)` | Device never booted, never joined the network, or is dead | Read the serial log; the shadow is from an earlier boot (§8.9c). |
 | `BadSecurityPolicyRejected: Cannot find user token type Anonymous` | Endpoint built without a token policy | §8.4 |
 | `memory allocation of N bytes failed`, device reboots | Heap exhaustion. Decode with `xtensa-esp32s3-elf-addr2line -e <elf> -f -C` | §8.5–8.8, §9.4 |
 | Device dials a server address nobody configured | Stale cached config; same `cfg.v` is a no-op | §9.9 — erase `0x13000`. |
-| `driver went idle on enabled=false — state=running` | Known open firmware bug | §9.3 |
 | `WiFi start failed … ESP_ERR_TIMEOUT`, device then silent | Association timeout is terminal, no retry | §9.9. Reset and retry. |
+| Host run logs `Failed to read own certificate … Check paths, crypto won't work` | `async-opcua` looking for a certificate it does not need at security `None` | Harmless. |
 
 ---
 
 ## 11. Extending the scenario
 
-- **A new value type**: add one `Tag` to `tags.py` with an `expects` key present
-  in `ENCODING_PREDICATES`. The server creates the node and the telemetry phase
-  picks up the assertion automatically — no edit to `run_scenario.py`.
-- **A new phase**: decorate a function with `@phase("name")`, take `Ctx`, return
-  a `PhaseResult`. It is appended to the default run order and becomes selectable
-  via `--phases`.
-- **Scale testing toward the 250-tag cap** (follow-up F3 in the requirements):
-  generate addresses programmatically in `tags.py`, keep the number of distinct
-  scan rates small, and watch `reported.free_heap` — the cap is supposed to be a
-  measured number, and this harness is where that measurement should happen.
+- **A new value type**: add one `Tag` to
+  [`catalogue.rs`](../opcua-test-server/src/catalogue.rs) with an `encoding`. The
+  server creates the node, and both `telemetry_matches_the_wire_contract_for_every_type`
+  and the HIL `telemetry` phase check its encoding — no other edit. Add a new
+  `Encoding` variant if the JSON shape is new.
+- **A new failure mode**: most belong in the loopback suite. `TestServer` can be
+  stopped and restarted on the same port (`stop()` returns its `Options`),
+  faulted (`set_fault`), frozen (`set_frozen`) and written to (`write`);
+  `Blackhole` makes a link go silent; `sessions_activated()` tells a resync from
+  a reconnect.
+- **A new on-device phase**: an `async fn(&mut Ctx) -> Result<PhaseResult>` in
+  [`gateway-hil/src/phases.rs`](../gateway-hil/src/phases.rs), a match arm in
+  `run`, and its name in `PHASES`.
+- **Scale toward the 250-tag cap** (follow-up F3 in the requirements): generate
+  addresses in the catalogue, keep the number of distinct scan rates small, and
+  watch `reported.free_heap` on hardware — the cap is supposed to be a measured
+  number, and the HIL run is where that measurement has to happen.

@@ -393,8 +393,9 @@ The guiding rule: **everything that can be a pure function of data must be, and 
 test on the host target** (no `esp-idf-svc` in those modules). Device-specific pieces sit behind
 narrow traits.
 
-The realised layout splits the pure logic into its own workspace member so it cannot accidentally
-grow a device dependency — the host test run never even builds `esp-idf-sys`:
+The realised layout splits everything that is not device I/O into workspace members of its own,
+so none of it can accidentally grow a device dependency — the host test run never even builds
+`esp-idf-sys`:
 
 ```
 gateway-core/            // pure crate: serde + serde_json + sha2, nothing else.
@@ -413,15 +414,22 @@ gateway-core/            // pure crate: serde + serde_json + sha2, nothing else.
     shadow.rs            // shadow topic names, desired/delta/rejected parsing, reported encoding
     backoff.rs           // full-jitter exponential backoff (1 s -> 60 s)
 
-src/                     // firmware: the effectful shell
-  opcua/
-    mod.rs               // AppliedConfig, Command, Shared (queue + reported)
+gateway-opcua/           // the OPC UA client: platform-neutral, runs on the device AND the host
+  src/
+    lib.rs               // public API: new() -> (Client, Driver), spawn_thread, AppliedConfig
     variant.rs           // opcua_types::Variant -> gateway_core TagValue (all 27 arms)
-    session.rs           // Connection: connect / namespace_array / create_subscription /
-                         // create_items / shutdown, over async_opcua_client::Session
+    session.rs           // Connection: connect / namespace_array / missing_nodes /
+                         // create_subscription / create_items / delete_subscriptions /
+                         // closed / shutdown, over async_opcua_client::Session
     driver.rs            // state machine: Idle -> Connecting -> Syncing -> Running -> Error
+  tests/scenario.rs      // the real client against a real server over loopback
+  examples/local_gateway.rs // the client on a laptop, against the test server or a PLC
+
+opcua-test-server/       // async-opcua-server + the tag catalogue (test fixture, host only)
+
+src/                     // firmware: the effectful shell
   settings_store.rs      // NVS blob cache in the dedicated `opcua` partition
-  shadow.rs              // ConfigPlane: shadow conversation + retained bundle -> Command::Apply
+  shadow.rs              // ConfigPlane: shadow conversation + retained bundle -> Client::apply
   jobs.rs                // AWS IoT Jobs / OTA, flattened out of the telemetry loop
   mqtt_util.rs           // MqttTransport trait + EspMqttClient impl
   telemetry/
@@ -433,7 +441,10 @@ Key boundaries that make it testable:
 
 - **`gateway-core` has no device dependency at all.** Every decision with a rule behind it —
   validation, digest verification, batching, chunking, diffing, backoff, encoding — is a pure
-  function tested on the host (92 tests). The firmware crate is left with I/O and glue.
+  function tested on the host. The firmware crate is left with I/O and glue.
+- **`gateway-opcua` has none either.** The firmware injects what only it can provide — a clock, a
+  per-device backoff seed, the thread (after registering the eventfd VFS) — and talks to the
+  client only through its `Client` handle: `apply`, `disable`, `drain`, `reported`.
 - **`MqttTransport` trait** (`src/mqtt_util.rs`) is what `ConfigPlane`, `JobsClient` and
   `Publisher` are written against, not `EspMqttClient`.
 - **Explicit `now_ms` parameters** rather than an ambient clock: `batcher.rs` flush-on-age is
@@ -459,11 +470,14 @@ Test matrix (all implemented in `gateway-core`, run with
 - `health.rs`, `shadow.rs`, `backoff.rs`, `codec.rs`: size budgets, topic conventions, delta
   relevance, jitter saturation, RFC 4648 / SHA-256 vectors.
 
-Deliberately **not** covered by host tests, and why: `src/opcua/driver.rs` and `src/opcua/session.rs`
-sit directly on `async-opcua`, whose `Session` is a concrete struct rather than a trait. Wrapping it
-in a mockable trait would mean re-declaring a dozen service signatures for the sake of the fake, so
-the driver was instead kept thin — it holds no parsing, no encoding and no size arithmetic, only
-sequencing — and everything it sequences is tested in `gateway-core`.
+The driver and session sit directly on `async-opcua`, whose `Session` is a concrete struct rather
+than a trait, so they are not unit-tested against a mock. They do not need to be: they are tested
+against the real thing. `gateway-opcua/tests/scenario.rs` runs the client against
+`opcua-test-server` — built on `async-opcua-server`, the server half of the same library — in one
+process over loopback: provisioning with a missing tag, every value encoding, live
+reconfiguration, namespace-URI rescue, server loss and recovery, a silent link, an endpoint change,
+and disable under each failure. The suite found seven defects the unit tests could not see
+(`OPCUA_INTEGRATION_TEST.md` §8.10–8.16).
 
 
 ---
