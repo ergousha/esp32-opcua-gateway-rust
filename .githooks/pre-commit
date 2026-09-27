@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Pre-commit checks for esp32-opcua-gateway.
 #
-# This is a single bare-metal `no_std` crate (esp-hal, xtensa-esp32s3-none-elf),
-# so unlike a workspace with a host-testable crate, even clippy needs the
-# espup-installed `esp` toolchain — there's no faster host-target fallback.
-# rustfmt doesn't invoke rustc so it's unaffected by the toolchain pin.
+# The workspace has two halves. The firmware crate (repo root) is std on
+# ESP-IDF and only builds for xtensa, with the espup-installed `esp` toolchain.
+# Every other member — gateway-core, gateway-opcua, opcua-test-server,
+# gateway-hil, seed-device — builds for the host, which is fast and needs no
+# ESP toolchain.
+# rustfmt doesn't invoke rustc, so it's unaffected by the toolchain pin.
+#
+# The loopback integration suite (`cargo test -p gateway-opcua`, ~20 s) is left
+# to CI; run it by hand before pushing OPC UA changes.
 #
 # Enable this hook once per clone with:
 #   git config core.hooksPath .githooks
@@ -17,16 +22,22 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+host_crates=(-p gateway-core -p gateway-opcua -p opcua-test-server -p gateway-hil -p seed-device)
+
 echo "pre-commit: cargo fmt --check"
 RUSTUP_TOOLCHAIN=stable cargo fmt --all -- --check
 
-echo "pre-commit: cargo clippy"
+echo "pre-commit: host crates — clippy + gateway-core tests"
+RUSTUP_TOOLCHAIN=stable cargo clippy "${host_crates[@]}" --all-targets --target host-tuple -- -D warnings
+RUSTUP_TOOLCHAIN=stable cargo test -p gateway-core --target host-tuple --quiet
+
+echo "pre-commit: firmware — clippy"
 if [ -f "$HOME/export-esp.sh" ]; then
   # shellcheck disable=SC1091
   source "$HOME/export-esp.sh"
   cargo clippy --all-targets --all-features -- -D warnings
 else
-  echo "warning: ~/export-esp.sh not found, skipping clippy (run 'espup install --targets esp32s3' first)" >&2
+  echo "warning: ~/export-esp.sh not found, skipping firmware clippy (run 'espup install --targets esp32s3' first)" >&2
 fi
 
 echo "pre-commit: all checks passed"
