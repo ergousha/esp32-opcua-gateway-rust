@@ -15,11 +15,13 @@
 
 pub mod publisher;
 
+use std::ffi::CStr;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
 use gateway_core::health::DriverState;
 use gateway_opcua::Client;
 
@@ -38,10 +40,13 @@ const DRAIN_CHUNK: usize = 128;
 
 /// Stack for the OPC UA thread.
 ///
-/// The spike used 32 KiB, which does not cover the async-opcua chunk assembly
-/// and tokio's task machinery on the same stack. This is generous rather than
-/// measured; see follow-up F3 in the requirements.
+/// Measured on hardware with [`StackProbe`]; see follow-up F3 in the
+/// requirements. The connect path once peaked near 40 KiB because a spawned
+/// ~16 KB future was moved by value (fixed in `gateway_opcua::session::open`).
 const OPCUA_STACK_BYTES: usize = 40 * 1024;
+
+/// FreeRTOS name of the OPC UA task; unnamed std threads all show as "pthread".
+const OPCUA_TASK_NAME: &CStr = c"opcua";
 
 /// How often the periodic work below runs, at most.
 const TICK_MS: i64 = 50;
@@ -83,6 +88,7 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
 
     let mut publisher: Option<Publisher> = None;
     let mut last_tick = 0i64;
+    let mut stack_probe = StackProbe::new();
 
     loop {
         match session
@@ -146,6 +152,37 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
 
         update_counters(&opcua, publisher.as_ref());
         config_plane.report(&mut session.client, now);
+        stack_probe.check();
+    }
+}
+
+/// Logs how much of the OPC UA task's stack has never been touched, whenever
+/// that reaches a new low.
+struct StackProbe {
+    task: esp_idf_svc::sys::TaskHandle_t,
+    low: u32,
+}
+
+impl StackProbe {
+    fn new() -> Self {
+        // Null if the thread did not start; `check` is then a no-op.
+        let task = unsafe { esp_idf_svc::sys::xTaskGetHandle(OPCUA_TASK_NAME.as_ptr()) };
+        Self {
+            task,
+            low: u32::MAX,
+        }
+    }
+
+    fn check(&mut self) {
+        if self.task.is_null() {
+            return;
+        }
+        // Sound: the task lives as long as `run` holds its `Client`.
+        let free = unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark(self.task) };
+        if free < self.low {
+            self.low = free;
+            log::info!("OPC UA stack headroom: {free} of {OPCUA_STACK_BYTES} B never used");
+        }
     }
 }
 
@@ -199,9 +236,22 @@ fn start_opcua() -> Client {
 
     let (client, driver) = gateway_opcua::new(options);
     let started = register_eventfd().and_then(|()| {
-        gateway_opcua::spawn_thread(driver, "opcua", OPCUA_STACK_BYTES)
+        let named = ThreadSpawnConfiguration {
+            name: Some(OPCUA_TASK_NAME),
+            stack_size: OPCUA_STACK_BYTES,
+            ..Default::default()
+        };
+        if let Err(e) = named.set() {
+            log::warn!("could not name the OPC UA thread: {e}");
+        }
+        let spawned = gateway_opcua::spawn_thread(driver, "opcua", OPCUA_STACK_BYTES)
             .map(drop)
-            .context("starting the OPC UA thread")
+            .context("starting the OPC UA thread");
+        // The configuration is per calling thread; later spawns must not inherit the name.
+        if let Err(e) = ThreadSpawnConfiguration::default().set() {
+            log::warn!("could not reset the thread spawn configuration: {e}");
+        }
+        spawned
     });
     if let Err(e) = started {
         log::error!("OPC UA is unavailable: {e:#}");
