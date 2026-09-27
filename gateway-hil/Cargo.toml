@@ -1,6 +1,6 @@
 [package]
 name = "gateway-hil"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 publish = false
 description = "Hardware-in-the-loop scenario for the gateway: a real ESP32-S3 against the Rust OPC UA test server and a real AWS IoT account."

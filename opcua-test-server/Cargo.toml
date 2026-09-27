@@ -1,6 +1,6 @@
 [package]
 name = "opcua-test-server"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 publish = false
 description = "OPC UA test server for the gateway, built on async-opcua-server: the server half of the library the gateway's client uses."

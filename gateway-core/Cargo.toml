@@ -1,6 +1,6 @@
 [package]
 name = "gateway-core"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 publish = false
 description = "Pure, host-testable core logic for the ESP32 OPC UA gateway (no esp-idf, no OPC UA stack)."

@@ -1,6 +1,6 @@
 [package]
 name = "gateway-opcua"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 publish = false
 description = "The gateway's OPC UA client: session, subscription sync and the reconnect state machine. Platform-neutral: the same code runs on the ESP32-S3 and on the development host."

@@ -1,6 +1,6 @@
 [package]
 name = "seed-device"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 publish = false
 description = "Registers a gateway (MAC + shared secret) in the DynamoDB device registry that the fleet-provisioning hook checks."
