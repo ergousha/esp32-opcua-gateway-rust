@@ -15,11 +15,12 @@ publish = false
 #   opcua-test-server  an OPC UA server on async-opcua-server (the server half
 #                      of the client's own library) plus the tag catalogue
 #   gateway-hil        the on-device (hardware-in-the-loop) scenario runner
+#   seed-device        registers a device (MAC + secret) in the DynamoDB registry
 #
 # `crates/` holds vendored `[patch.crates-io]` sources and must stay out of the
 # workspace.
 [workspace]
-members = ["gateway-core", "gateway-opcua", "opcua-test-server", "gateway-hil"]
+members = ["gateway-core", "gateway-opcua", "opcua-test-server", "gateway-hil", "seed-device"]
 exclude = ["crates"]
 
 [[bin]]

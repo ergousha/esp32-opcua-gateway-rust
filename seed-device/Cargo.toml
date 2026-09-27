@@ -1,0 +1,18 @@
+[package]
+name = "seed-device"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Registers a gateway (MAC + shared secret) in the DynamoDB device registry that the fleet-provisioning hook checks."
+
+# Host-only operator tool:
+#
+#     cargo run -p seed-device --target host-tuple -- --mac AA:BB:CC:DD:EE:FF --secret …
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Default features select the SDK's legacy HTTPS client (hyper 0.14 +
+# rustls 0.21), which carries open advisories; see gateway-hil/Cargo.toml.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "sso"] }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
