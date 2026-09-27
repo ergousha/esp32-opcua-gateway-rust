@@ -1,0 +1,20 @@
+# cargo-audit configuration, read by `cargo audit` (.github/workflows/security-audit.yml).
+#
+# Every entry needs a reason it does not apply AND the condition under which
+# that stops being true.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — rsa: Marvin attack, a timing side channel on RSA
+    # PKCS#1 v1.5 decryption. No fixed release exists.
+    #
+    # Pulled in by async-opcua-crypto for the OPC UA security policies. The
+    # gateway accepts only SecurityPolicy None (decision D2 in
+    # docs/OPCUA_CLIENT_REQUIREMENTS.md, enforced by
+    # gateway_core::settings::InstanceSettings::validate), so no RSA
+    # private-key operation ever runs on the device; the test server serves
+    # None only as well.
+    #
+    # Revisit before Sign / SignAndEncrypt is enabled.
+    "RUSTSEC-2023-0071",
+]
