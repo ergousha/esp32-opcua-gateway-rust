@@ -474,8 +474,10 @@ The server is `async-opcua-server`, the server half of the library the client
 uses, so both ends speak the same stack, and one tag catalogue drives both the
 server's nodes and the configuration the client is given. The on-device
 scenario (`cargo run -p gateway-hil`) covers what only hardware can show: heap,
-the ESP-IDF runtime, NVS and the AWS planes. See
-[`docs/OPCUA_INTEGRATION_TEST.md`](docs/OPCUA_INTEGRATION_TEST.md).
+the ESP-IDF runtime, NVS and the AWS planes. On a host the device cannot reach,
+such as a firewalled workstation, `--offline` runs the part that needs no route
+back to the host. See
+[`docs/OPCUA_INTEGRATION_TEST.md`](docs/OPCUA_INTEGRATION_TEST.md) §7.
 
 ---
 
@@ -597,5 +599,6 @@ camera interface. Full component list, pinout and dimensions:
 | [`docs/FIRMWARE_INTEGRATION.md`](docs/FIRMWARE_INTEGRATION.md) | Boot sequence, hardware pitfalls and their fixes, re-provisioning. |
 | [`docs/OPCUA_CLIENT_REQUIREMENTS.md`](docs/OPCUA_CLIENT_REQUIREMENTS.md) | OPC UA requirements, the settings and bundle schema, transport limits, memory budget, agreed decisions. |
 | [`docs/OPCUA_INTEGRATION_TEST.md`](docs/OPCUA_INTEGRATION_TEST.md) | Test architecture: unit, loopback and on-device layers, wire contracts, defects found, current status. |
+| [`docs/HIL_ON_WINDOWS.md`](docs/HIL_ON_WINDOWS.md) | A ready-made prompt for an AI agent to run the full on-device scenario from a Windows PC. |
 | [`certs/README.md`](certs/README.md) | The embedded certificates and how the claim identity is handled. |
 | [`hardware/README.md`](hardware/README.md) | The board. |

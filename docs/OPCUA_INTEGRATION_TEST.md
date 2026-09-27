@@ -6,8 +6,11 @@ the server half of the same library — in one process on `127.0.0.1`, and passe
 19/19 in about 20 seconds (§9.1). Against the code as it stood after the last
 hardware run, 9 of those 19 fail, reproducing the three open on-device bugs and
 four defects nobody had seen (§8.10–8.16). The on-device scenario has been
-ported from Python to Rust (`gateway-hil`) and **has not yet been re-run on
-hardware** since the port and the fixes.
+ported from Python to Rust (`gateway-hil`). Its offline mode (§7.3), which needs
+no route from the device back to the host, passes **27/27 on hardware**. The
+full online scenario has not been re-run yet, because the development
+workstation's firewall blocks the device's inbound connection;
+[`HIL_ON_WINDOWS.md`](HIL_ON_WINDOWS.md) runs it from another machine.
 
 This document is the full specification of how the gateway is tested: the
 layers, the test doubles, the contract each side is held to, what every
@@ -471,7 +474,7 @@ meaningful once `provision` has applied something. Individually selectable with
 
 | | |
 | --- | --- |
-| **Action** | Detach the monitor, `espflash reset`, re-attach with `--no-reset`. |
+| **Action** | Re-attach the serial monitor, which reboots the chip and captures the new boot from its first line (§8.20). |
 | **Asserts** | Serial log contains `booting with cached OPC UA config v<N> (<n> tags)` — i.e. the NVS-cached bundle is applied **before** the cloud answers — and the device returns to `running` on the same `cfg_v`. |
 
 ---
@@ -526,9 +529,42 @@ cargo run -p gateway-hil --target host-tuple -- \
 | `--cleanup` | Clear the retained tag bundles the run published, so a later boot cannot pick up a stale config from a forgotten run. |
 | `--artifacts DIR` | Where the serial log and JSON summary land (default `gateway-hil/artifacts/`). |
 | `--iot-endpoint HOST` | IoT data endpoint, if not the one in `cfg.toml`. |
+| `--offline` | Run the phases that need no route from the device to this host (§7.3). Requires `--port`. |
 
 Exit code is 0 only if every check in every phase passed, 1 on a failed check,
 2 if the run itself could not proceed.
+
+### 7.3 Offline mode — when the device cannot reach this host
+
+On a workstation whose firewall refuses the device's inbound connection
+(§3.5), the OPC UA data path cannot be exercised, but everything around it can:
+
+```sh
+cargo run -p gateway-hil --target host-tuple -- \
+    --thing 28848553144F --server-host <this-host-lan-ip> \
+    --port /dev/cu.usbmodem21401 --flash --offline --cleanup
+```
+
+The device is pointed at this host's LAN address, where nothing listens: the
+test server is bound to loopback only, for `preflight`. Every assertion comes
+from the serial log and the shadow. Config versions continue from whatever the
+shadow last asked for, so a cached configuration can never be mistaken for a
+re-delivery (§9.9).
+
+| Phase | Asserts |
+| --- | --- |
+| `preflight` | As in §6.2. |
+| `offline_config` | The config arrives on both planes and is cached to NVS. The device runs the new firmware and logs the unencrypted-link warning. The failure is reported in the shadow, naming the endpoint, rather than an endless `connecting` (§8.12). Every connect attempt ends by itself. Reconnects back off at ≥ 1 s. No panic and no failed allocation. |
+| `offline_disable` | `enabled: false` idles the driver while it is still trying to connect (§8.11), and no attempts follow. |
+| `offline_reject_security` | A secured config is refused explicitly, shown in `last_error`, and neither cached nor applied. |
+| `offline_reject_digest` | A bundle with a mismatched SHA-256 is refused, shown in `last_error`, and neither cached nor applied. |
+| `offline_reenable` | The next valid config is cached and takes the driver out of `idle` (the wedged driver of §9.3 ignored it). |
+| `offline_reboot` | After a USB reset the NVS-cached config drives the driver before the cloud answers. |
+
+What it cannot show — the session, telemetry and its encoding, live
+reconfiguration, namespace resolution, and recovery once a server returns —
+needs a host the device can reach. [`HIL_ON_WINDOWS.md`](HIL_ON_WINDOWS.md) is
+a ready-made prompt for running the full scenario from a Windows PC.
 
 ---
 
@@ -539,6 +575,7 @@ the first run that reached hardware, each one uncovered only after the previous
 was fixed. §8.9 collects the old harness's own bugs. §8.10–8.16 were found by the
 loopback suite on its first run — each is a failing test against the previous
 code, listed in §9.1 — and §8.17–8.19 while moving the client into its own crate.
+§8.20 was found by the first on-device run of the Rust runner.
 
 ### 8.1 The device policy had no shadow permissions — the config plane could never work
 
@@ -736,7 +773,7 @@ runner keeps every fix.
 | # | Defect | Effect, and what the harness does now |
 | --- | --- | --- |
 | a | Docs claimed `export-esp.sh` puts `espflash` on `PATH`; it only adds the xtensa toolchain | The run died after the build. `device::espflash()` resolves `~/.cargo/bin` explicitly. |
-| b | Monitor attached after flashing with `--no-reset` | An ESP32-S3 re-enumerates its USB-JTAG on every reset, so the monitor held a node that never delivered a byte — every log assertion failed. `wait_for_port()` waits for a stable inode, and a run that flashed spends one deliberate reset to catch the boot. |
+| b | Monitor attached after flashing with `--no-reset` | An ESP32-S3 re-enumerates its USB-JTAG on every reset, so the monitor held a node that never delivered a byte — every log assertion failed. `wait_for_port()` waits for a stable inode before attaching. (The deeper problem with `--no-reset` is §8.20.) |
 | c | `reported` was read without checking its age | A shadow written **4.6 hours earlier** satisfied the predicates, and eight failures described firmware that was not running. `Cloud::require_fresh_since(t0_ms)` rejects any document older than the run. |
 | d | `failed_sample` assumed bare strings | The firmware reports `{"a", "s"}` objects; the harness accepts either shape. The spec mismatch itself is still open (§9.5). |
 | e | `disable` republished an already-applied version | A no-op by definition, so the phase reported a failure that never happened. Versions are 1–8 with no collisions. |
@@ -878,6 +915,35 @@ path 951 bytes; the next rebuild passed macOS's 1024 and failed. This would have
 struck CI as well, whose `target/` is cached. **Fixed** by anchoring the pattern:
 `"/partitions.csv"`.
 
+### 8.20 `espflash monitor --no-reset` left the chip in its bootloader (harness)
+
+```
+[… INFO ] Serial port: '/dev/cu.usbmodem212101'
+[… INFO ] Connecting...
+[… INFO ] Using flash stub
+                                   <- and then nothing, for minutes
+```
+
+`espflash monitor` (4.x) cannot attach to running firmware: it first connects
+to the chip's ROM loader, which means resetting it into download mode. By
+default it then hard-resets the chip so the firmware boots. `--no-reset` is
+`--after no-reset`: it skips only that second reset, **leaving the chip in the
+bootloader**. The firmware stops, and the monitor shows exactly what a silent
+device would.
+
+Both harnesses attached with `--no-reset` whenever they had not just flashed.
+That covers the `reboot` phase, whose "booting with cached OPC UA config" line
+therefore could never appear (the open §9.8), and every run started without
+`--flash`, which froze the device before the first phase. `--before
+no-reset-no-sync` does not help either: espflash then fails to connect to
+running firmware.
+
+**Fixed** by always attaching with espflash's default reset. An attach is
+therefore a reboot, which the runner now uses deliberately: every run starts
+from a clean boot captured from its first line, and `reboot` is a re-attach.
+The reboot checks also no longer accept a shadow report written before the
+reboot: its `uptime_s` must fit inside the time since.
+
 ---
 
 ## 9. Current status
@@ -916,13 +982,35 @@ last hardware run fails **9 of 19**:
 | `provision_applies_every_present_tag_and_names_the_absent_one` | §8.16 |
 | `telemetry_matches_the_wire_contract_for_every_type` | §8.16 |
 
-**Hardware.** The last full run was 2026-08-01 with the retired Python harness:
-48/56. The eight failures traced to §9.3, §9.4, §9.6 and §9.7; three of those
-four are fixed and verified on the host. **The Rust runner has not been run
-against hardware yet** — the development workstation's firewall still blocks the
-device's inbound connection (§3.5). Expected on the next run: `disable`,
-`reboot` and `server_down` go green; the heap assertion in `provision` remains
-open (§9.4).
+**Hardware, offline mode (2026-09-27).** Firmware at this branch's head,
+flashed to thing `28848553144F` (WiFi). The device dialled the workstation,
+whose firewall drops the connection silently (§3.5).
+
+| Phase | Result | Note |
+| --- | --- | --- |
+| `preflight` | **3/3** | |
+| `offline_config` | **9/9** | both planes and the NVS cache verified; `free_heap` 74 KB while retrying |
+| `offline_disable` | **3/3** | `idle` 3 s after the disable, with the server unreachable |
+| `offline_reject_security` | **3/3** | |
+| `offline_reject_digest` | **3/3** | |
+| `offline_reenable` | **3/3** | |
+| `offline_reboot` | **3/3** | the `booting with cached OPC UA config` line of §9.8, now observed |
+
+27/27, with no panic, failed allocation or watchdog reset in either serial
+log. The first attempt scored 26/28: the monitor re-attach froze the chip in
+its bootloader, which is §8.20, fixed before the rerun.
+
+Seen on hardware along the way, as §8.12 intended: the device booted on a
+cached config pointing at a host that no longer answers. The attempt ended at
+its 40 s deadline and was reported. The new configuration, already waiting,
+then cut the backoff short, and the driver moved to the new endpoint. The
+previous firmware stayed in `connecting` in exactly this situation.
+
+**Hardware, online.** The last full run was 2026-08-01 with the retired Python
+harness: 48/56. Its eight failures traced to §9.3, §9.4, §9.6, §9.7 and §9.8;
+all but §9.4 are now fixed. Expected on the next online run: `disable`,
+`reboot` and `server_down` pass; the heap assertion in `provision` stays open
+(§9.4).
 
 ### 9.2 How to read a failing run
 
@@ -985,14 +1073,11 @@ gone.
 
 Root cause and fix in §8.10; the silent-link variant in §8.13.
 
-### 9.8 OPEN — the boot-time cached-config line is not observed
+### 9.8 FIXED — the boot-time cached-config line was not observed
 
-`reboot`: `device applied the NVS-cached config at boot, before the shadow
-replied — not logged`. The firmware does emit
-`booting with cached OPC UA config v1 (15 tags)` — it appears in the serial logs
-— so this is more likely a capture-window or pattern issue in the phase than a
-missing behaviour. In the last run it was also downstream of §9.3: the wedged
-driver never applied v8, so the device came back on v6. Re-check on the next run.
+A harness defect, not a firmware one. Re-attaching the monitor with
+`--no-reset` left the chip in its bootloader, so the rebooted firmware never
+ran (§8.20).
 
 ### 9.9 Environment prerequisites discovered the hard way
 
@@ -1031,6 +1116,7 @@ driver never applied v8, so the device came back on v6. Re-check on the next run
 | Telemetry absent from CloudWatch but the device says it published | `dt/+/opcua` rule or its log group missing | §8.1's terraform also creates them. |
 | `espflash not found` | `export-esp.sh` does not add `~/.cargo/bin` | `cargo install espflash`; the runner looks in `~/.cargo/bin` itself. |
 | Serial log is a few hundred bytes; every log assertion fails | Monitor attached while the USB-JTAG was re-enumerating | §8.9b |
+| Monitor shows `Using flash stub`, then nothing; the device goes silent | Attached with `espflash monitor --no-reset`, which leaves the chip in its bootloader | §8.20. Attach without it; `espflash reset` recovers the device. |
 | Every phase reports the same `reported` snapshot, same `uptime_s` | Device is crash-looping | §9.2. `grep -c "memory allocation of" <serial log>`. |
 | `reported: (stale — nothing written since the run started)` | Device never booted, never joined the network, or is dead | Read the serial log; the shadow is from an earlier boot (§8.9c). |
 | `BadSecurityPolicyRejected: Cannot find user token type Anonymous` | Endpoint built without a token policy | §8.4 |
