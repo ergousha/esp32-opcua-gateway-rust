@@ -8,7 +8,6 @@
 //! block, telemetry in CloudWatch, the serial log — because nothing in
 //! production can reach inside the device either.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -21,10 +20,11 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::cloud::{now_ms, rows_by_address, Cloud};
-use crate::device::{self, SerialMonitor};
+use crate::device::SerialMonitor;
 use crate::report::{info, PhaseResult};
 
-/// Default run order.
+/// Default run order. For a host the device cannot reach, see
+/// [`crate::offline::PHASES`].
 pub const PHASES: &[&str] = &[
     "preflight",
     "provision",
@@ -113,17 +113,29 @@ pub struct Ctx {
     pub server: Server,
     pub monitor: Option<SerialMonitor>,
     pub thing: String,
-    pub repo: PathBuf,
     /// Config version currently expected to be applied on the device.
     pub applied_version: u32,
     /// Unix ms at the start of the run; nothing older counts.
     pub t0_ms: i64,
     /// Bundle versions published by this run, for `--cleanup`.
     pub published: Vec<u32>,
+    /// Highest config version the shadow had asked for, or this run has
+    /// published; [`Ctx::next_version`] continues from it.
+    pub last_version: u32,
 }
 
 impl Ctx {
-    async fn publish_config(
+    /// A config version the device cannot have applied already.
+    ///
+    /// A device ignores a version it is already running (requirements §7,
+    /// idempotency), so reusing one — a cached v1 from an earlier run, say —
+    /// would make a new configuration look like a re-delivery (§9.9).
+    pub(crate) fn next_version(&mut self) -> u32 {
+        self.last_version += 1;
+        self.last_version
+    }
+
+    pub(crate) async fn publish_config(
         &mut self,
         version: u32,
         tags: &[Tag],
@@ -137,6 +149,7 @@ impl Ctx {
             .update_desired(&desired.to_json(&self.thing, &bundle))
             .await?;
         self.published.push(version);
+        self.last_version = self.last_version.max(version);
         info(format!(
             "published config v{version}: {} tags, {} B bundle, sha256={}…",
             bundle.count,
@@ -146,7 +159,7 @@ impl Ctx {
         Ok(bundle)
     }
 
-    async fn expect_state(
+    pub(crate) async fn expect_state(
         &mut self,
         phase: &mut PhaseResult,
         label: &str,
@@ -170,12 +183,39 @@ impl Ctx {
         reported
     }
 
-    fn mark(&self) -> u64 {
+    pub(crate) fn mark(&self) -> u64 {
         self.monitor.as_ref().map_or(0, SerialMonitor::mark)
     }
 
-    fn log_since(&self, mark: u64) -> Option<String> {
+    pub(crate) fn log_since(&self, mark: u64) -> Option<String> {
         self.monitor.as_ref().map(|m| m.read_since(mark))
+    }
+
+    /// Waits for `pattern` in the serial log after `mark`.
+    pub(crate) async fn wait_log(
+        &self,
+        pattern: &str,
+        mark: u64,
+        timeout: Duration,
+    ) -> Option<String> {
+        let monitor = self.monitor.as_ref()?;
+        let pattern = Regex::new(pattern).expect("valid pattern");
+        monitor.wait_for(&pattern, mark, timeout).await
+    }
+
+    /// Reboots the chip over USB, capturing the new boot from its first line.
+    ///
+    /// Returns when the monitor is attached; use the returned instant to tell
+    /// a report from the new boot from one written before it.
+    pub(crate) async fn reset_device(&mut self) -> Result<std::time::Instant> {
+        info("rebooting the device over USB…");
+        let monitor = self
+            .monitor
+            .as_mut()
+            .ok_or_else(|| anyhow!("rebooting the device needs the serial monitor (--port)"))?;
+        let at = std::time::Instant::now();
+        monitor.restart().await?;
+        Ok(at)
     }
 }
 
@@ -192,6 +232,12 @@ pub async fn run(name: &str, ctx: &mut Ctx) -> Result<PhaseResult> {
         "server_down" => server_down(ctx).await,
         "disable" => disable(ctx).await,
         "reboot" => reboot(ctx).await,
+        "offline_config" => crate::offline::config(ctx).await,
+        "offline_disable" => crate::offline::disable(ctx).await,
+        "offline_reject_security" => crate::offline::reject_security(ctx).await,
+        "offline_reject_digest" => crate::offline::reject_digest(ctx).await,
+        "offline_reenable" => crate::offline::reenable(ctx).await,
+        "offline_reboot" => crate::offline::reboot(ctx).await,
         other => Err(anyhow!("unknown phase {other:?}")),
     }
 }
@@ -200,7 +246,14 @@ pub async fn run(name: &str, ctx: &mut Ctx) -> Result<PhaseResult> {
 // helpers
 // ---------------------------------------------------------------------------
 
-fn state(r: &Value) -> &str {
+/// True when the report's `uptime_s` places its boot after `since`.
+pub(crate) fn booted_since(r: &Value, since: std::time::Instant) -> bool {
+    r["uptime_s"]
+        .as_u64()
+        .is_some_and(|uptime| uptime <= since.elapsed().as_secs() + 5)
+}
+
+pub(crate) fn state(r: &Value) -> &str {
     r["state"].as_str().unwrap_or("")
 }
 
@@ -218,7 +271,7 @@ fn summary(r: &Value) -> String {
 /// An `on_poll` that never prints a stale document as if it were live:
 /// printing an old boot's fields is what makes a dead device look like a slow
 /// one.
-fn show(fmt: impl Fn(&Value) -> String) -> impl Fn(&Value, bool) {
+pub(crate) fn show(fmt: impl Fn(&Value) -> String) -> impl Fn(&Value, bool) {
     move |r, fresh| {
         if fresh {
             info(format!("reported: {}", fmt(r)));
@@ -228,7 +281,7 @@ fn show(fmt: impl Fn(&Value) -> String) -> impl Fn(&Value, bool) {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
@@ -824,23 +877,14 @@ async fn reboot(ctx: &mut Ctx) -> Result<PhaseResult> {
     ctx.server.start().await?;
     let mark = ctx.mark();
 
-    // The port is exclusive: the monitor lets go so `espflash reset` can drive
-    // DTR/RTS, then re-attaches without a reset of its own.
-    info("resetting the device over USB…");
-    let monitor = ctx.monitor.as_mut().expect("checked above");
-    monitor.stop();
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let reset = device::reset(&monitor.port, &ctx.repo).await?;
-    monitor.start(false).await?;
-    r.check(
-        "device reset over USB",
-        reset.is_ok(),
-        reset.err().map(|e| truncate(&e, 160)).unwrap_or_default(),
-    );
+    let rebooted_at = ctx.reset_device().await?;
 
-    let pattern = Regex::new(r"booting with cached OPC UA config v\d+ \(\d+ tags\)")?;
-    let hit = monitor
-        .wait_for(&pattern, mark, Duration::from_secs(120))
+    let hit = ctx
+        .wait_log(
+            r"booting with cached OPC UA config v\d+ \(\d+ tags\)",
+            mark,
+            Duration::from_secs(120),
+        )
         .await;
     r.check(
         "device applied the NVS-cached config at boot, before the shadow replied",
@@ -848,12 +892,14 @@ async fn reboot(ctx: &mut Ctx) -> Result<PhaseResult> {
         hit.unwrap_or_else(|| "not logged".into()),
     );
 
+    // Only a report from the new boot counts: `uptime_s` must fit inside the
+    // time since the reboot, or it was written before it.
     let applied = ctx.applied_version as u64;
     ctx.expect_state(
         &mut r,
         &format!("device is running again on cfg_v={applied} after the reboot"),
         Duration::from_secs(300),
-        move |x| state(x) == RUNNING && cfg_v(x) == applied,
+        move |x| state(x) == RUNNING && cfg_v(x) == applied && booted_since(x, rebooted_at),
     )
     .await;
     Ok(r)

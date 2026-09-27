@@ -148,6 +148,14 @@ impl Cloud {
         }
     }
 
+    /// Highest config version the shadow knows of, desired or reported.
+    pub async fn last_cfg_version(&self) -> Result<u32> {
+        let doc = self.get_shadow().await?.unwrap_or(Value::Null);
+        let desired = doc["state"]["desired"]["cfg"]["v"].as_u64().unwrap_or(0);
+        let reported = doc["state"]["reported"]["cfg_v"].as_u64().unwrap_or(0);
+        Ok(desired.max(reported) as u32)
+    }
+
     /// The `reported` block and when AWS last wrote any of it.
     pub async fn reported_with_ts(&self) -> Result<(Value, Option<i64>)> {
         let doc = self.get_shadow().await?.unwrap_or(Value::Null);

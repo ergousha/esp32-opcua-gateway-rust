@@ -23,6 +23,7 @@
 
 mod cloud;
 mod device;
+mod offline;
 mod phases;
 mod report;
 
@@ -47,6 +48,9 @@ usage: gateway-hil --thing NAME --server-host LAN-IP [options]
   --port DEVICE         serial port of the device; enables log assertions and `reboot`
   --flash               flash target/xtensa-esp32s3-espidf/release/esp32-opcua-gateway first
   --elf PATH            firmware ELF to flash and to decode the log against
+  --offline             for a host the device cannot reach (e.g. a firewalled
+                        workstation): run the phases that need no route from the
+                        device to this host; requires --port
   --phases A,B,...      subset of phases to run
   --region REGION       AWS region                                (default eu-central-1)
   --iot-endpoint HOST   IoT data endpoint                         (default: cfg.toml's iot_endpoint)
@@ -62,6 +66,7 @@ struct Args {
     flash: bool,
     elf: PathBuf,
     phases: Vec<String>,
+    offline: bool,
     region: String,
     iot_endpoint: Option<String>,
     artifacts: PathBuf,
@@ -85,7 +90,8 @@ fn parse_args() -> Result<Args> {
         port: None,
         flash: false,
         elf: repo.join("target/xtensa-esp32s3-espidf/release/esp32-opcua-gateway"),
-        phases: PHASES.iter().map(|p| p.to_string()).collect(),
+        phases: Vec::new(),
+        offline: false,
         region: "eu-central-1".into(),
         iot_endpoint: None,
         artifacts: repo.join("gateway-hil/artifacts"),
@@ -103,6 +109,7 @@ fn parse_args() -> Result<Args> {
             "--flash" => args.flash = true,
             "--elf" => args.elf = value()?.into(),
             "--phases" => args.phases = value()?.split(',').map(str::to_string).collect(),
+            "--offline" => args.offline = true,
             "--region" => args.region = value()?,
             "--iot-endpoint" => args.iot_endpoint = Some(value()?),
             "--artifacts" => args.artifacts = value()?.into(),
@@ -127,13 +134,24 @@ fn parse_args() -> Result<Args> {
     if args.flash && args.port.is_none() {
         bail!("--flash needs --port");
     }
-    let unknown: Vec<_> = args
-        .phases
-        .iter()
-        .filter(|p| !PHASES.contains(&p.as_str()))
-        .collect();
+    if args.offline && args.port.is_none() {
+        bail!("--offline asserts on the serial log and needs --port");
+    }
+    let default = if args.offline {
+        offline::PHASES
+    } else {
+        PHASES
+    };
+    if args.phases.is_empty() {
+        args.phases = default.iter().map(|p| p.to_string()).collect();
+    }
+    let known = |p: &str| PHASES.contains(&p) || offline::PHASES.contains(&p);
+    let unknown: Vec<_> = args.phases.iter().filter(|p| !known(p)).collect();
     if !unknown.is_empty() {
-        bail!("unknown phases {unknown:?}; known: {PHASES:?}");
+        bail!(
+            "unknown phases {unknown:?}; known: {PHASES:?}, offline: {:?}",
+            offline::PHASES
+        );
     }
     Ok(args)
 }
@@ -180,8 +198,11 @@ async fn run() -> Result<bool> {
     // left over from an earlier boot can never satisfy an assertion.
     cloud.require_fresh_since(t0_ms);
 
+    // Offline, nothing may listen on the LAN: the device is meant to find
+    // its endpoint silent. The server still serves `preflight` over loopback.
+    let bind = if args.offline { "127.0.0.1" } else { "0.0.0.0" };
     let server = Server::new(opcua_test_server::Options {
-        bind: "0.0.0.0".parse().expect("valid address"),
+        bind: bind.parse().expect("valid address"),
         port: args.server_port,
         path: args.server_path.clone(),
         advertised_host: Some(args.server_host.clone()),
@@ -192,20 +213,25 @@ async fn run() -> Result<bool> {
         .as_deref()
         .map(|p| SerialMonitor::new(p, serial_log.clone(), args.elf.clone(), repo.clone()));
 
+    let last_version = cloud
+        .last_cfg_version()
+        .await
+        .context("reading the opcua shadow")?;
     let mut ctx = Ctx {
         cloud,
         server,
         monitor,
         thing: args.thing.clone(),
-        repo,
         applied_version: 0,
         t0_ms,
         published: Vec::new(),
+        last_version,
     };
 
     if let Some(monitor) = ctx.monitor.as_mut() {
-        // Only a run that just flashed may spend a reset to catch the boot.
-        monitor.start(args.flash).await?;
+        // Attaching reboots the device (see `SerialMonitor`), so every run
+        // starts from a clean boot whose log is captured from the first line.
+        monitor.start().await?;
     }
 
     let mut results = Vec::new();

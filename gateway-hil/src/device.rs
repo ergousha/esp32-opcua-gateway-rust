@@ -5,10 +5,12 @@
 //! ESP-IDF), and tokio's child reaper on macOS is built on SIGCHLD — so
 //! `tokio::process` cannot wait for a child here. Blocking calls run on
 //! `spawn_blocking` instead.
+//!
+//! Runs on macOS, Linux and Windows. Only port detection differs: see
+//! [`wait_for_port`].
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -24,19 +26,21 @@ use crate::report::info;
 /// where `cargo install espflash` puts it, so a bare name fails after the
 /// build — for a reason the error does not name.
 pub fn espflash() -> Result<PathBuf> {
+    let name = format!("espflash{}", std::env::consts::EXE_SUFFIX);
     if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
-            .map(|dir| dir.join("espflash"))
+            .map(|dir| dir.join(&name))
             .find(|candidate| candidate.is_file())
     }) {
         return Ok(path);
     }
-    let fallback = std::env::var_os("HOME")
-        .map(|home| Path::new(&home).join(".cargo/bin/espflash"))
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let fallback = home
+        .map(|home| Path::new(&home).join(".cargo").join("bin").join(&name))
         .filter(|p| p.is_file());
     fallback.ok_or_else(|| {
         anyhow!(
-            "espflash not found on PATH or at ~/.cargo/bin/espflash; install it with \
+            "{name} not found on PATH or in ~/.cargo/bin; install it with \
              `cargo install espflash`"
         )
     })
@@ -48,7 +52,10 @@ pub fn espflash() -> Result<PathBuf> {
 /// the node disappears and comes back, possibly as a new inode. A monitor
 /// attached in that window holds a handle that never delivers a byte, which on
 /// the log is indistinguishable from a device that booted and said nothing.
+#[cfg(unix)]
 pub fn wait_for_port(port: &str, timeout: Duration, settle: Duration) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
     let deadline = Instant::now() + timeout;
     let mut last: Option<u64> = None;
     let mut stable_since: Option<Instant> = None;
@@ -69,6 +76,16 @@ pub fn wait_for_port(port: &str, timeout: Duration, settle: Duration) -> bool {
     false
 }
 
+/// Windows: a COM port is not a file with an inode, and probing it by opening
+/// it can drive DTR/RTS — which on this chip's USB-JTAG is a reset line. So
+/// wait out the re-enumeration instead; espflash reports a port that never
+/// came back.
+#[cfg(not(unix))]
+pub fn wait_for_port(_port: &str, timeout: Duration, settle: Duration) -> bool {
+    std::thread::sleep((settle * 2).min(timeout));
+    true
+}
+
 /// Flashes `elf` into the `ota_0` slot.
 pub async fn flash(port: &str, elf: &Path, repo: &Path) -> Result<()> {
     let mut cmd = Command::new(espflash()?);
@@ -87,29 +104,21 @@ pub async fn flash(port: &str, elf: &Path, repo: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Resets the chip over USB. Returns espflash's stderr on failure.
-pub async fn reset(port: &str, repo: &Path) -> Result<std::result::Result<(), String>> {
-    let mut cmd = Command::new(espflash()?);
-    cmd.args(["reset", "--port", port]).current_dir(repo);
-    let out = tokio::task::spawn_blocking(move || cmd.output())
-        .await?
-        .context("running espflash reset")?;
-    if out.status.success() {
-        Ok(Ok(()))
-    } else {
-        Ok(Err(String::from_utf8_lossy(&out.stderr).into_owned()))
-    }
-}
-
 /// Captures the device's serial log for the whole run.
 ///
 /// One long-lived monitor rather than one per phase: the port is exclusive,
-/// and re-attaching resets the chip, which would destroy exactly the
-/// continuity later phases assert on. Only a run that just flashed attaches
-/// *with* a reset — flashing already reset the chip while nothing was
-/// listening, so one more reset is the only way to see a boot from its first
-/// line. Every other attach keeps `--no-reset`, so the boot under inspection
-/// is the one the phase caused.
+/// and every attach reboots the chip, which would destroy exactly the
+/// continuity later phases assert on.
+///
+/// **Every attach resets the chip, deliberately.** `espflash monitor` cannot
+/// attach to running firmware: it first connects to the ROM loader, which
+/// means resetting the chip into download mode. Its default then hard-resets
+/// the chip so the firmware boots, and the log starts at the first boot line.
+/// `--no-reset` only skips that second reset (it is `--after no-reset`): the
+/// chip stays in the bootloader and the firmware never runs again, while the
+/// monitor shows `Using flash stub` and then nothing. That was the harness
+/// defect behind §9.8; see `docs/OPCUA_INTEGRATION_TEST.md` §8.20. A reboot is
+/// therefore just a re-attach ([`SerialMonitor::restart`]).
 pub struct SerialMonitor {
     pub port: String,
     log: PathBuf,
@@ -129,7 +138,8 @@ impl SerialMonitor {
         }
     }
 
-    pub async fn start(&mut self, reset: bool) -> Result<()> {
+    /// Attaches, rebooting the chip so its log is captured from the first line.
+    pub async fn start(&mut self) -> Result<()> {
         let port = self.port.clone();
         let settled = tokio::task::spawn_blocking(move || {
             wait_for_port(&port, Duration::from_secs(30), Duration::from_millis(1_500))
@@ -149,29 +159,31 @@ impl SerialMonitor {
             .open(&self.log)?;
         let mut cmd = Command::new(espflash()?);
         cmd.args(["monitor", "--port", &self.port, "--non-interactive"]);
-        if !reset {
-            cmd.arg("--no-reset");
+        // The ELF only decodes backtraces; a host that did not build the
+        // firmware can still monitor without it.
+        if self.elf.is_file() {
+            cmd.arg("--elf").arg(&self.elf);
         }
-        cmd.arg("--elf")
-            .arg(&self.elf)
-            .current_dir(&self.repo)
+        cmd.current_dir(&self.repo)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
         self.child = Some(cmd.spawn().context("starting espflash monitor")?);
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        let how = if reset {
-            "with a reset, to capture the boot"
-        } else {
-            "without resetting"
-        };
         info(format!(
-            "serial monitor attached to {} {how} -> {}",
+            "serial monitor attached to {} (the chip reboots) -> {}",
             self.port,
             self.log.display()
         ));
         Ok(())
+    }
+
+    /// Reboots the chip by re-attaching (see the type docs).
+    pub async fn restart(&mut self) -> Result<()> {
+        self.stop();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        self.start().await
     }
 
     /// Current size of the log, for reading only what a phase produced.
