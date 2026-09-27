@@ -710,10 +710,11 @@ async fn reject_digest(ctx: &mut Ctx) -> Result<PhaseResult> {
     let (ok, reported) = ctx
         .cloud
         .wait_for_reported(
+            // Not just "sha256": the previous phase's error names Basic256Sha256.
             |x| {
                 x["last_error"]
                     .as_str()
-                    .is_some_and(|e| e.to_lowercase().contains("sha256"))
+                    .is_some_and(|e| e.contains("bundle sha256"))
             },
             Duration::from_secs(120),
             show(|x| format!("last_error={} cfg_v={}", x["last_error"], x["cfg_v"])),

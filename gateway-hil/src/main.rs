@@ -234,10 +234,16 @@ async fn run() -> Result<bool> {
         monitor.start().await?;
     }
 
+    // Printed by the ESP-IDF panic handler, never by a USB reset.
+    let crash = regex::Regex::new(
+        r"Guru Meditation|\*\*\*ERROR\*\*\*.*|abort\(\) was called.*|Rebooting\.\.\.",
+    )
+    .expect("valid pattern");
     let mut results = Vec::new();
     for name in &args.phases {
         banner(&format!("PHASE: {name}"));
-        let result = match phases::run(name, &mut ctx).await {
+        let mark = ctx.mark();
+        let mut result = match phases::run(name, &mut ctx).await {
             Ok(r) => r,
             // A phase blowing up is a failure, not a crash of the run.
             Err(e) => {
@@ -246,6 +252,15 @@ async fn run() -> Result<bool> {
                 r
             }
         };
+        if let Some(log) = ctx.log_since(mark) {
+            // A reboot can restore the expected state from NVS and hide itself.
+            let found = crash.find(&log).map(|m| m.as_str().trim().to_string());
+            result.check(
+                "device did not crash during the phase",
+                found.is_none(),
+                found.unwrap_or_default(),
+            );
+        }
         results.push(result);
     }
 
