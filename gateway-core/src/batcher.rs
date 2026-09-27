@@ -8,6 +8,14 @@
 //! A batch is flushed on whichever comes first: item count, estimated encoded
 //! size, or the age of the oldest buffered sample. Time is injected so the
 //! policy is testable without sleeping.
+//!
+//! A batch never mixes configuration versions. Each sample carries the version
+//! of the configuration whose subscription produced it, and a sample from a
+//! different version closes the current batch. The version stamped on a batch
+//! is therefore true by construction — it cannot depend on how quickly the
+//! publisher was rebuilt after a reconfiguration, which is the race that let
+//! samples collected under one version go out labelled with the next
+//! (`docs/OPCUA_INTEGRATION_TEST.md` §8.17).
 
 use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
@@ -26,13 +34,22 @@ pub struct Sample {
     pub value: TagValue,
     /// OPC UA StatusCode. Omitted from the wire format when Good.
     pub status: u32,
+    /// Configuration version the tag was subscribed under. Not part of the
+    /// row: it becomes the batch's `v`.
+    pub cfg_v: u32,
 }
 
 impl Sample {
     /// Pessimistic encoded size, including the row's brackets and commas.
     pub fn estimated_bytes(&self) -> usize {
         // ["address",1753660799871,<value>] plus an optional status field.
-        self.address.len() + 2 + 1 + 15 + 1 + self.value.estimated_bytes() + 2
+        self.address.len()
+            + 2
+            + 1
+            + 15
+            + 1
+            + self.value.estimated_bytes()
+            + 2
             + if is_good(self.status) { 0 } else { 12 }
     }
 }
@@ -73,6 +90,8 @@ pub enum FlushReason {
     Bytes,
     /// The oldest sample reached `batch_max_age_ms`.
     Age,
+    /// The next sample belongs to a different configuration version.
+    Version,
     /// The caller asked for everything buffered (shutdown, config change).
     Forced,
 }
@@ -95,12 +114,12 @@ const ENVELOPE_BYTES: usize = 40;
 
 impl Batcher {
     /// Creates a batcher from validated telemetry settings.
-    pub fn new(settings: &TelemetrySettings, cfg_version: u32) -> Self {
+    pub fn new(settings: &TelemetrySettings) -> Self {
         Self {
             max_items: settings.batch_max_items.max(1),
             max_bytes: settings.batch_max_bytes.max(ENVELOPE_BYTES + 64),
             max_age_ms: settings.batch_max_age_ms as i64,
-            cfg_version,
+            cfg_version: 0,
             buf: Vec::new(),
             bytes: ENVELOPE_BYTES,
             oldest_ms: None,
@@ -117,7 +136,8 @@ impl Batcher {
         self.buf.is_empty()
     }
 
-    /// Adds a sample, returning a batch when the size or count limit is hit.
+    /// Adds a sample, returning a batch when the size or count limit is hit,
+    /// or when the sample belongs to a different configuration version.
     ///
     /// A sample that would push the buffer past `batch_max_bytes` flushes the
     /// *previous* contents first and then starts the next batch, so no batch
@@ -127,10 +147,15 @@ impl Batcher {
         let size = sample.estimated_bytes() + 1;
         let mut flushed = None;
 
-        if !self.buf.is_empty() && self.bytes + size > self.max_bytes {
+        if !self.buf.is_empty() && sample.cfg_v != self.cfg_version {
+            flushed = self.take(now_ms).map(|b| (b, FlushReason::Version));
+        } else if !self.buf.is_empty() && self.bytes + size > self.max_bytes {
             flushed = self.take(now_ms).map(|b| (b, FlushReason::Bytes));
         }
 
+        if self.buf.is_empty() {
+            self.cfg_version = sample.cfg_v;
+        }
         self.oldest_ms.get_or_insert(now_ms);
         self.bytes += size;
         self.buf.push(sample);
@@ -189,11 +214,16 @@ mod tests {
     }
 
     fn sample(addr: &str, status: u32) -> Sample {
+        versioned(addr, status, 7)
+    }
+
+    fn versioned(addr: &str, status: u32, cfg_v: u32) -> Sample {
         Sample {
             address: addr.into(),
             ts_ms: 1_753_660_799_871,
             value: TagValue::F64(23.5),
             status,
+            cfg_v,
         }
     }
 
@@ -203,10 +233,34 @@ mod tests {
             t: 1_753_660_800_000,
             v: 7,
             d: vec![
-                Sample { address: "slow".into(), ts_ms: 1_753_660_799_871, value: TagValue::F64(23.5), status: 0 },
-                Sample { address: "fast".into(), ts_ms: 1_753_660_799_902, value: TagValue::Bool(true), status: 0 },
-                Sample { address: "txt".into(), ts_ms: 1_753_660_799_902, value: TagValue::Str("RUN".into()), status: 0 },
-                Sample { address: "bad".into(), ts_ms: 1_753_660_799_910, value: TagValue::Null, status: 2_153_775_104 },
+                Sample {
+                    address: "slow".into(),
+                    ts_ms: 1_753_660_799_871,
+                    value: TagValue::F64(23.5),
+                    status: 0,
+                    cfg_v: 7,
+                },
+                Sample {
+                    address: "fast".into(),
+                    ts_ms: 1_753_660_799_902,
+                    value: TagValue::Bool(true),
+                    status: 0,
+                    cfg_v: 7,
+                },
+                Sample {
+                    address: "txt".into(),
+                    ts_ms: 1_753_660_799_902,
+                    value: TagValue::Str("RUN".into()),
+                    status: 0,
+                    cfg_v: 7,
+                },
+                Sample {
+                    address: "bad".into(),
+                    ts_ms: 1_753_660_799_910,
+                    value: TagValue::Null,
+                    status: 2_153_775_104,
+                    cfg_v: 7,
+                },
             ],
         };
         assert_eq!(
@@ -225,7 +279,7 @@ mod tests {
 
     #[test]
     fn flushes_on_item_count() {
-        let mut b = Batcher::new(&settings(3, 64_000, 1_000), 7);
+        let mut b = Batcher::new(&settings(3, 64_000, 1_000));
         assert!(b.push(sample("a", 0), 0).is_none());
         assert!(b.push(sample("b", 0), 0).is_none());
         let (batch, why) = b.push(sample("c", 0), 0).unwrap();
@@ -237,14 +291,17 @@ mod tests {
     #[test]
     fn flushes_on_byte_budget_without_exceeding_it() {
         let budget = 200;
-        let mut b = Batcher::new(&settings(1_000, budget, 60_000), 7);
+        let mut b = Batcher::new(&settings(1_000, budget, 60_000));
         let mut flushes = 0;
         for i in 0..40 {
             if let Some((batch, why)) = b.push(sample(&format!("tag{i:03}"), 0), 0) {
                 assert_eq!(why, FlushReason::Bytes);
                 flushes += 1;
                 let encoded = serde_json::to_vec(&batch).unwrap().len();
-                assert!(encoded <= budget, "batch encoded to {encoded} B > {budget} B");
+                assert!(
+                    encoded <= budget,
+                    "batch encoded to {encoded} B > {budget} B"
+                );
             }
         }
         assert!(flushes > 0, "byte budget never triggered");
@@ -252,7 +309,7 @@ mod tests {
 
     #[test]
     fn flushes_on_age() {
-        let mut b = Batcher::new(&settings(1_000, 64_000, 1_000), 7);
+        let mut b = Batcher::new(&settings(1_000, 64_000, 1_000));
         b.push(sample("a", 0), 10_000);
         assert!(b.poll(10_500).is_none());
         let (batch, why) = b.poll(11_000).unwrap();
@@ -263,7 +320,7 @@ mod tests {
 
     #[test]
     fn age_is_measured_from_the_oldest_sample_not_the_newest() {
-        let mut b = Batcher::new(&settings(1_000, 64_000, 1_000), 7);
+        let mut b = Batcher::new(&settings(1_000, 64_000, 1_000));
         b.push(sample("a", 0), 10_000);
         b.push(sample("b", 0), 10_900);
         assert!(b.poll(11_000).is_some(), "oldest sample had aged out");
@@ -271,15 +328,48 @@ mod tests {
 
     #[test]
     fn empty_flushes_are_suppressed() {
-        let mut b = Batcher::new(&settings(10, 64_000, 100), 7);
+        let mut b = Batcher::new(&settings(10, 64_000, 100));
         assert!(b.poll(1_000_000).is_none());
         assert!(b.flush(1_000_000).is_none());
     }
 
     #[test]
-    fn batch_carries_the_config_version() {
-        let mut b = Batcher::new(&settings(1, 64_000, 1_000), 42);
-        let (batch, _) = b.push(sample("a", 0), 0).unwrap();
+    fn batch_carries_the_config_version_of_its_samples() {
+        let mut b = Batcher::new(&settings(1, 64_000, 1_000));
+        let (batch, _) = b.push(versioned("a", 0, 42), 0).unwrap();
         assert_eq!(batch.v, 42);
+    }
+
+    #[test]
+    fn a_new_config_version_closes_the_batch() {
+        let mut b = Batcher::new(&settings(1_000, 64_000, 60_000));
+        assert!(b.push(versioned("a", 0, 1), 0).is_none());
+        assert!(b.push(versioned("b", 0, 1), 0).is_none());
+
+        let (old, why) = b.push(versioned("a", 0, 2), 0).unwrap();
+        assert_eq!(why, FlushReason::Version);
+        assert_eq!(old.v, 1);
+        assert_eq!(old.d.len(), 2);
+
+        let (new, _) = b.flush(0).unwrap();
+        assert_eq!(new.v, 2);
+        assert_eq!(new.d.len(), 1);
+    }
+
+    #[test]
+    fn versions_never_mix_within_a_batch() {
+        let mut b = Batcher::new(&settings(3, 64_000, 60_000));
+        let mut batches = Vec::new();
+        for (i, v) in [1, 1, 2, 2, 2, 2, 1, 3].into_iter().enumerate() {
+            if let Some((batch, _)) = b.push(versioned(&format!("t{i}"), 0, v), 0) {
+                batches.push(batch);
+            }
+        }
+        batches.extend(b.flush(0).map(|(batch, _)| batch));
+        for batch in &batches {
+            assert!(batch.d.iter().all(|s| s.cfg_v == batch.v), "{batch:?}");
+        }
+        let versions: Vec<u32> = batches.iter().map(|b| b.v).collect();
+        assert_eq!(versions, vec![1, 2, 2, 1, 3]);
     }
 }

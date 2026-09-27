@@ -121,20 +121,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-opcua"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c011d92128edf3870ae12fc12eed59fb21b2cc45900a9c2ff57218aff2c835b4"
-dependencies = [
- "async-opcua-client",
- "async-opcua-core",
- "async-opcua-crypto",
- "async-opcua-macros",
- "async-opcua-types",
- "chrono",
-]
-
-[[package]]
 name = "async-opcua-client"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1046,17 +1032,13 @@ name = "esp32-opcua-gateway"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "async-opcua",
- "async-opcua-client",
- "async-opcua-types",
- "async-trait",
  "embuild",
  "esp-idf-svc",
  "gateway-core",
+ "gateway-opcua",
  "log",
  "serde",
  "serde_json",
- "tokio",
  "toml-cfg",
 ]
 
@@ -1218,6 +1200,21 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "gateway-opcua"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-opcua-client",
+ "async-opcua-types",
+ "env_logger",
+ "gateway-core",
+ "log",
+ "opcua-test-server",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

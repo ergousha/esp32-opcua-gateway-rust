@@ -120,6 +120,7 @@ mod tests {
             ts_ms: ts,
             value: TagValue::F64(ts as f64),
             status: 0,
+            cfg_v: 1,
         }
     }
 

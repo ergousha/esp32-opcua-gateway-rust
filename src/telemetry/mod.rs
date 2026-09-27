@@ -7,10 +7,11 @@
 //! * **control** — AWS IoT Jobs, i.e. OTA ([`crate::jobs`]),
 //! * **data** — batched OPC UA samples ([`publisher`]).
 //!
-//! The OPC UA stack runs on its own thread with its own tokio runtime, and
-//! talks to this loop only through a bounded sample queue and a command
-//! channel. That isolation is deliberate: an unreachable PLC must never be able
-//! to stall the path that delivers a firmware update.
+//! The OPC UA client (`gateway-opcua`) runs on its own thread with its own
+//! tokio runtime, and talks to this loop only through its [`Client`] handle —
+//! a bounded sample queue and a command channel. That isolation is deliberate:
+//! an unreachable PLC must never be able to stall the path that delivers a
+//! firmware update.
 
 pub mod publisher;
 
@@ -19,22 +20,17 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use gateway_core::health::DriverState;
+use gateway_opcua::Client;
 
 use crate::device_id::{self, DeviceIdentity};
 use crate::jobs::JobsClient;
 use crate::mqtt_util::{self, MqttEvent};
-use crate::opcua::{self, Shared};
 use crate::settings_store::SettingsStore;
 use crate::shadow::ConfigPlane;
 use crate::{config, ota};
 
 use publisher::Publisher;
-
-/// Samples buffered between the OPC UA thread and this loop.
-///
-/// Two full sweeps of the 250-tag maximum. Larger buffers do not help: the
-/// queue coalesces per address, so extra depth only adds staleness and heap.
-const QUEUE_CAPACITY: usize = 500;
 
 /// Samples moved out of the queue per loop turn. Caps the worst-case time this
 /// loop spends away from the MQTT event channel.
@@ -75,14 +71,11 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
         log::warn!("could not mark the firmware valid: {e:#}");
     }
 
-    let shared = Arc::new(Shared::new(QUEUE_CAPACITY, env!("CARGO_PKG_VERSION")));
-    let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
-    spawn_driver(Arc::clone(&shared), command_rx)?;
+    let opcua = start_opcua();
 
     let jobs = JobsClient::new(&id.thing_name);
-    let mut config_plane = ConfigPlane::new(&id.thing_name, commands);
-    let mut store = SettingsStore::new()
-        .context("opening the OPC UA settings store")?;
+    let mut config_plane = ConfigPlane::new(&id.thing_name, opcua.clone());
+    let mut store = SettingsStore::new().context("opening the OPC UA settings store")?;
 
     config_plane.bootstrap(&store);
     jobs.start(&mut session.client)?;
@@ -92,7 +85,10 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
     let mut last_tick = 0i64;
 
     loop {
-        match session.events.recv_timeout(Duration::from_millis(TICK_MS as u64)) {
+        match session
+            .events
+            .recv_timeout(Duration::from_millis(TICK_MS as u64))
+        {
             Ok(MqttEvent::Connected) => {
                 // Subscriptions do not survive a dropped session, and the
                 // shadow response is not retained, so both planes restart.
@@ -111,13 +107,7 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
                 if jobs.owns(&topic) {
                     jobs.handle(&topic, &data, &mut session.client);
                 } else {
-                    config_plane.handle(
-                        &topic,
-                        &data,
-                        &mut session.client,
-                        &mut store,
-                        &shared,
-                    );
+                    config_plane.handle(&topic, &data, &mut session.client, &mut store);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -146,17 +136,16 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
                 settings.telemetry.batch_max_bytes,
                 settings.telemetry.batch_max_age_ms
             );
-            publisher = Some(Publisher::new(&settings.telemetry, settings.cfg.v));
+            publisher = Some(Publisher::new(&settings.telemetry));
         }
 
         if let Some(publisher) = publisher.as_mut() {
-            let samples = shared.with_queue(|q| q.drain(DRAIN_CHUNK));
-            publisher.ingest(samples, now);
+            publisher.ingest(opcua.drain(DRAIN_CHUNK), now);
             publisher.tick(&mut session.client, now);
         }
 
-        update_counters(&shared, publisher.as_ref());
-        config_plane.report(&mut session.client, &shared, now);
+        update_counters(&opcua, publisher.as_ref());
+        config_plane.report(&mut session.client, now);
     }
 }
 
@@ -191,46 +180,43 @@ fn register_eventfd() -> Result<()> {
         .context("registering the eventfd VFS driver for Tokio")
 }
 
-/// Starts the OPC UA thread.
+/// Starts the OPC UA client on its own thread.
 ///
 /// A dedicated thread rather than a task: `esp-mqtt` runs its callback on its
 /// own task with a small stack, and the OPC UA stack needs far more room than
 /// that callback can offer.
-fn spawn_driver(
-    shared: Arc<Shared>,
-    commands: tokio::sync::mpsc::UnboundedReceiver<opcua::Command>,
-) -> Result<()> {
-    register_eventfd()?;
+///
+/// A client that cannot start does not take the device down with it: MQTT,
+/// Jobs and OTA keep running so a fixed image can still be delivered, and the
+/// failure is put in the shadow's `last_error` instead of surfacing only as an
+/// absence of data (`docs/OPCUA_INTEGRATION_TEST.md` §8.2).
+fn start_opcua() -> Client {
+    let mut options = gateway_opcua::Options::new(env!("CARGO_PKG_VERSION"));
+    // A per-device backoff seed keeps a whole fleet from reconnecting in
+    // lockstep after a server restart.
+    options.backoff_seed = backoff_seed();
+    options.clock = Arc::new(now_ms);
 
-    std::thread::Builder::new()
-        .name("opcua".into())
-        .stack_size(OPCUA_STACK_BYTES)
-        .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    log::error!("could not start the OPC UA runtime: {e}");
-                    return;
-                }
-            };
-            let now = Arc::new(now_ms) as opcua::session::NowFn;
-            // A per-device backoff seed keeps a whole fleet from reconnecting
-            // in lockstep after a server restart.
-            let seed = backoff_seed();
-            runtime.block_on(opcua::driver::run(shared, commands, now, seed));
-            log::warn!("OPC UA driver exited");
-        })
-        .context("spawning the OPC UA thread")?;
-    Ok(())
+    let (client, driver) = gateway_opcua::new(options);
+    let started = register_eventfd().and_then(|()| {
+        gateway_opcua::spawn_thread(driver, "opcua", OPCUA_STACK_BYTES)
+            .map(drop)
+            .context("starting the OPC UA thread")
+    });
+    if let Err(e) = started {
+        log::error!("OPC UA is unavailable: {e:#}");
+        client.update_reported(|r| {
+            r.state = DriverState::Error;
+            r.set_error(format!("OPC UA did not start: {e:#}"));
+        });
+    }
+    client
 }
 
-fn update_counters(shared: &Shared, publisher: Option<&Publisher>) {
-    let (dropped, coalesced) = shared.with_queue(|q| (q.dropped(), q.coalesced()));
+fn update_counters(opcua: &Client, publisher: Option<&Publisher>) {
+    let (dropped, coalesced) = opcua.queue_counters();
     let dropped = dropped + publisher.map_or(0, |p| p.dropped_batches());
-    shared.with_reported(|r| {
+    opcua.update_reported(|r| {
         r.dropped = dropped;
         r.coalesced = coalesced;
         r.uptime_s = uptime_s();

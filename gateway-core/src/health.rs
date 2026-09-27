@@ -29,7 +29,7 @@ pub enum DriverState {
 
 impl DriverState {
     /// Lowercase name, matching the shadow encoding.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             DriverState::Idle => "idle",
             DriverState::Connecting => "connecting",
@@ -167,7 +167,10 @@ mod tests {
     fn failure_sample_is_bounded() {
         let mut r = Reported::new("0.0.1");
         let failures: Vec<_> = (0..100)
-            .map(|i| FailedTag { a: format!("tag{i}"), s: 0x8034_0000 })
+            .map(|i| FailedTag {
+                a: format!("tag{i}"),
+                s: 0x8034_0000,
+            })
             .collect();
         r.set_sync_outcome(150, failures);
         assert_eq!(r.applied, 150);
@@ -185,7 +188,10 @@ mod tests {
         r.set_sync_outcome(
             248,
             (0..250)
-                .map(|i| FailedTag { a: format!("Chan1.Dev1.Tag{i:04}"), s: 0x8034_0000 })
+                .map(|i| FailedTag {
+                    a: format!("Chan1.Dev1.Tag{i:04}"),
+                    s: 0x8034_0000,
+                })
                 .collect(),
         );
         let encoded = serde_json::to_vec(&r).unwrap();
@@ -197,7 +203,13 @@ mod tests {
         let mut r = Reported::new("0.0.1");
         r.cfg_v = 7;
         r.state = DriverState::Running;
-        r.set_sync_outcome(248, vec![FailedTag { a: "bad".into(), s: 1 }]);
+        r.set_sync_outcome(
+            248,
+            vec![FailedTag {
+                a: "bad".into(),
+                s: 1,
+            }],
+        );
         let back: Reported = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(r, back);
     }

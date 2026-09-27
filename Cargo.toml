@@ -6,17 +6,19 @@ resolver = "2"
 publish = false
 
 # Only this crate is tied to the device. Every other member builds and runs on
-# the development host (`--target host-tuple`):
+# the development host (`--target host-tuple`, see README):
 #
 #   gateway-core       pure logic: settings/bundle parsing, value mapping,
 #                      batching, diffing, backoff
+#   gateway-opcua      the OPC UA client: session, subscription sync, reconnect
+#                      state machine. Platform-neutral; this crate plugs it in
 #   opcua-test-server  an OPC UA server on async-opcua-server (the server half
 #                      of the client's own library) plus the tag catalogue
 #
 # `crates/` holds vendored `[patch.crates-io]` sources and must stay out of the
 # workspace.
 [workspace]
-members = ["gateway-core", "opcua-test-server"]
+members = ["gateway-core", "gateway-opcua", "opcua-test-server"]
 exclude = ["crates"]
 
 [[bin]]
@@ -30,12 +32,8 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml-cfg = "0.2"
-tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
-async-opcua = { version = "0.19.0", default-features = false, features = ["client"] }
-async-opcua-client = { version = "0.19.0", default-features = false }
-async-opcua-types = { version = "0.19.0", default-features = false }
-async-trait = "0.1"
 gateway-core = { path = "gateway-core" }
+gateway-opcua = { path = "gateway-opcua" }
 
 # NOT: W5500 artik ESP-IDF'in dahili esp_eth SPI surucusuyle (lwIP netif olarak)
 # suruluyor; boylece TCP/IP + mbedTLS + MQTT dogrudan calisiyor. Bu yuzden

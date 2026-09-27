@@ -38,7 +38,10 @@ pub struct Publisher {
 
 impl Publisher {
     /// Creates a publisher for the given validated telemetry settings.
-    pub fn new(settings: &TelemetrySettings, cfg_version: u32) -> Self {
+    ///
+    /// Batches take their config version from the samples themselves, so a
+    /// publisher does not need to know which version it is publishing for.
+    pub fn new(settings: &TelemetrySettings) -> Self {
         Self {
             topic: settings.topic.clone(),
             qos: match settings.qos {
@@ -46,7 +49,7 @@ impl Publisher {
                 _ => QoS::AtLeastOnce,
             },
             max_bytes: settings.batch_max_bytes,
-            batcher: Batcher::new(settings, cfg_version),
+            batcher: Batcher::new(settings),
             pending: VecDeque::new(),
             last_publish_ms: 0,
             dropped_batches: 0,
@@ -135,7 +138,10 @@ impl Publisher {
             self.dropped_batches += 1;
             log::warn!("telemetry backlog full; dropped the oldest batch");
         }
-        log::debug!("queued {count}-sample batch ({reason:?}), {} B", payload.len());
+        log::debug!(
+            "queued {count}-sample batch ({reason:?}), {} B",
+            payload.len()
+        );
         self.pending.push_back(payload);
     }
 }

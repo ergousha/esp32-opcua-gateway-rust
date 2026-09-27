@@ -39,7 +39,11 @@ pub fn from_data_value(handle: u32, dv: &DataValue, received_ms: i64) -> RawSamp
     RawSample {
         client_handle: handle,
         ts_ms,
-        value: dv.value.as_ref().map(from_variant).unwrap_or(TagValue::Null),
+        value: dv
+            .value
+            .as_ref()
+            .map(from_variant)
+            .unwrap_or(TagValue::Null),
         status: dv.status.map(|s| s.bits()).unwrap_or(0),
     }
 }

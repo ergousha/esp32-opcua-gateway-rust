@@ -15,14 +15,12 @@
 use anyhow::Result;
 use esp_idf_svc::mqtt::client::QoS;
 
-use gateway_core::bundle;
 use gateway_core::health::DriverState;
 use gateway_core::settings::DesiredSettings;
 use gateway_core::shadow::{self, ShadowTopics};
-use tokio::sync::mpsc::UnboundedSender;
+use gateway_opcua::{AppliedConfig, Client};
 
 use crate::mqtt_util::{MqttTransport, QOS1};
-use crate::opcua::{AppliedConfig, Command, Shared};
 use crate::settings_store::SettingsStore;
 
 /// Minimum spacing between `reported` updates.
@@ -34,7 +32,7 @@ const REPORT_INTERVAL_MS: i64 = 30_000;
 /// Drives the shadow conversation and hands validated configs to the driver.
 pub struct ConfigPlane {
     topics: ShadowTopics,
-    commands: UnboundedSender<Command>,
+    opcua: Client,
     /// Validated settings waiting for a bundle that matches `cfg.sha256`.
     pending: Option<DesiredSettings>,
     /// Bundle topic we are currently subscribed to, if any.
@@ -48,11 +46,11 @@ pub struct ConfigPlane {
 }
 
 impl ConfigPlane {
-    /// Creates the config plane for `thing_name`.
-    pub fn new(thing_name: &str, commands: UnboundedSender<Command>) -> Self {
+    /// Creates the config plane for `thing_name`, driving `opcua`.
+    pub fn new(thing_name: &str, opcua: Client) -> Self {
         Self {
             topics: ShadowTopics::new(thing_name),
-            commands,
+            opcua,
             pending: None,
             subscribed_bundle_topic: None,
             applied_version: 0,
@@ -88,20 +86,14 @@ impl ConfigPlane {
             log::info!("no cached OPC UA configuration; waiting for the shadow");
             return;
         };
-        let settings = cached.settings;
-        match bundle::parse_and_verify(
-            &cached.bundle,
-            &settings.cfg,
-            settings.instance.ns,
-            settings.instance.id_type,
-        ) {
-            Ok(tags) => {
+        match AppliedConfig::new(cached.settings, &cached.bundle) {
+            Ok(config) => {
                 log::info!(
                     "booting with cached OPC UA config v{} ({} tags)",
-                    settings.cfg.v,
-                    tags.len()
+                    config.settings.cfg.v,
+                    config.tags.len()
                 );
-                self.dispatch(settings, tags);
+                self.dispatch(config);
             }
             Err(e) => log::warn!("cached bundle rejected: {e}"),
         }
@@ -115,10 +107,9 @@ impl ConfigPlane {
         payload: &[u8],
         client: &mut impl MqttTransport,
         store: &mut SettingsStore,
-        shared: &Shared,
     ) {
         if topic == self.topics.get_accepted {
-            self.on_desired(payload, client, store, shared);
+            self.on_desired(payload, client, store);
         } else if topic == self.topics.get_rejected {
             let err = shadow::parse_rejected(payload);
             // A 404 simply means nobody has configured this device yet.
@@ -133,9 +124,12 @@ impl ConfigPlane {
                 Err(e) => log::warn!("unparseable shadow delta: {e}"),
             }
         } else if topic == self.topics.update_rejected {
-            log::warn!("shadow update rejected: {}", shadow::parse_rejected(payload));
+            log::warn!(
+                "shadow update rejected: {}",
+                shadow::parse_rejected(payload)
+            );
         } else if self.subscribed_bundle_topic.as_deref() == Some(topic) {
-            self.on_bundle(payload, store, shared);
+            self.on_bundle(payload, store);
         }
     }
 
@@ -144,13 +138,12 @@ impl ConfigPlane {
         payload: &[u8],
         client: &mut impl MqttTransport,
         store: &mut SettingsStore,
-        shared: &Shared,
     ) {
         let doc = match shadow::parse_get_accepted(payload) {
             Ok(doc) => doc,
             Err(e) => {
                 log::warn!("shadow document unusable: {e}");
-                shared.with_reported(|r| r.set_error(e.to_string()));
+                self.opcua.update_reported(|r| r.set_error(e.to_string()));
                 return;
             }
         };
@@ -159,20 +152,26 @@ impl ConfigPlane {
             // Hard rejection. Notably this is where a non-`None` security
             // policy is refused rather than silently downgraded.
             log::error!("shadow v{} rejected: {e}", doc.version);
-            shared.with_reported(|r| r.set_error(e.to_string()));
+            self.opcua.update_reported(|r| r.set_error(e.to_string()));
             return;
         }
 
         if !doc.settings.enabled {
             log::info!("shadow v{}: OPC UA disabled", doc.version);
             self.pending = None;
-            let _ = self.commands.send(Command::Disable);
+            if self.opcua.disable().is_err() {
+                log::error!("OPC UA task is gone; disable not applied");
+            }
             return;
         }
 
         if doc.settings.cfg.v == self.applied_version {
             // Idempotent re-delivery of the version we are already running.
-            log::debug!("shadow v{}: config v{} already applied", doc.version, self.applied_version);
+            log::debug!(
+                "shadow v{}: config v{} already applied",
+                doc.version,
+                self.applied_version
+            );
             return;
         }
 
@@ -187,17 +186,19 @@ impl ConfigPlane {
         // The cached bundle may already be the one this config points at, in
         // which case nothing needs to come over the wire.
         if let Some(cached) = store.load() {
-            if cached.settings.cfg.sha256.eq_ignore_ascii_case(&doc.settings.cfg.sha256) {
-                if let Ok(tags) = bundle::parse_and_verify(
-                    &cached.bundle,
-                    &doc.settings.cfg,
-                    doc.settings.instance.ns,
-                    doc.settings.instance.id_type,
-                ) {
-                    log::info!("cached bundle already matches config v{}", doc.settings.cfg.v);
-                    let settings = doc.settings.clone();
-                    let _ = store.save(&settings, &cached.bundle);
-                    self.dispatch(settings, tags);
+            if cached
+                .settings
+                .cfg
+                .sha256
+                .eq_ignore_ascii_case(&doc.settings.cfg.sha256)
+            {
+                if let Ok(config) = AppliedConfig::new(doc.settings.clone(), &cached.bundle) {
+                    log::info!(
+                        "cached bundle already matches config v{}",
+                        doc.settings.cfg.v
+                    );
+                    let _ = store.save(&config.settings, &cached.bundle);
+                    self.dispatch(config);
                     return;
                 }
             }
@@ -225,42 +226,36 @@ impl ConfigPlane {
         }
     }
 
-    fn on_bundle(&mut self, payload: &[u8], store: &mut SettingsStore, shared: &Shared) {
+    fn on_bundle(&mut self, payload: &[u8], store: &mut SettingsStore) {
         let Some(settings) = self.pending.clone() else {
             // A retained bundle can arrive before, or long after, the shadow.
             log::debug!("tag bundle arrived with no pending configuration");
             return;
         };
 
-        let tags = match bundle::parse_and_verify(
-            payload,
-            &settings.cfg,
-            settings.instance.ns,
-            settings.instance.id_type,
-        ) {
-            Ok(tags) => tags,
+        let config = match AppliedConfig::new(settings, payload) {
+            Ok(config) => config,
             Err(e) => {
                 log::error!("tag bundle rejected: {e}");
-                shared.with_reported(|r| r.set_error(e.to_string()));
+                self.opcua.update_reported(|r| r.set_error(e.to_string()));
                 return;
             }
         };
 
-        if let Err(e) = store.save(&settings, payload) {
+        if let Err(e) = store.save(&config.settings, payload) {
             // Not fatal: we can still run, we just will not survive a reboot
             // without the cloud.
             log::warn!("could not cache OPC UA config: {e:#}");
         }
 
         self.pending = None;
-        self.dispatch(settings, tags);
+        self.dispatch(config);
     }
 
-    fn dispatch(&mut self, settings: DesiredSettings, tags: Vec<gateway_core::bundle::TagSpec>) {
-        self.applied_version = settings.cfg.v;
-        self.fresh_settings = Some(settings.clone());
-        let config = AppliedConfig { settings, tags };
-        if self.commands.send(Command::Apply(Box::new(config))).is_err() {
+    fn dispatch(&mut self, config: AppliedConfig) {
+        self.applied_version = config.settings.cfg.v;
+        self.fresh_settings = Some(config.settings.clone());
+        if self.opcua.apply(config).is_err() {
             log::error!("OPC UA task is gone; configuration not applied");
         }
     }
@@ -272,8 +267,8 @@ impl ConfigPlane {
     }
 
     /// Publishes `reported` when the state changed or the interval elapsed.
-    pub fn report(&mut self, client: &mut impl MqttTransport, shared: &Shared, now_ms: i64) {
-        let (payload, state) = shared.with_reported(|r| {
+    pub fn report(&mut self, client: &mut impl MqttTransport, now_ms: i64) {
+        let (payload, state) = self.opcua.update_reported(|r| {
             r.free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
             (shadow::encode_reported(r), r.state)
         });

@@ -20,12 +20,19 @@
 //!   turned into a backoff, never a `panic!` or an early `return`.
 //! * Reconnects use exponential backoff with jitter (1 s → 60 s). The spike's
 //!   flat 5 s retry turns a fleet into a synchronised connection storm the
-//!   moment a server comes back.
+//!   moment a server comes back. This is the *only* retry loop: the library's
+//!   own is switched off (see `session.rs`), because two of them fighting is
+//!   what hid dead servers and wedged disables on hardware.
+//! * Steady state is event-driven: the driver sleeps until a command arrives or
+//!   the session ends, and reacts to either at once.
+//! * A newer configuration always wins over whatever is in flight.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::anyhow;
 use gateway_core::backoff::Backoff;
 use gateway_core::batcher::Sample;
 use gateway_core::bundle::TagSpec;
@@ -33,20 +40,18 @@ use gateway_core::diff;
 use gateway_core::health::{DriverState, FailedTag};
 use gateway_core::node::resolve_namespace;
 use gateway_core::plan::{self, MAX_ITEMS_PER_REQUEST};
+use gateway_core::settings::InstanceSettings;
 use gateway_core::value::is_good;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use super::session::{Connection, NowFn, SampleSink};
-use super::{AppliedConfig, Command, Shared};
+use crate::session::{Connection, SampleSink};
+use crate::{AppliedConfig, Clock, Command, Shared};
 
-/// How often the running state is re-checked for a dead session.
-const LIVENESS_POLL: Duration = Duration::from_millis(500);
-
-/// Runs the driver until `commands` is closed. Never returns otherwise.
-pub async fn run(
+/// Runs the driver until `commands` is closed.
+pub(crate) async fn run(
     shared: Arc<Shared>,
     mut commands: UnboundedReceiver<Command>,
-    now: NowFn,
+    clock: Clock,
     backoff_seed: u32,
 ) {
     let mut backoff = Backoff::default_schedule(backoff_seed);
@@ -54,111 +59,122 @@ pub async fn run(
     let mut running: Option<Session> = None;
 
     loop {
-        // A newer configuration always wins over whatever is in flight.
-        match next_command(&mut commands, running.is_some() || desired.is_some()).await {
-            Some(Command::Apply(config)) => {
-                desired = Some(*config);
-                backoff.reset();
-            }
-            Some(Command::Disable) => {
-                log::info!("OPC UA disabled by configuration");
-                desired = None;
-                if let Some(session) = running.take() {
-                    session.connection.shutdown().await;
-                }
-                set_state(&shared, DriverState::Idle);
-                continue;
-            }
-            None if commands.is_closed() => return,
-            None => {}
-        }
-
         let Some(config) = desired.clone() else {
+            if let Some(session) = running.take() {
+                session.close().await;
+            }
             set_state(&shared, DriverState::Idle);
-            continue;
+            match commands.recv().await {
+                Some(cmd) => {
+                    apply(cmd, &mut desired, &mut commands);
+                    backoff.reset();
+                    continue;
+                }
+                None => return,
+            }
         };
-
-        // Drop a session whose event loop has died before doing anything else.
-        if running.as_ref().is_some_and(|s| !s.connection.is_alive()) {
-            log::warn!("OPC UA session lost; reconnecting");
-            running = None;
-            shared.with_reported(|r| r.set_error("session lost"));
-        }
 
         let outcome = match running.take() {
-            Some(session) => resync(&shared, session, &config, &now).await,
-            None => connect_and_sync(&shared, &config, &now).await,
+            Some(session) => resync(&shared, session, &config, &clock).await,
+            None => connect_and_sync(&shared, &config, &clock).await,
         };
 
-        match outcome {
-            Ok(session) => {
-                running = Some(session);
+        let failure = match outcome {
+            Ok(mut session) => {
                 backoff.reset();
                 set_state(&shared, DriverState::Running);
-                tokio::time::sleep(LIVENESS_POLL).await;
-            }
-            Err(e) => {
-                let delay = backoff.next_delay_ms();
-                log::error!(
-                    "OPC UA sync failed (attempt {}): {e:#}; retrying in {} ms",
-                    backoff.attempt(),
-                    delay
-                );
-                shared.with_reported(|r| {
-                    r.state = DriverState::Error;
-                    r.set_error(format!("{e:#}"));
-                });
-                // Sleeping in a `select!` keeps a config change from waiting
-                // out a 60 s backoff.
+
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
-                    cmd = commands.recv() => {
-                        if let Some(cmd) = cmd {
-                            apply_command(cmd, &mut desired, &mut running).await;
-                            backoff.reset();
+                    cmd = commands.recv() => match cmd {
+                        Some(cmd) => {
+                            apply(cmd, &mut desired, &mut commands);
+                            running = Some(session);
+                            continue;
                         }
+                        None => {
+                            session.close().await;
+                            return;
+                        }
+                    },
+                    reason = session.connection.closed() => {
+                        session.close().await;
+                        anyhow!("session lost: {reason}")
                     }
                 }
             }
-        }
-    }
-}
+            Err(e) => e,
+        };
 
-/// Waits for a command when idle, polls without blocking when there is work.
-async fn next_command(
-    commands: &mut UnboundedReceiver<Command>,
-    have_work: bool,
-) -> Option<Command> {
-    if have_work {
-        commands.try_recv().ok()
-    } else {
-        commands.recv().await
-    }
-}
+        let delay = backoff.next_delay_ms();
+        log::error!(
+            "OPC UA failure (attempt {}): {failure:#}; retrying in {delay} ms",
+            backoff.attempt()
+        );
+        set_state(&shared, DriverState::Error);
+        shared.with_reported(|r| r.set_error(format!("{failure:#}")));
 
-async fn apply_command(
-    cmd: Command,
-    desired: &mut Option<AppliedConfig>,
-    running: &mut Option<Session>,
-) {
-    match cmd {
-        Command::Apply(config) => *desired = Some(*config),
-        Command::Disable => {
-            *desired = None;
-            if let Some(session) = running.take() {
-                session.connection.shutdown().await;
+        // Sleeping in a `select!` keeps a config change from waiting out a
+        // 60 s backoff.
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+            cmd = commands.recv() => match cmd {
+                Some(cmd) => {
+                    apply(cmd, &mut desired, &mut commands);
+                    backoff.reset();
+                }
+                None => return,
             }
         }
     }
 }
 
-/// A connected session together with the tag set it currently realises.
+/// Records `cmd`, then any commands queued behind it: only the last one counts.
+fn apply(
+    cmd: Command,
+    desired: &mut Option<AppliedConfig>,
+    commands: &mut UnboundedReceiver<Command>,
+) {
+    let mut next = Some(cmd);
+    while let Some(cmd) = next {
+        match cmd {
+            Command::Apply(config) => *desired = Some(*config),
+            Command::Disable => {
+                log::info!("OPC UA disabled by configuration");
+                *desired = None;
+            }
+        }
+        next = commands.try_recv().ok();
+    }
+}
+
+/// A connected session together with what it currently realises.
 struct Session {
     connection: Connection,
-    /// Tags actually created on the server, in bundle order.
-    tags: Vec<TagSpec>,
-    /// Config version these tags came from.
+    /// Connection parameters the session was opened with.
+    instance: InstanceSettings,
+    /// Config version the subscriptions belong to.
     cfg_version: u32,
+    synced: Synced,
+}
+
+/// The subscriptions created for one configuration.
+struct Synced {
+    /// The configuration's tags, as given — before any namespace renumbering,
+    /// so that re-applying an identical configuration diffs as empty.
+    tags: Vec<TagSpec>,
+    /// Subscription ids, so a reconfiguration can delete them.
+    subscriptions: Vec<u32>,
+    /// Cleared when these subscriptions are retired; their sink checks it, so
+    /// a notification already in flight cannot land under the new config.
+    live: Arc<AtomicBool>,
+}
+
+impl Session {
+    /// Ends the session, bounded (see [`Connection::shutdown`]).
+    async fn close(self) {
+        self.synced.live.store(false, Ordering::SeqCst);
+        self.connection.shutdown().await;
+    }
 }
 
 fn set_state(shared: &Shared, state: DriverState) {
@@ -176,22 +192,34 @@ fn set_state(shared: &Shared, state: DriverState) {
 /// Builds the sink that turns notifications into queued samples.
 ///
 /// The handle-to-address map is captured by the closure, which is why a
-/// resync always rebuilds the subscription rather than mutating it: a stale
+/// resync always rebuilds the subscriptions rather than mutating them: a stale
 /// map would misattribute values to the wrong tag, the worst failure mode a
 /// gateway has.
-fn make_sink(shared: Arc<Shared>, handles: HashMap<u32, String>) -> SampleSink {
+fn make_sink(
+    shared: Arc<Shared>,
+    handles: HashMap<u32, String>,
+    cfg_v: u32,
+    live: Arc<AtomicBool>,
+) -> SampleSink {
     Arc::new(move |raw| {
+        if !live.load(Ordering::SeqCst) {
+            return;
+        }
         let Some(address) = handles.get(&raw.client_handle) else {
             // Can only happen if the server echoes a handle we never sent.
-            log::debug!("dropping notification for unknown handle {}", raw.client_handle);
+            log::debug!(
+                "dropping notification for unknown handle {}",
+                raw.client_handle
+            );
             return;
         };
         shared.with_queue(|q| {
             q.push(Sample {
                 address: address.clone(),
                 ts_ms: raw.ts_ms,
-                value: raw.value.clone(),
+                value: raw.value,
                 status: raw.status,
+                cfg_v,
             })
         });
     })
@@ -200,21 +228,22 @@ fn make_sink(shared: Arc<Shared>, handles: HashMap<u32, String>) -> SampleSink {
 async fn connect_and_sync(
     shared: &Arc<Shared>,
     config: &AppliedConfig,
-    now: &NowFn,
+    clock: &Clock,
 ) -> anyhow::Result<Session> {
     set_state(shared, DriverState::Connecting);
 
     let session_name = format!("esp32-gw-v{}", config.settings.cfg.v);
     let connection = Connection::connect(&config.settings.instance, &session_name).await?;
 
-    match sync(shared, &connection, config, now, &[]).await {
-        Ok(tags) => Ok(Session {
+    match sync(shared, &connection, config, clock).await {
+        Ok(synced) => Ok(Session {
             connection,
-            tags,
+            instance: config.settings.instance.clone(),
             cfg_version: config.settings.cfg.v,
+            synced,
         }),
         Err(e) => {
-            // Do not leak the event loop task on a failed sync.
+            // Never leave an event loop running behind a failed sync.
             connection.shutdown().await;
             Err(e)
         }
@@ -223,11 +252,23 @@ async fn connect_and_sync(
 
 async fn resync(
     shared: &Arc<Shared>,
-    mut session: Session,
+    session: Session,
     config: &AppliedConfig,
-    now: &NowFn,
+    clock: &Clock,
 ) -> anyhow::Result<Session> {
-    let plan = diff::diff(&session.tags, &config.tags);
+    if session.instance != config.settings.instance {
+        // A different endpoint (or session parameters) is a different
+        // session; resynchronising the old one would keep reading the old PLC.
+        log::info!(
+            "config v{} -> v{}: connection settings changed; reconnecting",
+            session.cfg_version,
+            config.settings.cfg.v
+        );
+        session.close().await;
+        return connect_and_sync(shared, config, clock).await;
+    }
+
+    let plan = diff::diff(&session.synced.tags, &config.tags);
     if plan.is_empty() && session.cfg_version == config.settings.cfg.v {
         return Ok(session);
     }
@@ -244,11 +285,29 @@ async fn resync(
     // Subscriptions are rebuilt wholesale rather than edited in place. At 250
     // tags the extra service calls cost under a second, and it removes the
     // entire class of bugs where the handle map and the server's monitored
-    // items drift apart.
-    let tags = sync(shared, &session.connection, config, now, &session.tags).await?;
-    session.tags = tags;
-    session.cfg_version = config.settings.cfg.v;
-    Ok(session)
+    // items drift apart. The old ones are deleted first: left in place they
+    // keep reporting removed tags, and on the device they leak heap with every
+    // reconfiguration.
+    let Session {
+        connection, synced, ..
+    } = session;
+    synced.live.store(false, Ordering::SeqCst);
+    let rebuilt = match connection.delete_subscriptions(&synced.subscriptions).await {
+        Ok(()) => sync(shared, &connection, config, clock).await,
+        Err(e) => Err(e),
+    };
+    match rebuilt {
+        Ok(synced) => Ok(Session {
+            connection,
+            instance: config.settings.instance.clone(),
+            cfg_version: config.settings.cfg.v,
+            synced,
+        }),
+        Err(e) => {
+            connection.shutdown().await;
+            Err(e)
+        }
+    }
 }
 
 /// Creates every subscription and monitored item for `config`.
@@ -256,23 +315,19 @@ async fn sync(
     shared: &Arc<Shared>,
     connection: &Connection,
     config: &AppliedConfig,
-    now: &NowFn,
-    previous: &[TagSpec],
-) -> anyhow::Result<Vec<TagSpec>> {
+    clock: &Clock,
+) -> anyhow::Result<Synced> {
     set_state(shared, DriverState::Syncing);
-
-    // Samples buffered under the previous configuration would be published
-    // with the new `cfg.v` and silently mis-attributed.
-    if !previous.is_empty() {
-        shared.with_queue(|q| q.clear());
-    }
 
     let instance = &config.settings.instance;
     let namespaces = match connection.namespace_array().await {
         Ok(ns) => ns,
         Err(e) => {
             // Not fatal: without the array we simply use the literal index.
-            log::warn!("could not read NamespaceArray ({e:#}); using ns={}", instance.ns);
+            log::warn!(
+                "could not read NamespaceArray ({e:#}); using ns={}",
+                instance.ns
+            );
             Vec::new()
         }
     };
@@ -298,19 +353,48 @@ async fn sync(
         .flat_map(|p| p.chunks.iter().flatten())
         .map(|i| (i.client_handle, i.tag.address.clone()))
         .collect();
-    let sink = make_sink(Arc::clone(shared), handles);
+    let live = Arc::new(AtomicBool::new(true));
+    let sink = make_sink(
+        Arc::clone(shared),
+        handles,
+        config.settings.cfg.v,
+        Arc::clone(&live),
+    );
 
     let mut applied = 0usize;
     let mut failures: Vec<FailedTag> = Vec::new();
+    let mut subscriptions = Vec::with_capacity(plans.len());
 
     for subscription in &plans {
         let subscription_id = connection
-            .create_subscription(subscription.scan_rate_ms, Arc::clone(&sink), Arc::clone(now))
+            .create_subscription(
+                subscription.scan_rate_ms,
+                Arc::clone(&sink),
+                Arc::clone(clock),
+            )
             .await?;
+        subscriptions.push(subscription_id);
 
         for chunk in &subscription.chunks {
-            let outcomes = connection.create_items(subscription_id, chunk).await?;
-            for (item, outcome) in chunk.iter().zip(outcomes) {
+            // Addresses the server does not have are failed here, whatever the
+            // server's own policy on subscribing to them (see `missing_nodes`).
+            let missing = connection.missing_nodes(chunk).await;
+            let mut present = Vec::with_capacity(chunk.len());
+            for (item, missing) in chunk.iter().zip(missing) {
+                match missing {
+                    Some(status) => failures.push(FailedTag {
+                        a: item.tag.address.clone(),
+                        s: status,
+                    }),
+                    None => present.push(item.clone()),
+                }
+            }
+            if present.is_empty() {
+                continue;
+            }
+
+            let outcomes = connection.create_items(subscription_id, &present).await?;
+            for (item, outcome) in present.iter().zip(outcomes) {
                 if is_good(outcome.status) {
                     applied += 1;
                 } else {
@@ -346,7 +430,11 @@ async fn sync(
         r.set_sync_outcome(applied, failures);
     });
 
-    Ok(tags)
+    Ok(Synced {
+        tags: config.tags.clone(),
+        subscriptions,
+        live,
+    })
 }
 
 /// Re-renders NodeIds after `ns_uri` resolved to a different namespace index.

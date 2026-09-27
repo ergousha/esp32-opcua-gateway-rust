@@ -15,7 +15,6 @@ mod device_id;
 mod eth;
 mod jobs;
 mod mqtt_util;
-mod opcua;
 mod ota;
 mod provisioning;
 mod settings_store;
@@ -29,6 +28,12 @@ use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
 /// Stub socketpair symbol for ESP-IDF target (Unix Domain Sockets unavailable in ESP-IDF libc).
+///
+/// # Safety
+///
+/// Never dereferences `_sv` and touches no other state; it only reports
+/// failure, so any arguments are sound. `unsafe` only because it is an
+/// `extern "C"` symbol that C code calls with raw pointers.
 #[no_mangle]
 pub unsafe extern "C" fn socketpair(
     _domain: std::os::raw::c_int,
@@ -60,11 +65,10 @@ fn main() -> Result<()> {
     // ExtensionObject decode; deferred, that decode lands when the heap is
     // nearly gone and the allocation aborts the process instead of failing
     // softly. Paid here, it is paid out of ~230 kB rather than out of nothing.
-    opcua_types::generated::types::preload_types();
-    log::info!(
-        "OPC UA type table preloaded; free heap {}",
-        unsafe { esp_idf_svc::sys::esp_get_free_heap_size() }
-    );
+    gateway_opcua::preload_types();
+    log::info!("OPC UA type table preloaded; free heap {}", unsafe {
+        esp_idf_svc::sys::esp_get_free_heap_size()
+    });
 
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
