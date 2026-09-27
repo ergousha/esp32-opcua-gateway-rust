@@ -122,6 +122,71 @@ fn request_timeout(keepalive_ms: u32) -> Duration {
     (Duration::from_millis(keepalive_ms as u64) * 2).clamp(MIN_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT)
 }
 
+/// Builds the client and starts the session's event loop.
+///
+/// Out of line and synchronous on purpose: the by-value builder chain needs a
+/// large frame, which inlined into `connect` stayed live for the whole connect.
+#[inline(never)]
+fn open(
+    instance: &InstanceSettings,
+    session_name: &str,
+    request_timeout: Duration,
+) -> Result<(Arc<Session>, JoinHandle<StatusCode>)> {
+    let mut client = ClientBuilder::new()
+        .application_name("ESP32 OPC UA Gateway")
+        .application_uri("urn:esp32-opcua-gateway")
+        .product_uri("urn:esp32-opcua-gateway")
+        .session_name(session_name)
+        // No filesystem, no PKI, and no need for either at security None.
+        // The library still insists on a PKI directory; on a host it would
+        // otherwise create `./pki` in whatever directory the client runs
+        // from. On the device the create fails harmlessly, as before.
+        .create_sample_keypair(false)
+        .pki_dir(std::env::temp_dir().join("gateway-opcua-pki"))
+        .trust_server_certs(true)
+        .verify_server_certs(false)
+        // One attempt, no library-level retries: see the module docs.
+        .session_retry_limit(0)
+        .max_failed_keep_alive_count(MAX_FAILED_KEEPALIVES)
+        .session_timeout(instance.session_timeout_ms)
+        .keep_alive_interval(Duration::from_millis(instance.keepalive_ms as u64))
+        .request_timeout(request_timeout)
+        .publish_timeout(Duration::from_secs(30))
+        .max_message_size(MAX_MESSAGE_SIZE)
+        .max_chunk_size(MAX_CHUNK_SIZE)
+        .max_incoming_chunk_size(MAX_CHUNK_SIZE)
+        .max_chunk_count(MAX_CHUNK_COUNT)
+        .max_array_length(MAX_ARRAY_LENGTH)
+        .max_string_length(MAX_STRING_LENGTH)
+        .max_byte_string_length(MAX_STRING_LENGTH)
+        .recreate_monitored_items_chunk(gateway_core::plan::MAX_ITEMS_PER_REQUEST)
+        .client()
+        .map_err(|errors| anyhow!("invalid OPC UA client configuration: {errors:?}"))?;
+
+    // The endpoint has to carry the Anonymous policy explicitly.
+    // `EndpointDescription::from(&str)` leaves `user_identity_tokens`
+    // empty, and because we deliberately skip discovery there is nothing
+    // else to fill it in. ActivateSession then looks for the policy
+    // matching the `IdentityToken::Anonymous` below, finds an empty list,
+    // and fails with `BadSecurityPolicyRejected` — after CreateSession has
+    // already succeeded, so the server looks reachable and the session
+    // still never comes up.
+    let endpoint = EndpointDescription::from((
+        instance.endpoint.as_str(),
+        SECURITY_POLICY_NONE_URI,
+        MessageSecurityMode::None,
+        UserTokenPolicy::anonymous(),
+    ));
+    let (session, event_loop) = client
+        .connect_to_endpoint_directly(endpoint, IdentityToken::Anonymous)
+        .with_context(|| format!("connecting to {}", instance.endpoint))?;
+
+    // Boxed before spawning: the loop's future sits just under tokio's own
+    // boxing threshold, so `event_loop.spawn()` moves it by value through
+    // several stack frames (~65 KiB on the host) and overflowed the device.
+    Ok((session, tokio::task::spawn(Box::pin(event_loop.run()))))
+}
+
 impl Connection {
     /// Opens a session against `instance`.
     ///
@@ -140,56 +205,7 @@ impl Connection {
         );
 
         let request_timeout = request_timeout(instance.keepalive_ms);
-        let mut client = ClientBuilder::new()
-            .application_name("ESP32 OPC UA Gateway")
-            .application_uri("urn:esp32-opcua-gateway")
-            .product_uri("urn:esp32-opcua-gateway")
-            .session_name(session_name)
-            // No filesystem, no PKI, and no need for either at security None.
-            // The library still insists on a PKI directory; on a host it would
-            // otherwise create `./pki` in whatever directory the client runs
-            // from. On the device the create fails harmlessly, as before.
-            .create_sample_keypair(false)
-            .pki_dir(std::env::temp_dir().join("gateway-opcua-pki"))
-            .trust_server_certs(true)
-            .verify_server_certs(false)
-            // One attempt, no library-level retries: see the module docs.
-            .session_retry_limit(0)
-            .max_failed_keep_alive_count(MAX_FAILED_KEEPALIVES)
-            .session_timeout(instance.session_timeout_ms)
-            .keep_alive_interval(Duration::from_millis(instance.keepalive_ms as u64))
-            .request_timeout(request_timeout)
-            .publish_timeout(Duration::from_secs(30))
-            .max_message_size(MAX_MESSAGE_SIZE)
-            .max_chunk_size(MAX_CHUNK_SIZE)
-            .max_incoming_chunk_size(MAX_CHUNK_SIZE)
-            .max_chunk_count(MAX_CHUNK_COUNT)
-            .max_array_length(MAX_ARRAY_LENGTH)
-            .max_string_length(MAX_STRING_LENGTH)
-            .max_byte_string_length(MAX_STRING_LENGTH)
-            .recreate_monitored_items_chunk(gateway_core::plan::MAX_ITEMS_PER_REQUEST)
-            .client()
-            .map_err(|errors| anyhow!("invalid OPC UA client configuration: {errors:?}"))?;
-
-        // The endpoint has to carry the Anonymous policy explicitly.
-        // `EndpointDescription::from(&str)` leaves `user_identity_tokens`
-        // empty, and because we deliberately skip discovery there is nothing
-        // else to fill it in. ActivateSession then looks for the policy
-        // matching the `IdentityToken::Anonymous` below, finds an empty list,
-        // and fails with `BadSecurityPolicyRejected` — after CreateSession has
-        // already succeeded, so the server looks reachable and the session
-        // still never comes up.
-        let endpoint = EndpointDescription::from((
-            instance.endpoint.as_str(),
-            SECURITY_POLICY_NONE_URI,
-            MessageSecurityMode::None,
-            UserTokenPolicy::anonymous(),
-        ));
-        let (session, event_loop) = client
-            .connect_to_endpoint_directly(endpoint, IdentityToken::Anonymous)
-            .with_context(|| format!("connecting to {}", instance.endpoint))?;
-
-        let mut event_loop = event_loop.spawn();
+        let (session, mut event_loop) = open(instance, session_name, request_timeout)?;
 
         // `wait_for_connection` never returns if the event loop gives up, so
         // it has to be raced against the loop itself — and against a clock,
