@@ -48,6 +48,7 @@ pub fn start<'d>(
 
     wifi.start().context("wifi start")?;
     log::info!("Connecting to WiFi: SSID={ssid}");
+    // No retry in place: on hardware a failed attempt left ~11 kB less heap; the caller restarts.
     wifi.connect().context("wifi connect (SSID/password?)")?;
     wifi.wait_netif_up().context("wifi netif did not come up")?;
 

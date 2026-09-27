@@ -13,9 +13,12 @@
 mod config;
 mod device_id;
 mod eth;
+mod jobs;
 mod mqtt_util;
 mod ota;
 mod provisioning;
+mod settings_store;
+mod shadow;
 mod telemetry;
 mod wifi;
 
@@ -23,6 +26,23 @@ use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+
+/// Stub socketpair symbol for ESP-IDF target (Unix Domain Sockets unavailable in ESP-IDF libc).
+///
+/// # Safety
+///
+/// Never dereferences `_sv` and touches no other state; it only reports
+/// failure, so any arguments are sound. `unsafe` only because it is an
+/// `extern "C"` symbol that C code calls with raw pointers.
+#[no_mangle]
+pub unsafe extern "C" fn socketpair(
+    _domain: std::os::raw::c_int,
+    _type: std::os::raw::c_int,
+    _protocol: std::os::raw::c_int,
+    _sv: *mut std::os::raw::c_int,
+) -> std::os::raw::c_int {
+    -1
+}
 
 /// Keeps the active network interface alive throughout main.
 /// Even if fallback to WiFi occurs, the Ethernet handle is kept: if dropped, SpiDriver::drop
@@ -39,6 +59,16 @@ enum Net<'d> {
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+
+    // Claim the OPC UA type table before TLS and the OPC UA session take their
+    // share of the heap. It is ~9 kB in one block, built lazily on the first
+    // ExtensionObject decode; deferred, that decode lands when the heap is
+    // nearly gone and the allocation aborts the process instead of failing
+    // softly. Paid here, it is paid out of ~230 kB rather than out of nothing.
+    gateway_opcua::preload_types();
+    log::info!("OPC UA type table preloaded; free heap {}", unsafe {
+        esp_idf_svc::sys::esp_get_free_heap_size()
+    });
 
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
@@ -70,10 +100,10 @@ fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                log::error!("WiFi start failed: {:?}", e);
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                }
+                // A restart retries Ethernet too; an OTA image not yet marked valid is rolled back.
+                log::error!("WiFi start failed: {:?}; restarting in 10 s", e);
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                esp_idf_svc::hal::reset::restart();
             }
         }
     };

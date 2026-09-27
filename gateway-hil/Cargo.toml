@@ -1,0 +1,31 @@
+[package]
+name = "gateway-hil"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Hardware-in-the-loop scenario for the gateway: a real ESP32-S3 against the Rust OPC UA test server and a real AWS IoT account."
+
+# Host-only. Everything the OPC UA client does can be tested without a device
+# (`cargo test -p gateway-opcua`); this runner covers what only the device can
+# show — heap, the ESP-IDF runtime, NVS, and the MQTT/AWS planes.
+#
+#     cargo run -p gateway-hil --target host-tuple -- --help
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+regex = "1"
+serde_json = "1"
+toml = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# Default features pull in the SDK's legacy HTTPS client (hyper 0.14 +
+# rustls 0.21, and with them h2 0.3 and rustls-webpki 0.101, both with open
+# advisories). `default-https-client` is the current hyper 1 + rustls 0.23 one.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "sso"] }
+aws-sdk-iotdataplane = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+gateway-core = { path = "../gateway-core" }
+gateway-opcua = { path = "../gateway-opcua" }
+opcua-test-server = { path = "../opcua-test-server" }

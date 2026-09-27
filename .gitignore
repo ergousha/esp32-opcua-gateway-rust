@@ -23,6 +23,6 @@ crash.log
 # --- WiFi kimlik bilgileri (toml-cfg; derlemeye gomulur) ---
 /cfg.toml
 
-# --- Python ---
-__pycache__/
-*.pyc
+# --- Test harness ---
+# Serial logs and JSON summaries from `cargo run -p gateway-hil`.
+/gateway-hil/artifacts/

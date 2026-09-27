@@ -1,0 +1,29 @@
+[package]
+name = "gateway-opcua"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "The gateway's OPC UA client: session, subscription sync and the reconnect state machine. Platform-neutral: the same code runs on the ESP32-S3 and on the development host."
+
+# No `esp-idf-*` dependency, on purpose. Everything the device has to provide
+# (a wall clock, a backoff seed, the eventfd VFS registration) is injected by
+# the firmware, so this crate builds and runs on the host:
+#
+#     cargo test -p gateway-opcua --target host-tuple
+#
+# which drives the real client against a real `async-opcua` server over
+# loopback — see `tests/` and the `opcua-test-server` crate.
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
+async-opcua-client = { version = "0.19.0", default-features = false }
+async-opcua-types = { version = "0.19.0", default-features = false }
+gateway-core = { path = "../gateway-core" }
+
+[dev-dependencies]
+opcua-test-server = { path = "../opcua-test-server" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }

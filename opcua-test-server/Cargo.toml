@@ -1,0 +1,23 @@
+[package]
+name = "opcua-test-server"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "OPC UA test server for the gateway, built on async-opcua-server: the server half of the library the gateway's client uses."
+
+# Host-only. It is a test fixture and never ships in the firmware image:
+#
+#     cargo run -p opcua-test-server --target host-tuple -- --help
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-std", "io-util"] }
+async-opcua-server = "0.19.0"
+async-opcua-nodes = "0.19.0"
+async-opcua-types = { version = "0.19.0", default-features = false }

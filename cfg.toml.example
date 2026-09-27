@@ -9,3 +9,7 @@ wifi_ssid = "your-ssid"
 wifi_psk = "your-password"
 iot_endpoint = "your-iot-endpoint"
 provisioning_template = "your-provisioning-template"
+
+# The OPC UA session (endpoint, namespace, tag list, batching) is NOT compiled
+# in: it is delivered at runtime through the `opcua` device shadow. See
+# docs/OPCUA_CLIENT_REQUIREMENTS.md.

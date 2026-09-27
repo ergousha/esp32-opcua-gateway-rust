@@ -5,6 +5,12 @@
 
 /// WiFi credentials — read from [esp32-opcua-gateway] table inside `cfg.toml`
 /// at compile time via toml-cfg. Access: `config::CONFIG.wifi_ssid`.
+/// Compile-time configuration.
+///
+/// Only bootstrap values live here. Everything about the OPC UA session —
+/// endpoint, namespace, tag list, batching — is delivered at runtime through
+/// the `opcua` device shadow, so that a tag change does not need a firmware
+/// build. See `docs/OPCUA_CLIENT_REQUIREMENTS.md`.
 #[toml_cfg::toml_config]
 pub struct Config {
     #[default("")]

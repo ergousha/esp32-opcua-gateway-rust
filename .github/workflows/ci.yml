@@ -1,7 +1,13 @@
 name: ESP32 Build
 
-# This is a single `std`, ESP-IDF-based crate. Firmware checks share one runner
-# so the ESP toolchain, SDK build, swap, and Cargo cache are initialized once.
+# Two jobs:
+#
+# * Firmware CI — the ESP-IDF crate, for xtensa. Its checks share one runner so
+#   the ESP toolchain, SDK build, swap, and Cargo cache are initialized once.
+# * Host tests — every other workspace member, on stable Rust for the runner's
+#   own target. This is where the OPC UA client is tested end to end: the
+#   gateway-opcua suite runs the real client against a real OPC UA server
+#   (opcua-test-server) over loopback, no device involved.
 
 on:
   pull_request:
@@ -36,9 +42,11 @@ jobs:
             "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" \
             --jq '.[].filename')"
 
+          # The firmware links gateway-core and gateway-opcua, so changes
+          # there rebuild it too.
           while IFS= read -r path; do
             case "$path" in
-              src/*|Cargo.toml|Cargo.lock|build.rs|.cargo/*|rust-toolchain.toml|sdkconfig.defaults|partitions.csv|certs/AmazonRootCA1.pem)
+              src/*|gateway-core/*|gateway-opcua/*|crates/*|Cargo.toml|Cargo.lock|build.rs|.cargo/*|rust-toolchain.toml|sdkconfig.defaults|partitions.csv|certs/AmazonRootCA1.pem)
                 echo "firmware=true" >> "$GITHUB_OUTPUT"
                 exit 0
                 ;;
@@ -93,3 +101,67 @@ jobs:
       - name: Build for ESP32-S3
         if: steps.filter.outputs.firmware == 'true'
         run: cargo build --release
+
+  host_tests:
+    name: Host tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      # rust-toolchain.toml pins Espressif's fork for the firmware; the host
+      # crates build on upstream stable.
+      RUSTUP_TOOLCHAIN: stable
+      HOST_CRATES: -p gateway-core -p gateway-opcua -p opcua-test-server -p gateway-hil -p seed-device
+    steps:
+      - name: Check changed paths
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          changed_files="$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" \
+            --jq '.[].filename')"
+
+          while IFS= read -r path; do
+            case "$path" in
+              gateway-core/*|gateway-opcua/*|opcua-test-server/*|gateway-hil/*|seed-device/*|crates/*|Cargo.toml|Cargo.lock|.cargo/*|.github/workflows/ci.yml)
+                echo "host=true" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+          done <<< "$changed_files"
+
+          echo "host=false" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: steps.filter.outputs.host == 'true'
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        if: steps.filter.outputs.host == 'true'
+        with:
+          components: clippy
+
+      - name: Cache Rust build
+        if: steps.filter.outputs.host == 'true' && !env.ACT
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: host
+
+      # `--target host-tuple` overrides the xtensa default in .cargo/config.toml.
+      - name: Run clippy
+        if: steps.filter.outputs.host == 'true'
+        run: cargo clippy $HOST_CRATES --all-targets --target host-tuple -- -D warnings
+
+      - name: Run tests
+        if: steps.filter.outputs.host == 'true'
+        run: cargo test $HOST_CRATES --target host-tuple
+
+      - name: Check documentation
+        if: steps.filter.outputs.host == 'true'
+        run: cargo doc $HOST_CRATES --no-deps --target host-tuple
+        env:
+          RUSTDOCFLAGS: -D warnings
