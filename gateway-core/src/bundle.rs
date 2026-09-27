@@ -361,8 +361,18 @@ mod tests {
         let b = TagBundle {
             v: 1,
             g: vec![
-                TagGroup { r: 1000, d: None, i: None, a: vec!["a".into()] },
-                TagGroup { r: 250, d: None, i: None, a: vec!["a".into()] },
+                TagGroup {
+                    r: 1000,
+                    d: None,
+                    i: None,
+                    a: vec!["a".into()],
+                },
+                TagGroup {
+                    r: 250,
+                    d: None,
+                    i: None,
+                    a: vec!["a".into()],
+                },
             ],
         };
         assert_eq!(
@@ -376,7 +386,12 @@ mod tests {
         for r in [0, MIN_SCAN_RATE_MS - 1, MAX_SCAN_RATE_MS + 1] {
             let b = TagBundle {
                 v: 1,
-                g: vec![TagGroup { r, d: None, i: None, a: vec!["a".into()] }],
+                g: vec![TagGroup {
+                    r,
+                    d: None,
+                    i: None,
+                    a: vec!["a".into()],
+                }],
             };
             assert_eq!(expand(&b, 2, IdType::S), Err(BundleError::BadScanRate(r)));
         }
@@ -412,7 +427,12 @@ mod tests {
     fn bad_address_names_the_offender() {
         let b = TagBundle {
             v: 1,
-            g: vec![TagGroup { r: 1000, d: None, i: Some(IdType::I), a: vec!["nope".into()] }],
+            g: vec![TagGroup {
+                r: 1000,
+                d: None,
+                i: Some(IdType::I),
+                a: vec!["nope".into()],
+            }],
         };
         assert!(matches!(
             expand(&b, 2, IdType::S),
@@ -430,7 +450,9 @@ mod tests {
                 r: 1000,
                 d: None,
                 i: None,
-                a: (1..=MAX_TAGS).map(|i| format!("Chan1.Dev1.Tag{i:04}")).collect(),
+                a: (1..=MAX_TAGS)
+                    .map(|i| format!("Chan1.Dev1.Tag{i:04}"))
+                    .collect(),
             }],
         };
         let raw = serde_json::to_vec(&bundle).unwrap();

@@ -361,7 +361,8 @@ mod tests {
     #[test]
     fn golden_document_round_trips() {
         let s = golden();
-        let back: DesiredSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        let back: DesiredSettings =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(s, back);
     }
 
@@ -399,7 +400,10 @@ mod tests {
         s.instance.sec_mode = "SignAndEncrypt".into();
         assert!(matches!(
             s.validate(),
-            Err(SettingsError::SecurityUnsupported { field: "sec_mode", .. })
+            Err(SettingsError::SecurityUnsupported {
+                field: "sec_mode",
+                ..
+            })
         ));
     }
 
@@ -416,7 +420,10 @@ mod tests {
         s.instance.publish_ms = 10;
         assert!(matches!(
             s.validate(),
-            Err(SettingsError::OutOfRange { field: "publish_ms", .. })
+            Err(SettingsError::OutOfRange {
+                field: "publish_ms",
+                ..
+            })
         ));
         s.instance.publish_ms = 50;
         s.validate().unwrap();
@@ -441,7 +448,10 @@ mod tests {
         s.telemetry.batch_max_bytes = MAX_BATCH_BYTES + 1;
         assert!(matches!(
             s.validate(),
-            Err(SettingsError::OutOfRange { field: "batch_max_bytes", .. })
+            Err(SettingsError::OutOfRange {
+                field: "batch_max_bytes",
+                ..
+            })
         ));
     }
 
@@ -450,7 +460,10 @@ mod tests {
         for bad in ["", "dt/+/opcua", "dt/gw/#", "$aws/rules/x"] {
             let mut s = golden();
             s.telemetry.topic = bad.into();
-            assert!(matches!(s.validate(), Err(SettingsError::BadTopic(_))), "{bad}");
+            assert!(
+                matches!(s.validate(), Err(SettingsError::BadTopic(_))),
+                "{bad}"
+            );
         }
     }
 

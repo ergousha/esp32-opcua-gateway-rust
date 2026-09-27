@@ -96,9 +96,15 @@ mod tests {
 
     #[test]
     fn new_tags_are_added_in_bundle_order() {
-        let plan = diff(&[tag("x", 1000)], &[tag("x", 1000), tag("a", 250), tag("b", 250)]);
+        let plan = diff(
+            &[tag("x", 1000)],
+            &[tag("x", 1000), tag("a", 250), tag("b", 250)],
+        );
         assert_eq!(
-            plan.add.iter().map(|t| t.address.as_str()).collect::<Vec<_>>(),
+            plan.add
+                .iter()
+                .map(|t| t.address.as_str())
+                .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
         assert!(plan.remove.is_empty());

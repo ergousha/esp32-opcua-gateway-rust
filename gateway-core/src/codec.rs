@@ -33,7 +33,7 @@ pub fn base64_encode(input: &[u8]) -> String {
 
 /// True when `s` is syntactically valid standard base64 (alphabet + padding).
 pub fn is_base64(s: &str) -> bool {
-    if s.is_empty() || s.len() % 4 != 0 {
+    if s.is_empty() || !s.len().is_multiple_of(4) {
         return false;
     }
     let bytes = s.as_bytes();
@@ -67,7 +67,10 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 /// Constant-shape, case-insensitive comparison of two hex digests.
 pub fn hex_eq_ignore_case(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).all(|(x, y)| x.eq_ignore_ascii_case(&y))
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .all(|(x, y)| x.eq_ignore_ascii_case(&y))
 }
 
 #[cfg(test)]

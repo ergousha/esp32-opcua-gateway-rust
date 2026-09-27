@@ -61,7 +61,9 @@ impl fmt::Display for NodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NodeError::Empty => write!(f, "empty node address"),
-            NodeError::TooLong(n) => write!(f, "node address too long ({n} > {MAX_IDENTIFIER_LEN})"),
+            NodeError::TooLong(n) => {
+                write!(f, "node address too long ({n} > {MAX_IDENTIFIER_LEN})")
+            }
             NodeError::BadNumeric(a) => write!(f, "not a numeric node identifier: {a}"),
             NodeError::BadGuid(a) => write!(f, "not a GUID node identifier: {a}"),
             NodeError::BadOpaque(a) => write!(f, "not a base64 node identifier: {a}"),
@@ -160,7 +162,10 @@ mod tests {
             node_id_string(3, IdType::G, "72962B91-FA75-4AE6-8D28-B404DC7DAF63").unwrap(),
             "ns=3;g=72962B91-FA75-4AE6-8D28-B404DC7DAF63"
         );
-        assert_eq!(node_id_string(4, IdType::B, "Zm9vYmFy").unwrap(), "ns=4;b=Zm9vYmFy");
+        assert_eq!(
+            node_id_string(4, IdType::B, "Zm9vYmFy").unwrap(),
+            "ns=4;b=Zm9vYmFy"
+        );
     }
 
     #[test]
@@ -176,7 +181,9 @@ mod tests {
         );
         assert_eq!(
             node_id_string(2, IdType::G, "72962B91-FA75-4AE6-8D28-B404DC7DAF6"),
-            Err(NodeError::BadGuid("72962B91-FA75-4AE6-8D28-B404DC7DAF6".into()))
+            Err(NodeError::BadGuid(
+                "72962B91-FA75-4AE6-8D28-B404DC7DAF6".into()
+            ))
         );
         assert_eq!(
             node_id_string(2, IdType::B, "not base64!"),
@@ -200,7 +207,10 @@ mod tests {
             "urn:server:local".to_string(),
             "urn:example:server".to_string(),
         ];
-        assert_eq!(resolve_namespace(Some("urn:example:server"), &arr, 9), (2, true));
+        assert_eq!(
+            resolve_namespace(Some("urn:example:server"), &arr, 9),
+            (2, true)
+        );
     }
 
     #[test]

@@ -282,8 +282,7 @@ mod tests {
 
     #[test]
     fn deltas_touching_our_fields_are_relevant() {
-        let (v, relevant) =
-            is_relevant_delta(br#"{"version":9,"state":{"cfg":{"v":8}}}"#).unwrap();
+        let (v, relevant) = is_relevant_delta(br#"{"version":9,"state":{"cfg":{"v":8}}}"#).unwrap();
         assert_eq!(v, 9);
         assert!(relevant);
     }

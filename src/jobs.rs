@@ -65,10 +65,7 @@ impl JobsClient {
     }
 
     fn run_update(&self, job: &FirmwareJob, client: &mut impl MqttTransport) {
-        let update_topic = format!(
-            "$aws/things/{}/jobs/{}/update",
-            self.thing_name, job.job_id
-        );
+        let update_topic = format!("$aws/things/{}/jobs/{}/update", self.thing_name, job.job_id);
         log::info!("starting OTA job {}", job.job_id);
         let _ = client.publish(&update_topic, QOS1, false, br#"{"status":"IN_PROGRESS"}"#);
 

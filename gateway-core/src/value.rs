@@ -209,7 +209,9 @@ mod tests {
             r#"{"$t":"b64","v":"Zm9vYmFy"}"#
         );
         assert_eq!(
-            json(&TagValue::Guid("72962b91-fa75-4ae6-8d28-b404dc7daf63".into())),
+            json(&TagValue::Guid(
+                "72962b91-fa75-4ae6-8d28-b404dc7daf63".into()
+            )),
             r#"{"$t":"guid","v":"72962b91-fa75-4ae6-8d28-b404dc7daf63"}"#
         );
         assert_eq!(
@@ -221,11 +223,16 @@ mod tests {
     #[test]
     fn arrays_encode_as_json_arrays_and_are_truncated() {
         assert_eq!(
-            json(&TagValue::array(vec![TagValue::F64(1.0), TagValue::Bool(false)])),
+            json(&TagValue::array(vec![
+                TagValue::F64(1.0),
+                TagValue::Bool(false)
+            ])),
             "[1.0,false]"
         );
         let long = TagValue::array(vec![TagValue::F64(0.0); MAX_ARRAY_ELEMENTS + 10]);
-        let TagValue::Array(items) = long else { unreachable!() };
+        let TagValue::Array(items) = long else {
+            unreachable!()
+        };
         assert_eq!(items.len(), MAX_ARRAY_ELEMENTS);
     }
 

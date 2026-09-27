@@ -140,8 +140,14 @@ mod tests {
         let tags: Vec<_> = (0..MAX_TAGS).map(|i| tag(&format!("t{i}"), 1000)).collect();
         let plans = plan(&tags, MAX_ITEMS_PER_REQUEST);
         assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].chunks.len(), MAX_TAGS.div_ceil(MAX_ITEMS_PER_REQUEST));
-        assert!(plans[0].chunks.iter().all(|c| c.len() <= MAX_ITEMS_PER_REQUEST));
+        assert_eq!(
+            plans[0].chunks.len(),
+            MAX_TAGS.div_ceil(MAX_ITEMS_PER_REQUEST)
+        );
+        assert!(plans[0]
+            .chunks
+            .iter()
+            .all(|c| c.len() <= MAX_ITEMS_PER_REQUEST));
         assert_eq!(plans[0].item_count(), MAX_TAGS);
         assert_eq!(request_count(&plans), 5);
     }

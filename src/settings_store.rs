@@ -97,8 +97,8 @@ impl SettingsStore {
         let Some(raw_settings) = self.nvs.get_blob(KEY_SETTINGS, &mut settings_buf)? else {
             return Ok(None);
         };
-        let settings: DesiredSettings = serde_json::from_slice(raw_settings)
-            .context("cached settings are not valid JSON")?;
+        let settings: DesiredSettings =
+            serde_json::from_slice(raw_settings).context("cached settings are not valid JSON")?;
 
         let Some(bundle_len) = self.blob_len_within(KEY_BUNDLE, MAX_BUNDLE_BYTES)? else {
             return Ok(None);
