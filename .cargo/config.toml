@@ -19,5 +19,13 @@ ESP_IDF_TOOLS_INSTALL_DIR = "workspace"
 # resolves that path against PROJECT_DIR, which for esp-idf-sys is its OUT_DIR,
 # not this workspace). Without this the esp-idf build and espflash would use two
 # different partition tables. See esp-idf-sys build/config.rs: ESP_IDF_GLOB.
+#
+# The leading `/` anchors the pattern to the workspace root (gitignore syntax).
+# Unanchored, `partitions.csv` matches at ANY depth, and embuild walks the whole
+# tree following links — so every build also copied the partition tables of the
+# ESP-IDF examples under .embuild/ and, worse, the copies left in earlier
+# esp-idf-sys OUT_DIRs under target/, each nested one level deeper than the
+# last. Within two rebuilds the paths passed 1024 bytes and the build died with
+# "File name too long (os error 63)".
 ESP_IDF_GLOB_PARTITIONS_BASE = { value = ".", relative = true }
-ESP_IDF_GLOB_PARTITIONS_0 = "partitions.csv"
+ESP_IDF_GLOB_PARTITIONS_0 = "/partitions.csv"
