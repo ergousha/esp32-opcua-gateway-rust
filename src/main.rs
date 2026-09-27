@@ -100,10 +100,10 @@ fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                log::error!("WiFi start failed: {:?}", e);
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                }
+                // A restart retries Ethernet too; an OTA image not yet marked valid is rolled back.
+                log::error!("WiFi start failed: {:?}; restarting in 10 s", e);
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                esp_idf_svc::hal::reset::restart();
             }
         }
     };
