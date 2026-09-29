@@ -148,8 +148,9 @@ on-device scenario — not a green run at any cost.
    detail line.
 2. For each failure: the relevant serial-log excerpt with timestamps, your
    diagnosis, and whether it is firmware, harness, network or environment.
-3. The measured `free_heap`, the reconnect delays seen in `server_down`, and
-   the lowest `OPC UA stack headroom` value in the serial log.
+3. The measured `free_heap`, the reconnect delays seen in `server_down`, the
+   lowest `OPC UA stack headroom` value in the serial log, and the boot line
+   `OPC UA stack: … at …` (§9.10 of `docs/OPCUA_INTEGRATION_TEST.md`).
 4. Paths of the artifacts, and anything you had to install or change on this
    PC.
 
@@ -158,10 +159,10 @@ a loopback test that reproduces the problem (`gateway-opcua/tests/`) where the
 problem is in the OPC UA client. Building and flashing firmware needs the ESP
 toolchain; the Mac has it, and so does the WSL2 setup below.
 
-A stack problem in the OPC UA client reproduces over loopback. Make the
-driver stack in `gateway-opcua/tests/common/mod.rs` configurable, then run
-`cargo test --release -p gateway-opcua --target host-tuple --test scenario`
-at decreasing sizes. The host needs more stack than the device, so compare
+A stack problem in the OPC UA client reproduces over loopback. Run
+`OPCUA_TEST_STACK_BYTES=<bytes> cargo test --release -p gateway-opcua --target host-tuple --test scenario`
+at decreasing sizes; a run that overflows aborts with `thread 'opcua' has
+overflowed its stack`. The host needs more stack than the device, so compare
 sizes against each other, not against the device's 40 KiB.
 
 ## Running from WSL2

@@ -1,0 +1,22 @@
+# Opt-in debug image for chasing a stack overflow report
+# (docs/OPCUA_INTEGRATION_TEST.md §9.10). Nothing uses it by default; layer
+# it over the defaults, in a target dir of its own so switching back does not
+# rebuild ESP-IDF:
+#
+#   ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.stack-debug" \
+#   CARGO_TARGET_DIR=target/stack-debug cargo build --release
+
+# The canary check runs only at a context switch, by which time the frame that
+# overflowed is gone and the backtrace is corrupt. This puts a hardware
+# watchpoint on the running task's lowest 32 aligned stack bytes, at or just
+# above the canary, so a store there from that task's core panics at the
+# store, with its backtrace.
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
+
+# Canaries around every heap block, checked on free and by
+# heap_caps_check_integrity; "comprehensive" also fills allocated and freed
+# blocks. A stack is a heap block, and a neighbour overrunning into its low end
+# trips the stack canary just like an overflow does; this can catch the
+# neighbour instead. It costs 12 B per allocation and moves every block, so
+# the layout that crashed may not recur.
+CONFIG_HEAP_POISONING_COMPREHENSIVE=y

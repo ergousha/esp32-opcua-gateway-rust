@@ -488,6 +488,9 @@ cargo test -p gateway-core -p gateway-opcua -p opcua-test-server --target host-t
 
 # one test, with the driver's own log lines (the device's serial-console view)
 RUST_LOG=info cargo test -p gateway-opcua --target host-tuple -- --nocapture server_loss
+
+# the driver thread on a small stack; a run that overflows aborts (§9.10)
+OPCUA_TEST_STACK_BYTES=32768 cargo test --release -p gateway-opcua --target host-tuple --test scenario
 ```
 
 The client on a laptop — against the in-process test server by default, or any
@@ -1095,6 +1098,65 @@ ran (§8.20).
   association timeout at boot is **terminal** — the firmware logs
   `WiFi start failed` and stops, with no retry, until someone resets the board.
   Worth addressing independently of this harness.
+
+### 9.10 OPEN — the OPC UA thread's stack margin
+
+The OPC UA thread runs on a 40 KiB stack (`OPCUA_STACK_BYTES` in
+`src/telemetry/mod.rs`). The 2026-09-27 run's lowest headroom was **3,372 B**,
+on the first connect after boot. A **48 KiB** stack instead reported
+`A stack overflow in task opcua` on every first connect, which a bigger stack
+should never do, so do not raise the size until that is explained (issue #11).
+
+The firmware logs:
+
+- once at boot, `OPC UA stack: N B at <start>..<end> (40960 B requested);
+  internal heap A -> B B free, largest block C -> D B`: the stack the task
+  actually got, where it is, and what starting the thread cost;
+- `OPC UA stack headroom: N of 40960 B never used`, at each new low.
+
+Over loopback, `OPCUA_TEST_STACK_BYTES` (§7.1) bisects the stack the client
+needs. The host peak fell from 60,416 B to 35,424 B (release build, Apple
+silicon) once `gateway-opcua` stopped keeping two large futures on the stack:
+the driver's under `block_on`, and the event loop's stream inside
+`SessionEventLoop::run`. What remains is async-opcua's connect path. In the
+firmware image the same two changes take about 15.5 KB of frames out from
+under every poll of the event loop: 5,104 B at the thread's base, and `run`'s
+10,416 B poll frame. What that does to the device's headroom needs a hardware
+run. The device needs less stack than the host, so compare device readings
+with each other.
+
+A likely explanation of the 48 KiB crash, not yet confirmed on hardware: Rust
+frames on this target are not stack-probed, so a call whose frame is bigger
+than what is left moves the stack pointer past the stack's end without touching
+the bytes in between. Only what is actually written reaches the canary, and the
+headroom reading counts untouched bytes up from the bottom, so after an
+overflow it is meaningless. Before 214e53a, spawning the event loop reserved
+about 49 KB of frames on the device (static frame sizes along that path, most
+of it room for copies of the loop's future), more than either stack. At 40 KiB
+its stores below the end missed the canary and went into the heap block
+underneath; at 48 KiB one landed on it. If so, 48 KiB does not crash on
+current firmware.
+
+FreeRTOS notices an overflow only as a changed canary at the stack's low end,
+checked at a context switch. The stack is a heap block, so the block below it
+overrunning looks exactly the same. `sdkconfig.stack-debug` builds an image
+that tells the two apart, in a target dir of its own so the normal build stays
+cached:
+
+```sh
+. ~/export-esp.sh
+ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.stack-debug" \
+    CARGO_TARGET_DIR=target/stack-debug cargo build --release
+espflash flash --port <port> --partition-table partitions.csv --target-app-partition ota_0 \
+    target/stack-debug/xtensa-esp32s3-espidf/release/esp32-opcua-gateway
+```
+
+| Serial log | Meaning |
+| --- | --- |
+| `Stack canary watchpoint triggered (opcua)`, with a backtrace | Code running as `opcua` stored into the lowest 32 bytes it can watch, at or just above the canary. Deep in the connect path, it is a real overflow and the backtrace names the frame; ending in a copy into a heap buffer, a neighbouring block overran. |
+| `CORRUPT HEAP: Bad tail at <addr>`, usually on a later `free` | A heap block overran, by less than the poisoning margin between blocks. An address just below the boot line's stack start makes that the "overflow". |
+| `A stack overflow in task opcua` and neither of the above | The canary was written without a store into the watched bytes just above it: from below (the heap block underneath), from the other core, or by DMA. |
+| No crash | Poisoning moves every block, so the layout that crashed may not have recurred. Compare the boot lines. |
 
 ---
 
