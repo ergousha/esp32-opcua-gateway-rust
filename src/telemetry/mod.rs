@@ -26,6 +26,7 @@ use gateway_core::health::DriverState;
 use gateway_opcua::Client;
 
 use crate::device_id::{self, DeviceIdentity};
+use crate::job_store::JobStore;
 use crate::jobs::JobsClient;
 use crate::mqtt_util::{self, MqttEvent};
 use crate::settings_store::SettingsStore;
@@ -52,8 +53,9 @@ const OPCUA_TASK_NAME: &CStr = c"opcua";
 const TICK_MS: i64 = 50;
 
 /// Connects with the device identity and runs until something unrecoverable
-/// happens.
-pub fn run(id: &DeviceIdentity) -> Result<()> {
+/// happens. `job_store` holds the OTA job, if any, whose outcome the previous
+/// boot left for this one to report.
+pub fn run(id: &DeviceIdentity, job_store: JobStore) -> Result<()> {
     log::info!("starting gateway. thing={}", id.thing_name);
 
     let mut session = mqtt_util::connect(
@@ -72,13 +74,17 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
 
     // Only once we are on the network with a working identity is this image
     // worth keeping; before this point a rollback is the correct outcome.
-    if let Err(e) = ota::mark_valid() {
+    let valid = ota::mark_valid();
+    if let Err(e) = &valid {
         log::warn!("could not mark the firmware valid: {e:#}");
     }
+    // Read after marking valid, so a pending OTA job is settled with the
+    // verdict on this image already in.
+    let boot = ota::boot_facts(&valid);
 
     let opcua = start_opcua();
 
-    let jobs = JobsClient::new(&id.thing_name);
+    let mut jobs = JobsClient::new(&id.thing_name, job_store, boot);
     let mut config_plane = ConfigPlane::new(&id.thing_name, opcua.clone());
     let mut store = SettingsStore::new().context("opening the OPC UA settings store")?;
 
@@ -152,6 +158,7 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
 
         update_counters(&opcua, publisher.as_ref());
         config_plane.report(&mut session.client, now);
+        jobs.tick(&mut session.client);
         stack_probe.check();
     }
 }
