@@ -1837,6 +1837,7 @@ dependencies = [
  "async-opcua-client",
  "async-opcua-types",
  "env_logger",
+ "futures-core",
  "gateway-core",
  "log",
  "opcua-test-server",

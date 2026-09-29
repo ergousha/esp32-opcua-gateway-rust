@@ -39,6 +39,8 @@ pub mod session;
 pub mod variant;
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -301,7 +303,7 @@ pub fn spawn_thread(
                 }
             };
             let _ = ready_tx.send(Ok(()));
-            runtime.block_on(driver.run());
+            runtime.block_on(boxed_run(driver));
             log::warn!("OPC UA driver exited");
         })?;
 
@@ -310,6 +312,18 @@ pub fn spawn_thread(
         Ok(Err(e)) => Err(e),
         Err(_) => Err(std::io::Error::other("OPC UA thread exited during startup")),
     }
+}
+
+/// [`Driver::run`], on the heap.
+///
+/// The driver's future (~4 KB on the host) is under tokio's own boxing
+/// threshold, so `block_on` would move it by value through several frames that
+/// stay live under everything the thread ever does: 17 KiB of the host's
+/// 59 KiB peak. Out of line so the temporary it is built in before boxing is
+/// not left in the thread's bottom frame either.
+#[inline(never)]
+fn boxed_run(driver: Driver) -> Pin<Box<impl Future<Output = ()>>> {
+    Box::pin(driver.run())
 }
 
 /// Claims the OPC UA type table up front.
