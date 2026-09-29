@@ -149,8 +149,8 @@ types, a schema bug would agree with itself and pass.
 ### 2.4 Why the cloud side needs no device certificate
 
 Everything `gateway-hil` does with AWS goes through IAM-authorised HTTPS —
-`UpdateThingShadow`, `GetThingShadow`, `Publish` (with `retain`), and CloudWatch
-`FilterLogEvents`. There is no MQTT client and therefore no X.509 identity to
+`UpdateThingShadow`, `GetThingShadow`, `Publish` (with `retain`),
+`GetRetainedMessage`, and CloudWatch `FilterLogEvents`. There is no MQTT client and therefore no X.509 identity to
 provision for the test itself. Telemetry is observed through the IoT rule rather
 than by subscribing, which is what keeps this true.
 
@@ -209,6 +209,10 @@ The IoT data endpoint is read from `cfg.toml` (`iot_endpoint`, the same value th
 firmware is built with); pass `--iot-endpoint` to override. The device policy
 **must** grant the named-shadow topics — see §8.1; this was missing and is the
 single most likely thing to be missing again in a fresh account.
+
+Besides the shadow and publish permissions, the credentials need
+`iot:GetRetainedMessage`: a run reads the bundle the device is configured with,
+so that it can put it back afterwards (§7.4).
 
 ### 3.5 Network — the part that actually bites (HIL only)
 
@@ -405,6 +409,8 @@ telemetry payload).
 Ten phases, run in order because they share state — `reconfig` is only
 meaningful once `provision` has applied something. Individually selectable with
 `--phases` so a single failure can be re-run without repeating the whole thing.
+After the last one the runner puts the device's configuration back the way it
+found it (§7.4).
 
 #### Phase 1 — `preflight` (no device involved)
 
@@ -526,13 +532,15 @@ cargo run -p gateway-hil --target host-tuple -- \
 | --- | --- |
 | `--flash` | Flashes the existing release build with `partitions.csv` into `ota_0` first. |
 | `--phases a,b` | Run a subset. |
-| `--cleanup` | Clear the retained tag bundles the run published, so a later boot cannot pick up a stale config from a forgotten run. |
+| `--cleanup` | Clear the retained tag bundles the run published, so a later boot cannot pick up a stale config from a forgotten run. The bundle the restored configuration points at, and the pre-run one, are kept (§7.4). |
+| `--restore` | Put back the configuration a run that did not finish saved, then exit (§7.4). Needs only `--thing`. |
 | `--artifacts DIR` | Where the serial log and JSON summary land (default `gateway-hil/artifacts/`). |
 | `--iot-endpoint HOST` | IoT data endpoint, if not the one in `cfg.toml`. |
 | `--offline` | Run the phases that need no route from the device to this host (§7.3). Requires `--port`. |
 
 Exit code is 0 only if every check in every phase passed, 1 on a failed check,
-2 if the run itself could not proceed.
+2 if the run itself could not proceed. The restore counts as a phase: a restore
+that failed, or that the device did not confirm, fails the run.
 
 ### 7.3 Offline mode — when the device cannot reach this host
 
@@ -565,6 +573,78 @@ What it cannot show — the session, telemetry and its encoding, live
 reconfiguration, namespace resolution, and recovery once a server returns —
 needs a host the device can reach. [`HIL_ON_WINDOWS.md`](HIL_ON_WINDOWS.md) is
 a ready-made prompt for running the full scenario from a Windows PC.
+
+### 7.4 What a run leaves behind
+
+A run points the device at its own OPC UA server, which stops when the runner
+exits. Left like that, the device reports `connecting` or `error` from then on,
+and the copy in NVS keeps it dialling the dead host across reboots. So, online
+and offline alike, the runner saves the `opcua` shadow's `desired` and the
+retained bundle it points at before the first phase, and on the way out puts
+both back: after a failed check, an error or a panic in a phase, and Ctrl-C.
+A run that changed nothing (`--phases preflight`) restores nothing.
+
+- **Under a new version**, past everything the shadow and the run have seen.
+  The device ignores the version it is running (requirements §7), and the
+  online phases always count v1 to v8, so a pre-run v8 sent back as v8 would do
+  nothing. The bundle embeds its version, so it is re-published too, on
+  `cmd/<thing>/opcua/tags/v<N>` with a new digest; the tags are the same.
+- **As a merge patch.** AWS merges `desired` into what is there, so fields the
+  run added and the pre-run document lacks (`ns_uri`, say) are deleted
+  explicitly. `desired` ends up equal to the pre-run document apart from
+  `cfg.v`, `cfg.sha256` and `cfg.topic`.
+- **The original bundle too.** If the run overwrote or cleared the pre-run
+  bundle's own topic, its original bytes go back there.
+- **Confirmed by the device.** The runner waits up to 3 minutes for a report,
+  written after the restore, that shows the device on it: `cfg_v` at the new
+  version, or `connecting`/`error` naming the restored endpoint (the pre-run
+  server need not be reachable from the test LAN), or `idle` when it is
+  disabled.
+
+The result is the `restore` phase of the summary. The `restore :` line and the
+`restore` object of `summary-*.json` say what was put back, under which
+version, and what the shadow held before the run.
+
+The device is left **disabled** instead (`enabled: false`, endpoint
+`opc.tcp://unconfigured.invalid:4840`), and so ends `idle`, when the pre-run
+configuration cannot or must not go back:
+
+| Before the run | Why it is not restored |
+| --- | --- |
+| no `desired` | There is nothing to go back to. |
+| `desired` dials this run's own endpoint | It was left by an earlier run, and the server is stopping. |
+| the bundle it names is gone | Its tags are unknown. An earlier `--cleanup` could do this. |
+| it fails the firmware's own checks (`AppliedConfig::new`) | The device was refusing it, not running it. Re-issued under a fresh digest it would be accepted. |
+
+The run then prints the pre-run document in a warning. A pre-run config that
+uses the test namespace but some other host, as a run from another machine
+leaves it, is restored as found, with a note saying so.
+
+**Interrupted runs.** The first Ctrl-C (or, on Unix, SIGTERM) stops the phases
+and restores the device without waiting for it to confirm; a second one quits
+at once. The snapshot is written to `<artifacts>/restore-<thing>.json` before
+the first phase and removed once the restore has gone through. It stays behind
+when a run dies first — killed, or stopped by a second Ctrl-C — and when the
+restore fails, which also exits non-zero and prints what to do. The next run on
+that thing refuses to start until it is dealt with, because it would save the
+leftover as the pre-run configuration:
+
+```sh
+cargo run -p gateway-hil --target host-tuple -- --thing 28848553144F --restore
+```
+
+puts the saved configuration back and waits for the device. Deleting the file
+gives it up.
+
+**`--cleanup`** clears the bundles the run published except the one `desired`
+points at once the restore is done, and the pre-run one. It reads `desired`
+back from the shadow rather than assuming the restore worked, so after a
+failed restore it keeps the bundle the device runs on.
+
+**NVS.** A restored config is cached to NVS like any other. A disabled one is
+not, because the firmware caches only the configs it applies. After a reboot
+the device runs the last cached config until it has read the shadow, and goes
+`idle` then.
 
 ---
 
@@ -1122,6 +1202,8 @@ ran (§8.20).
 | `BadSecurityPolicyRejected: Cannot find user token type Anonymous` | Endpoint built without a token policy | §8.4 |
 | `memory allocation of N bytes failed`, device reboots | Heap exhaustion. Decode with `xtensa-esp32s3-elf-addr2line -e <elf> -f -C` | §8.5–8.8, §9.4 |
 | Device dials a server address nobody configured | Stale cached config; same `cfg.v` is a no-op | §9.9 — erase `0x13000`. |
+| After a run the device reports `connecting`/`error` naming the HIL host's test endpoint | A run that did not restore the device, or one from before the restore existed (§7.4) | `--restore` if the run left `restore-<thing>.json`; otherwise point the device at its real server through the shadow, or disable it. |
+| `gateway-hil` refuses to start: "… holds the configuration a run found … and never put back" | An earlier run died before it restored the device (§7.4) | Run the `--restore` command it prints, or delete the file. |
 | `WiFi start failed … ESP_ERR_TIMEOUT`, device then silent | Association timeout is terminal, no retry | §9.9. Reset and retry. |
 | Host run logs `Failed to read own certificate … Check paths, crypto won't work` | `async-opcua` looking for a certificate it does not need at security `None` | Harmless. |
 
