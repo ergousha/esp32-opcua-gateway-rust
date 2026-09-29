@@ -20,23 +20,35 @@
 //! The device dials this host, so `--server-host` must be a LAN address it can
 //! route to, and the host firewall must admit inbound TCP on `--server-port`
 //! (see `docs/OPCUA_INTEGRATION_TEST.md` §3.5).
+//!
+//! On the way out the run puts the device's configuration back the way it
+//! found it — after a failure, a panic in a phase, or Ctrl-C too; see
+//! [`restore`]. A run that dies before it can leaves that to `--restore`.
 
 mod cloud;
 mod device;
+mod interrupt;
 mod offline;
 mod phases;
 mod report;
+mod restore;
 
+use std::future::Future;
 use std::net::IpAddr;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::ExitCode;
+use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{anyhow, bail, Context, Result};
+use opcua_test_server::documents;
 
 use cloud::{now_ms, Cloud};
 use device::SerialMonitor;
 use phases::{Ctx, Server, PHASES};
 use report::{banner, info, PhaseResult};
+use restore::Snapshot;
 
 const USAGE: &str = "\
 usage: gateway-hil --thing NAME --server-host LAN-IP [options]
@@ -55,7 +67,15 @@ usage: gateway-hil --thing NAME --server-host LAN-IP [options]
   --region REGION       AWS region                                (default eu-central-1)
   --iot-endpoint HOST   IoT data endpoint                         (default: cfg.toml's iot_endpoint)
   --artifacts DIR       where logs and the summary go             (default gateway-hil/artifacts)
-  --cleanup             clear the retained tag bundles this run published";
+  --cleanup             clear the retained tag bundles this run published, except
+                        the ones the restored configuration points at
+  --restore             put back the configuration a run that did not finish
+                        saved in --artifacts, then exit; needs only --thing
+
+Every run puts the device's configuration back the way it found it on exit,
+Ctrl-C included.";
+
+const DEFAULT_REGION: &str = "eu-central-1";
 
 struct Args {
     thing: String,
@@ -71,6 +91,7 @@ struct Args {
     iot_endpoint: Option<String>,
     artifacts: PathBuf,
     cleanup: bool,
+    restore: bool,
 }
 
 fn repo_root() -> PathBuf {
@@ -78,6 +99,10 @@ fn repo_root() -> PathBuf {
         .parent()
         .expect("gateway-hil lives in the workspace")
         .to_path_buf()
+}
+
+fn default_artifacts() -> PathBuf {
+    repo_root().join("gateway-hil/artifacts")
 }
 
 fn parse_args() -> Result<Args> {
@@ -92,10 +117,11 @@ fn parse_args() -> Result<Args> {
         elf: repo.join("target/xtensa-esp32s3-espidf/release/esp32-opcua-gateway"),
         phases: Vec::new(),
         offline: false,
-        region: "eu-central-1".into(),
+        region: DEFAULT_REGION.into(),
         iot_endpoint: None,
-        artifacts: repo.join("gateway-hil/artifacts"),
+        artifacts: default_artifacts(),
         cleanup: false,
+        restore: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -114,6 +140,7 @@ fn parse_args() -> Result<Args> {
             "--iot-endpoint" => args.iot_endpoint = Some(value()?),
             "--artifacts" => args.artifacts = value()?.into(),
             "--cleanup" => args.cleanup = true,
+            "--restore" => args.restore = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -121,8 +148,11 @@ fn parse_args() -> Result<Args> {
             other => bail!("unknown argument {other:?}\n\n{USAGE}"),
         }
     }
-    if args.thing.is_empty() || args.server_host.is_empty() {
+    if args.thing.is_empty() || (args.server_host.is_empty() && !args.restore) {
         bail!("--thing and --server-host are required\n\n{USAGE}");
+    }
+    if args.restore {
+        return Ok(args);
     }
     if args
         .server_host
@@ -175,10 +205,78 @@ fn stamp() -> String {
     chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string()
 }
 
+fn when(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms).map_or_else(
+        || format!("{ms} ms"),
+        |t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+    )
+}
+
+fn iot_endpoint(args: &Args, repo: &Path) -> Result<String> {
+    match args.iot_endpoint.clone() {
+        Some(e) => Ok(e),
+        None => iot_endpoint_from_cfg(repo),
+    }
+}
+
+/// The command that finishes a restore, with the flags it needs from this
+/// one.
+fn restore_command(args: &Args) -> String {
+    let mut command = format!(
+        "cargo run -p gateway-hil --target host-tuple -- --thing {} --restore",
+        args.thing
+    );
+    if args.region != DEFAULT_REGION {
+        command += &format!(" --region {}", args.region);
+    }
+    if let Some(endpoint) = &args.iot_endpoint {
+        command += &format!(" --iot-endpoint {endpoint}");
+    }
+    if args.artifacts != default_artifacts() {
+        command += &format!(" --artifacts {}", args.artifacts.display());
+    }
+    command
+}
+
+/// Said last and loudly: the device is still pointed at a server that has
+/// stopped, and nothing else will tell anyone.
+fn print_unrestored(args: &Args, pending: &Path) {
+    banner("THE DEVICE WAS NOT RESTORED");
+    println!("  It is still configured for a gateway-hil test server that is no longer");
+    println!("  running. What it had before the run is saved in");
+    println!("  {}. Put it back with:\n", pending.display());
+    println!("      {}\n", restore_command(args));
+}
+
+fn catch_interrupts(what: &str) {
+    match interrupt::catch() {
+        Ok(()) => info(format!("Ctrl-C {what}; a second Ctrl-C quits at once")),
+        Err(e) => log::warn!(
+            "cannot catch Ctrl-C ({e}): an interrupted run leaves the device to --restore"
+        ),
+    }
+}
+
 async fn run() -> Result<bool> {
     let args = parse_args()?;
     let repo = repo_root();
     std::fs::create_dir_all(&args.artifacts)?;
+    let pending = restore::path(&args.artifacts, &args.thing);
+    if args.restore {
+        return restore_pending(&args, &repo, &pending).await;
+    }
+    // Starting over an unfinished restore would save the leftover as the
+    // pre-run configuration, and put the device back on that.
+    if let Some(snapshot) = Snapshot::load(&pending)? {
+        bail!(
+            "{} holds the configuration a run found on {} at {} and never put back.\n\
+             Restore it first:\n\n    {}\n\nor delete the file to give it up.",
+            pending.display(),
+            snapshot.thing,
+            when(snapshot.taken_ms),
+            restore_command(&args)
+        );
+    }
     let stamp = stamp();
     let serial_log = args.artifacts.join(format!("device-serial-{stamp}.log"));
 
@@ -188,11 +286,7 @@ async fn run() -> Result<bool> {
         device::flash(port, &args.elf, &repo).await?;
     }
 
-    let iot_endpoint = match args.iot_endpoint.clone() {
-        Some(e) => e,
-        None => iot_endpoint_from_cfg(&repo)?,
-    };
-    let mut cloud = Cloud::new(&args.thing, &args.region, &iot_endpoint).await?;
+    let mut cloud = Cloud::new(&args.thing, &args.region, &iot_endpoint(&args, &repo)?).await?;
     let t0_ms = now_ms();
     // Anchor shadow freshness to the start of the run, so a `reported` block
     // left over from an earlier boot can never satisfy an assertion.
@@ -213,10 +307,6 @@ async fn run() -> Result<bool> {
         .as_deref()
         .map(|p| SerialMonitor::new(p, serial_log.clone(), args.elf.clone(), repo.clone()));
 
-    let last_version = cloud
-        .last_cfg_version()
-        .await
-        .context("reading the opcua shadow")?;
     let mut ctx = Ctx {
         cloud,
         server,
@@ -225,7 +315,7 @@ async fn run() -> Result<bool> {
         applied_version: 0,
         t0_ms,
         published: Vec::new(),
-        last_version,
+        last_version: 0,
     };
 
     if let Some(monitor) = ctx.monitor.as_mut() {
@@ -234,23 +324,149 @@ async fn run() -> Result<bool> {
         monitor.start().await?;
     }
 
+    // As late as possible, and on disk before anything changes: from here on
+    // nothing may return early, because the device has to be put back.
+    banner("PRE-RUN CONFIGURATION");
+    let snapshot = restore::take(&ctx.cloud, &args.thing, &ctx.server.endpoint())
+        .await
+        .context("saving the configuration the run is about to change")?;
+    snapshot.save(&pending)?;
+    for line in snapshot.describe() {
+        info(line);
+    }
+    info(format!(
+        "kept in {} until it is restored",
+        pending.display()
+    ));
+    ctx.last_version = snapshot.last_version;
+    catch_interrupts("stops the run and restores the device");
+
+    let mut results = Vec::new();
+    let interrupted = tokio::select! {
+        () = run_phases(&mut ctx, &args.phases, &mut results) => false,
+        () = interrupt::wait() => true,
+    };
+    if interrupted {
+        // The phase in flight is the first one without a result.
+        let name = args
+            .phases
+            .get(results.len())
+            .map_or("interrupted", String::as_str);
+        banner(&format!("INTERRUPTED DURING {name}"));
+        results.push(failed(name, "phase ran to the end", "interrupted".into()));
+    }
+
+    ctx.server.stop().await;
+    let mut published: Vec<String> = ctx
+        .published
+        .iter()
+        .map(|v| documents::bundle_topic(&args.thing, *v))
+        .collect();
+    let changed = !published.is_empty();
+    let restored = restore::finish(
+        &mut ctx.cloud,
+        &snapshot,
+        ctx.last_version,
+        &mut published,
+        changed,
+    )
+    .await;
+    if restored.settled {
+        if let Err(e) = std::fs::remove_file(&pending) {
+            log::warn!("could not remove {}: {e}", pending.display());
+        }
+    }
+    if let Some(monitor) = ctx.monitor.as_mut() {
+        monitor.stop();
+    }
+    if args.cleanup {
+        // Retained messages outlive the test. Left behind, a later boot would
+        // pull a tag bundle from a run nobody remembers.
+        match restore::cleanup(&ctx.cloud, &snapshot, &published).await {
+            Ok((cleared, kept)) => info(format!(
+                "cleared {} retained tag bundles this run published; kept {kept:?}",
+                cleared.len()
+            )),
+            Err(e) => log::warn!("cleared no retained tag bundle: {e:#}"),
+        }
+    }
+    results.push(restored.result);
+
+    let (passed, total) = report::print_summary(&results);
+    println!("  restore    : {}", restored.line);
+    if ctx.monitor.is_some() {
+        println!("  serial log : {}", serial_log.display());
+    }
+    let mut summary = report::summary_json(&args.thing, &ctx.server.endpoint(), &results);
+    summary["restore"] = restored.json;
+    let summary_path = args.artifacts.join(format!("summary-{stamp}.json"));
+    std::fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
+    println!("  summary    : {}", summary_path.display());
+    if !restored.settled {
+        print_unrestored(&args, &pending);
+    }
+    Ok(passed == total)
+}
+
+/// `--restore`: puts back what a run that did not finish saved.
+async fn restore_pending(args: &Args, repo: &Path, pending: &Path) -> Result<bool> {
+    let snapshot = Snapshot::load(pending)?.ok_or_else(|| {
+        anyhow!(
+            "nothing to restore: there is no {} (a run removes it once it has put the \
+             device back)",
+            pending.display()
+        )
+    })?;
+    banner("PRE-RUN CONFIGURATION");
+    info(format!("saved by a run at {}", when(snapshot.taken_ms)));
+    for line in snapshot.describe() {
+        info(line);
+    }
+    if args.cleanup {
+        info("--cleanup does nothing here: the list of bundles the run published died with it");
+    }
+    let mut cloud = Cloud::new(&args.thing, &args.region, &iot_endpoint(args, repo)?).await?;
+    catch_interrupts("stops waiting for the device");
+
+    let restored = restore::finish(
+        &mut cloud,
+        &snapshot,
+        snapshot.last_version,
+        &mut Vec::new(),
+        true,
+    )
+    .await;
+    report::print_summary(std::slice::from_ref(&restored.result));
+    println!("  restore    : {}", restored.line);
+    if restored.settled {
+        std::fs::remove_file(pending).with_context(|| format!("removing {}", pending.display()))?;
+    } else {
+        print_unrestored(args, pending);
+    }
+    Ok(restored.result.ok())
+}
+
+/// Runs the phases in order. A phase's failure is its own — an error and a
+/// panic alike — so the run always gets as far as the restore.
+async fn run_phases(ctx: &mut Ctx, names: &[String], results: &mut Vec<PhaseResult>) {
     // Printed by the ESP-IDF panic handler, never by a USB reset.
     let crash = regex::Regex::new(
         r"Guru Meditation|\*\*\*ERROR\*\*\*.*|abort\(\) was called.*|Rebooting\.\.\.",
     )
     .expect("valid pattern");
-    let mut results = Vec::new();
-    for name in &args.phases {
+    for name in names {
         banner(&format!("PHASE: {name}"));
         let mark = ctx.mark();
-        let mut result = match phases::run(name, &mut ctx).await {
-            Ok(r) => r,
+        let mut result = match Unwound(Box::pin(phases::run(name, ctx))).await {
+            Ok(Ok(r)) => r,
             // A phase blowing up is a failure, not a crash of the run.
-            Err(e) => {
-                let mut r = PhaseResult::new(name);
-                r.check("phase completed without an error", false, format!("{e:#}"));
-                r
-            }
+            Ok(Err(e)) => failed(name, "phase completed without an error", format!("{e:#}")),
+            // Nor is a bug in one: the device still has to be put back.
+            Err(panic) => failed(
+                name,
+                "phase completed without panicking",
+                panic_message(&*panic),
+            ),
         };
         if let Some(log) = ctx.log_since(mark) {
             // A reboot can restore the expected state from NVS and hide itself.
@@ -263,32 +479,39 @@ async fn run() -> Result<bool> {
         }
         results.push(result);
     }
+}
 
-    ctx.server.stop().await;
-    if let Some(monitor) = ctx.monitor.as_mut() {
-        monitor.stop();
-    }
-    if args.cleanup {
-        // Retained messages outlive the test. Left behind, a later boot would
-        // pull a tag bundle from a run nobody remembers.
-        for version in ctx.published.iter().copied() {
-            let topic = opcua_test_server::documents::bundle_topic(&args.thing, version);
-            if let Err(e) = ctx.cloud.clear_retained(&topic).await {
-                log::warn!("could not clear {topic}: {e:#}");
-            }
+fn failed(name: &str, check: &str, detail: String) -> PhaseResult {
+    let mut r = PhaseResult::new(name);
+    r.check(check, false, detail);
+    r
+}
+
+/// A future whose panics come out as an `Err`, as `catch_unwind` does for a
+/// closure.
+struct Unwound<F>(Pin<Box<F>>);
+
+impl<F: Future> Future for Unwound<F> {
+    type Output = std::thread::Result<F::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let inner = self.0.as_mut();
+        // Safe enough to assert: a future that panicked is never polled
+        // again, and nothing in `Ctx` depends on a phase finishing.
+        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Err(panic) => Poll::Ready(Err(panic)),
         }
-        info("cleared the retained tag bundles this run published");
     }
+}
 
-    let (passed, total) = report::print_summary(&results);
-    if ctx.monitor.is_some() {
-        println!("  serial log : {}", serial_log.display());
-    }
-    let summary = report::summary_json(&args.thing, &ctx.server.endpoint(), &results);
-    let summary_path = args.artifacts.join(format!("summary-{stamp}.json"));
-    std::fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
-    println!("  summary    : {}", summary_path.display());
-    Ok(passed == total)
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic without a message".into())
 }
 
 #[tokio::main]
@@ -304,5 +527,24 @@ async fn main() -> ExitCode {
             eprintln!("error: {e:#}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn phase(fail: bool) -> u32 {
+        if fail {
+            panic!("boom");
+        }
+        7
+    }
+
+    #[tokio::test]
+    async fn a_panicking_phase_comes_out_as_an_error() {
+        assert_eq!(Unwound(Box::pin(phase(false))).await.unwrap(), 7);
+        let panic = Unwound(Box::pin(phase(true))).await.unwrap_err();
+        assert_eq!(panic_message(&*panic), "boom");
     }
 }
