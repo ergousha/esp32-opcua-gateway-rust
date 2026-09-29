@@ -29,3 +29,12 @@ aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = [
 gateway-core = { path = "../gateway-core" }
 gateway-opcua = { path = "../gateway-opcua" }
 opcua-test-server = { path = "../opcua-test-server" }
+
+# Ctrl-C restores the device before exiting (src/interrupt.rs). On Unix
+# through `sigaction` directly: tokio's signal support goes through the
+# workspace's `signal-hook-registry` stub and cannot register a handler.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+tokio = { version = "1", features = ["signal"] }
