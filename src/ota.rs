@@ -1,6 +1,10 @@
 use anyhow::Result;
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
 use esp_idf_svc::ota::EspOta;
+use esp_idf_svc::sys::{
+    esp_ota_get_running_partition, esp_ota_get_state_partition, esp_ota_img_states_t,
+    esp_ota_img_states_t_ESP_OTA_IMG_NEW, esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY, ESP_OK,
+};
 use log::{error, info};
 
 /// Performs an Over-The-Air (OTA) update from the given HTTP(S) URL.
@@ -64,4 +68,17 @@ pub fn mark_valid() -> Result<()> {
     ota.mark_running_slot_valid()?;
     info!("Firmware marked as valid (no rollback).");
     Ok(())
+}
+
+/// True while the running image is a fresh OTA image that has not marked
+/// itself valid, i.e. one the bootloader rolls back if the device resets now.
+pub fn running_unverified() -> bool {
+    let mut state: esp_ota_img_states_t = Default::default();
+    // Sound: the running partition is never null in a booted app, and
+    // `state` outlives the call. An image without an otadata record reports
+    // ESP_ERR_NOT_FOUND, and is not unverified either.
+    let err = unsafe { esp_ota_get_state_partition(esp_ota_get_running_partition(), &mut state) };
+    err == ESP_OK
+        && (state == esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY
+            || state == esp_ota_img_states_t_ESP_OTA_IMG_NEW)
 }
