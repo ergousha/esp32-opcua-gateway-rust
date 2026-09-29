@@ -32,7 +32,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use opcua_client::{ClientBuilder, DataChangeCallback, IdentityToken, Session};
+use futures_core::Stream;
+use opcua_client::transport::TcpConnector;
+use opcua_client::{ClientBuilder, DataChangeCallback, IdentityToken, Session, SessionEventLoop};
 use opcua_types::{
     constants::SECURITY_POLICY_NONE_URI, AttributeId, EndpointDescription, ExtensionObject,
     MessageSecurityMode, MonitoredItemCreateRequest, MonitoringMode, MonitoringParameters, NodeId,
@@ -181,10 +183,34 @@ fn open(
         .connect_to_endpoint_directly(endpoint, IdentityToken::Anonymous)
         .with_context(|| format!("connecting to {}", instance.endpoint))?;
 
-    // Boxed before spawning: the loop's future sits just under tokio's own
-    // boxing threshold, so `event_loop.spawn()` moves it by value through
-    // several stack frames (~65 KiB on the host) and overflowed the device.
-    Ok((session, tokio::task::spawn(Box::pin(event_loop.run()))))
+    Ok((session, spawn_event_loop(event_loop)))
+}
+
+/// Starts the session's event loop as a task.
+///
+/// Out of line for the same reason as `open`: the loop is built in a temporary
+/// before it is boxed, and inlined, that temporary (~8 KB on the host) sat in
+/// `open`'s frame under all of `connect_to_endpoint_directly`.
+///
+/// This is `SessionEventLoop::run` with the stream boxed. `run` builds the
+/// ~8 KB stream inside its own future, so its poll frame reserves room for it
+/// on every poll, including at the deepest point of a connect: 7.4 KiB of the
+/// host's 42 KiB peak, used once.
+#[inline(never)]
+fn spawn_event_loop(event_loop: SessionEventLoop<TcpConnector>) -> JoinHandle<StatusCode> {
+    // Boxed before spawning: tokio only boxes futures over 16 KiB itself, so
+    // `event_loop.spawn()` moved the loop by value through several stack
+    // frames (~65 KiB on the host) and overflowed the device.
+    let mut events = Box::pin(event_loop.enter());
+    tokio::task::spawn(async move {
+        loop {
+            match std::future::poll_fn(|cx| events.as_mut().poll_next(cx)).await {
+                None => break StatusCode::Good,
+                Some(Err(status)) => break status,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
 }
 
 impl Connection {
