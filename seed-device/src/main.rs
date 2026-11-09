@@ -1,14 +1,20 @@
 //! Adds or updates a device in the DynamoDB device registry.
 //!
-//! During Fleet Provisioning the device presents its MAC and the shared secret
-//! along with the claim certificate, and the pre-provisioning Lambda hook
-//! checks them against this table. Provisioning is REJECTED unless the device
-//! is registered here and `allowed`.
+//! During Fleet Provisioning the device presents its MAC along with the claim
+//! certificate, and the pre-provisioning Lambda hook checks it against this
+//! table. Provisioning is REJECTED unless the device is registered here,
+//! `allowed`, for the product whose template it uses, and proves itself: with
+//! the shared secret (the gateway), or, for a device with a secure element
+//! (Vaktus), with a certificate for the public key registered here.
 //!
 //! ```sh
 //! source aws-env.sh
+//! # gateway
 //! cargo run -p seed-device --target host-tuple -- \
 //!     --mac AA:BB:CC:DD:EE:FF --secret change-me-shared-secret
+//! # Vaktus: the MAC and key it logs and shows on first boot
+//! cargo run -p seed-device --target host-tuple -- \
+//!     --product vaktus --mac 38:18:2B:84:56:F4 --public-key <128 hex digits>
 //! ```
 //!
 //! The device logs its MAC on first boot (`Provisioning starting. MAC=…`).
@@ -27,7 +33,8 @@ const DEFAULT_TABLE: &str = "esp32-ztp-device-registry";
 const DEFAULT_REGION: &str = "eu-central-1";
 
 const USAGE: &str = "\
-usage: seed-device --mac MAC --secret SECRET [--table NAME] [--region REGION] [--allowed true|false]
+usage: seed-device --mac MAC (--secret SECRET | --public-key HEX) [--product ID]
+                   [--table NAME] [--region REGION] [--allowed true|false]
 
 Adds a device to the DynamoDB registry the fleet-provisioning hook checks.
 An existing entry for the same MAC is overwritten, which also resets
@@ -35,22 +42,34 @@ An existing entry for the same MAC is overwritten, which also resets
 
   --mac MAC         device MAC as logged on first boot, e.g. AA:BB:CC:DD:EE:FF
                     (case and `:`/`-` separators are normalised)
+  --product ID      platform product the device enrols as (default gateway)
   --secret SECRET   shared secret, the same value as the firmware's DEVICE_SECRET
+  --public-key HEX  the device's P-256 public key as its secure element reports
+                    it: X||Y (128 hex digits) or 04||X||Y (130); `:` and spaces
+                    are ignored. Required for products with a secure element
   --table NAME      DynamoDB table                  (default esp32-ztp-device-registry)
   --region REGION   AWS region                      (default eu-central-1)
   --allowed BOOL    whether provisioning is allowed (default true)";
 
+/// The product a record belongs to when none is given; the hook treats records
+/// without one the same way.
+const DEFAULT_PRODUCT: &str = "gateway";
+
 #[derive(Debug, PartialEq)]
 struct Args {
     mac: String,
-    secret: String,
+    product: String,
+    secret: Option<String>,
+    /// Uppercase hex of X||Y, 128 digits.
+    public_key: Option<String>,
     table: String,
     region: String,
     allowed: bool,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
-    let (mut mac, mut secret) = (None, None);
+    let (mut mac, mut secret, mut public_key) = (None, None, None);
+    let mut product = DEFAULT_PRODUCT.to_string();
     let mut table = DEFAULT_TABLE.to_string();
     let mut region = DEFAULT_REGION.to_string();
     let mut allowed = true;
@@ -61,6 +80,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
         match flag.as_str() {
             "--mac" => mac = Some(normalise_mac(&value()?)?),
             "--secret" => secret = Some(value()?),
+            "--public-key" => public_key = Some(normalise_public_key(&value()?)?),
+            "--product" => product = value()?,
             "--table" => table = value()?,
             "--region" => region = value()?,
             "--allowed" => {
@@ -79,13 +100,26 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
     }
 
     let mac = mac.ok_or_else(|| anyhow!("--mac is required"))?;
-    let secret = secret.ok_or_else(|| anyhow!("--secret is required"))?;
-    if secret.is_empty() {
+    if secret.as_deref() == Some("") {
         bail!("--secret must not be empty");
+    }
+    if secret.is_none() && public_key.is_none() {
+        bail!("--secret or --public-key is required");
+    }
+    let id_ok = product.len() >= 2
+        && product.len() <= 16
+        && product.starts_with(|c: char| c.is_ascii_lowercase())
+        && product
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    if !id_ok {
+        bail!("--product {product:?}: 2-16 lowercase letters and digits, starting with a letter");
     }
     Ok(Args {
         mac,
+        product,
         secret,
+        public_key,
         table,
         region,
         allowed,
@@ -107,6 +141,27 @@ fn normalise_mac(input: &str) -> Result<String> {
     Ok(octets.join(":"))
 }
 
+/// Normalises a P-256 public key to the uppercase hex of X||Y.
+///
+/// Accepts what an ATECC608 reports (64 bytes of X||Y) and the uncompressed
+/// SEC1 form with its `04` prefix, with `:` and whitespace anywhere. Whether the
+/// point is on the curve is checked by the hook, which refuses an invalid key.
+fn normalise_public_key(input: &str) -> Result<String> {
+    let hex: String = input
+        .chars()
+        .filter(|c| !matches!(c, ':' | ' ' | '\n' | '\r' | '\t'))
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("--public-key is not hex");
+    }
+    match hex.len() {
+        128 => Ok(hex),
+        130 if hex.starts_with("04") => Ok(hex[2..].to_string()),
+        n => bail!("--public-key has {n} hex digits; expected 128 (X||Y) or 130 (04||X||Y)"),
+    }
+}
+
 async fn run(args: Args) -> Result<()> {
     let config = aws_config::from_env()
         .region(Region::new(args.region.clone()))
@@ -125,21 +180,35 @@ async fn run(args: Args) -> Result<()> {
         )
     })?;
 
-    aws_sdk_dynamodb::Client::new(&config)
+    let mut put = aws_sdk_dynamodb::Client::new(&config)
         .put_item()
         .table_name(&args.table)
         .item("mac_address", AttributeValue::S(args.mac.clone()))
-        .item("secret", AttributeValue::S(args.secret.clone()))
+        .item("product", AttributeValue::S(args.product.clone()))
         .item("allowed", AttributeValue::Bool(args.allowed))
-        .item("provisioned", AttributeValue::Bool(false))
-        .send()
+        .item("provisioned", AttributeValue::Bool(false));
+    if let Some(secret) = &args.secret {
+        put = put.item("secret", AttributeValue::S(secret.clone()));
+    }
+    if let Some(key) = &args.public_key {
+        put = put.item("public_key", AttributeValue::S(key.clone()));
+    }
+    put.send()
         .await
         .map_err(|e| anyhow!("{}", aws_sdk_dynamodb::error::DisplayErrorContext(e)))
         .with_context(|| format!("DynamoDB PutItem into {}", args.table))?;
 
     println!(
-        "OK: {} added to table ({}). allowed={}",
-        args.mac, args.table, args.allowed
+        "OK: {} added to table ({}) as product {}, enrolling with {}. allowed={}",
+        args.mac,
+        args.table,
+        args.product,
+        if args.public_key.is_some() {
+            "its public key"
+        } else {
+            "the secret"
+        },
+        args.allowed
     );
     Ok(())
 }
@@ -205,12 +274,62 @@ mod tests {
             parsed,
             Args {
                 mac: "AA:BB:CC:DD:EE:FF".into(),
-                secret: "s".into(),
+                product: "gateway".into(),
+                secret: Some("s".into()),
+                public_key: None,
                 table: "esp32-ztp-device-registry".into(),
                 region: "eu-central-1".into(),
                 allowed: true,
             }
         );
+    }
+
+    const KEY: &str = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF\
+                       FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210";
+
+    #[test]
+    fn a_secure_element_device_is_registered_with_its_key() {
+        let with_colons: String = format!("04{}", KEY.to_lowercase())
+            .as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(":");
+        for key in [KEY.to_string(), with_colons] {
+            let parsed = args(&[
+                "--product",
+                "vaktus",
+                "--mac",
+                "38:18:2b:84:56:f4",
+                "--public-key",
+                &key,
+            ])
+            .unwrap();
+            assert_eq!(parsed.product, "vaktus");
+            assert_eq!(parsed.secret, None);
+            assert_eq!(parsed.public_key.as_deref(), Some(KEY));
+        }
+    }
+
+    #[test]
+    fn malformed_keys_and_products_are_refused() {
+        let mac = ["--mac", "AA:BB:CC:DD:EE:FF"];
+        for bad_key in [
+            &KEY[..126],
+            &format!("05{KEY}"),
+            &format!("{}ZZ", &KEY[..126]),
+        ] {
+            assert!(
+                args(&[mac[0], mac[1], "--public-key", bad_key]).is_err(),
+                "{bad_key}"
+            );
+        }
+        for bad_product in ["", "v", "Vaktus", "vak tus", "1vaktus", "abcdefghijklmnopq"] {
+            assert!(
+                args(&[mac[0], mac[1], "--secret", "s", "--product", bad_product]).is_err(),
+                "{bad_product:?}"
+            );
+        }
     }
 
     #[test]

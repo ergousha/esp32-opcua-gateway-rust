@@ -3,7 +3,7 @@ name = "seed-device"
 version = "0.2.1"
 edition = "2021"
 publish = false
-description = "Registers a gateway (MAC + shared secret) in the DynamoDB device registry that the fleet-provisioning hook checks."
+description = "Registers a device (MAC + product + shared secret or secure-element public key) in the DynamoDB device registry that the fleet-provisioning hook checks."
 
 # Host-only operator tool:
 #

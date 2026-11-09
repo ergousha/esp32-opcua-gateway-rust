@@ -23,6 +23,11 @@ pub struct Config {
     pub provisioning_template: &'static str,
 }
 
+/// This firmware's product on the IoT platform (iot-platform-infra
+/// `products`): its releases go to `s3://<bucket>/gateway/`, and an OTA job
+/// whose document names another product is refused.
+pub const PRODUCT: &str = "gateway";
+
 /// Shared secret matching the record in DynamoDB.
 /// PoC: common to all devices. In production, it must be unique per device and
 /// protected with ESP32-S3 DS peripheral.

@@ -62,7 +62,7 @@ espflash erase-flash
 
 ## 4. OTA Updates and Job Status
 
-Firmware updates arrive as AWS IoT Jobs; the image is written by `src/ota.rs`. The decisions (how a job is read, what its outcome is, what is reported) are pure functions in `gateway-core/src/jobs.rs`, and the state machine that drives them is `gateway-core/src/jobs/client.rs`, written against narrow traits for MQTT, NVS and the OTA partitions. Both are unit-tested on the host; `src/jobs.rs` and `src/job_store.rs` plug in the device.
+Firmware updates arrive as AWS IoT Jobs; the image is written by `src/ota.rs`. The decisions (how a job is read, what its outcome is, what is reported) are pure functions in `iot-jobs/src/lib.rs`, and the state machine that drives them is `iot-jobs/src/client.rs`, written against narrow traits for MQTT, NVS and the OTA partitions. The `iot-jobs` crate is shared with the platform's other products (the Vaktus display depends on it through git); `gateway-core` re-exports it as `gateway_core::jobs`. The firmware sets its product (`config::PRODUCT`, `gateway`): a job whose document names another `product` is reported `REJECTED` without a download, before the version is compared. Both are unit-tested on the host; `src/jobs.rs` and `src/job_store.rs` plug in the device.
 
 With `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`, a new image that resets before it marks itself valid is rolled back by the bootloader. The image that downloads an update therefore cannot know whether it will work, and does not report SUCCEEDED. It records the job in NVS (`src/job_store.rs`, namespace `ota_job` in the `nvs` partition), reports IN_PROGRESS, and restarts. Whichever image boots next reports the outcome.
 

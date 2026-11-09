@@ -106,7 +106,7 @@ flowchart TB
         shared["SampleQueue + Reported<br/>shared state"]
     end
 
-    core["gateway-core — pure logic<br/>settings · bundle · value encoding ·<br/>batching · diff · plan · backoff ·<br/>OTA jobs state machine"]
+    core["gateway-core — pure logic<br/>settings · bundle · value encoding ·<br/>batching · diff · plan · backoff ·<br/>OTA jobs state machine (iot-jobs)"]
     lib["async-opcua 0.19"]
 
     boot --> net --> ident --> tloop
@@ -418,14 +418,17 @@ everything else builds and runs on the development host.
 │   ├── jobs.rs, ota.rs      # AWS IoT Jobs / OTA: MQTT + OTA partitions for the Jobs client
 │   ├── job_store.rs         # NVS: the OTA job the next boot must report, download count
 │   └── mqtt_util.rs         # mutual-TLS MQTT client wrapper
-├── gateway-core/            # pure logic: settings, bundle, encoding, batching, backoff,
-│                            # the OTA Jobs state machine
+├── iot-jobs/                # the AWS IoT Jobs OTA protocol and state machine, shared
+│                            # with the platform's other products (Vaktus)
+├── gateway-core/            # pure logic: settings, bundle, encoding, batching, backoff;
+│                            # re-exports iot-jobs as gateway_core::jobs
 ├── gateway-opcua/           # the OPC UA client: session, subscriptions, reconnect
 │                            # state machine — platform-neutral, plugged into src/
 ├── opcua-test-server/       # OPC UA test server on async-opcua-server (the server
 │                            # half of the client's own library) + tag catalogue
 ├── gateway-hil/             # on-device scenario runner (ESP32 + AWS + test server)
-├── seed-device/             # registers a device (MAC + secret) in the DynamoDB registry
+├── seed-device/             # registers a device (MAC, product, secret or public key)
+│                            # in the DynamoDB registry
 ├── crates/                  # vendored [patch.crates-io] sources (ESP-IDF fixes)
 ├── build.rs                 # fetches the claim identity and endpoint from SSM
 ├── partitions.csv           # the frozen flash layout

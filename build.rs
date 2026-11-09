@@ -7,7 +7,8 @@ fn main() {
     let fetched_cert = fetch_ssm_parameter("/esp32-ztp/poc/claim_certificate_pem", true);
     let fetched_key = fetch_ssm_parameter("/esp32-ztp/poc/claim_private_key", true);
     let fetched_endpoint = fetch_ssm_parameter("/esp32-ztp/poc/iot_endpoint", false);
-    let fetched_template = fetch_ssm_parameter("/esp32-ztp/poc/provisioning_template_name", false);
+    let fetched_template =
+        fetch_ssm_parameter("/esp32-ztp/poc/gateway/provisioning_template_name", false);
 
     // 2. Write certificates if successfully fetched
     if let (Some(cert), Some(key)) = (&fetched_cert, &fetched_key) {
