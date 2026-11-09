@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.1](https://github.com/ergousha/esp32-opcua-gateway-rust/compare/v0.2.0...v0.2.1) (2026-11-09)
+
+
+### Bug Fixes
+
+* flash the project's bootloader, which has OTA rollback ([db27d64](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/db27d647fa45c2e47d7e7924deaf167b063a3f78)), closes [#22](https://github.com/ergousha/esp32-opcua-gateway-rust/issues/22)
+* **hil:** confirm a restore to an idle device, treat test-namespace configs as leftovers, harden signal handling ([be120df](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/be120df2893c1b62133c78c7336009a050dfbab1))
+* **ota:** host-test the Jobs client; retry a never-activated update, cap crashing downloads, honour cancellation, reject refused jobs ([c937521](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/c937521c7650ccf83e7ad75029d5baf6d805f2b1))
+* **ota:** treat TerminalStateReached as a cancelled job before activation ([db015be](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/db015be7ec91f78f750012102643aacc9c42ae75))
+
 ## [0.2.0](https://github.com/ergousha/esp32-opcua-gateway-rust/compare/v0.1.0...v0.2.0) (2026-11-09)
 
 
