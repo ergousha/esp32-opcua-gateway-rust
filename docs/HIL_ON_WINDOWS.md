@@ -19,8 +19,8 @@ on-device scenario — not a green run at any cost.
 - The runner is the Rust crate `gateway-hil`. It starts an OPC UA test server
   inside its own process, configures the device through AWS IoT (shadow +
   retained tag bundle), and asserts on the device's shadow, on telemetry in
-  CloudWatch, and on the device's serial log. Ten phases: `preflight`,
-  `provision`, `telemetry`, `reconfig`, `ns_uri`, `reject_security`,
+  CloudWatch, and on the device's serial log. Eleven phases: `bootloader`,
+  `preflight`, `provision`, `telemetry`, `reconfig`, `ns_uri`, `reject_security`,
   `reject_digest`, `server_down`, `disable`, `reboot`.
 - The device: thing `28848553144F`, on WiFi at `192.168.50.75`
   (subnet `192.168.50.0/24`). It already runs the current firmware, including
@@ -199,5 +199,7 @@ The 2026-09-27 runs used this setup; it replaces steps 5–7 above.
   `ldproxy`), create `cfg.toml` from `cfg.toml.example` with the WiFi
   credentials, and run `cargo +esp build --release`. The first build
   downloads ESP-IDF into `.embuild/`. Flash with
-  `espflash flash --port /dev/ttyACM0 --partition-table partitions.csv --target-app-partition ota_0 target/xtensa-esp32s3-espidf/release/esp32-opcua-gateway`.
+  `espflash flash --port /dev/ttyACM0 --bootloader target/bootloader.bin --partition-table partitions.csv --target-app-partition ota_0 target/xtensa-esp32s3-espidf/release/esp32-opcua-gateway`.
+  `--bootloader` is not optional: without it espflash writes its own, which
+  has no OTA rollback (issue #22).
   To decode backtraces, pass that ELF to `gateway-hil` as `--elf`.

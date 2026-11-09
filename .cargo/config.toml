@@ -3,7 +3,9 @@ target = "xtensa-esp32s3-espidf"
 
 [target.'cfg(target_os = "espidf")']
 linker = "ldproxy"
-runner = "espflash flash --partition-table partitions.csv --target-app-partition ota_0 --monitor"
+# --bootloader: the one this build produced (build.rs copies it there), not
+# espflash's bundled one, which has no OTA rollback (issue #22).
+runner = "espflash flash --bootloader target/bootloader.bin --partition-table partitions.csv --target-app-partition ota_0 --monitor"
 rustflags = ["--cfg", "espidf_time64"]
 
 [unstable]

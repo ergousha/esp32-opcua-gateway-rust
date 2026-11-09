@@ -19,13 +19,15 @@ use opcua_test_server::{Options, TestServer};
 use regex::Regex;
 use serde_json::Value;
 
+use crate::bootloader;
 use crate::cloud::{now_ms, rows_by_address, Cloud};
-use crate::device::SerialMonitor;
+use crate::device::{self, SerialMonitor};
 use crate::report::{info, PhaseResult};
 
 /// Default run order. For a host the device cannot reach, see
 /// [`crate::offline::PHASES`].
 pub const PHASES: &[&str] = &[
+    "bootloader",
     "preflight",
     "provision",
     "telemetry",
@@ -225,6 +227,7 @@ impl Ctx {
 /// Runs one phase by name.
 pub async fn run(name: &str, ctx: &mut Ctx) -> Result<PhaseResult> {
     match name {
+        "bootloader" => bootloader(ctx).await,
         "preflight" => preflight(ctx).await,
         "provision" => provision(ctx).await,
         "telemetry" => telemetry(ctx).await,
@@ -309,6 +312,56 @@ fn compact_len(v: &Value) -> usize {
 // ---------------------------------------------------------------------------
 // phases
 // ---------------------------------------------------------------------------
+
+/// The ESP-IDF version the firmware builds against (`.cargo/config.toml`),
+/// and so the version its bootloader carries.
+const ESP_IDF_VERSION: &str = env!("ESP_IDF_VERSION");
+
+/// The device boots through the bootloader this project builds, the only one
+/// with OTA rollback (issue #22; see [`crate::bootloader`]).
+///
+/// Read back from flash, since the boot log never shows it. That takes the
+/// port from the monitor for a moment and reboots the chip, as an attach does.
+async fn bootloader(ctx: &mut Ctx) -> Result<PhaseResult> {
+    let mut r = PhaseResult::new("bootloader");
+    let Some(monitor) = ctx.monitor.as_mut() else {
+        r.skipped = true;
+        r.note = "needs the serial monitor (--port)".into();
+        return Ok(r);
+    };
+
+    info("reading the bootloader back from flash (the device reboots)…");
+    let flashed = monitor.read_flash(0, bootloader::REGION_LEN).await?;
+    let fix = "Write the project's: `espflash write-bin --chip esp32s3 0x0 \
+               target/bootloader.bin`, or run with --flash";
+
+    let version = bootloader::idf_version(&flashed);
+    let ok = version.as_deref() == Some(ESP_IDF_VERSION);
+    r.check(
+        format!("the device's bootloader is ESP-IDF {ESP_IDF_VERSION}, not espflash's bundled one"),
+        ok,
+        match version {
+            Some(v) if ok => v,
+            Some(v) => format!("{v}: no OTA rollback. {fix}"),
+            None => format!("no ESP-IDF bootloader at 0x0. {fix}"),
+        },
+    );
+
+    // A host that did not build the firmware has only the version to go by.
+    let built_path = device::bootloader_for(monitor.elf()).filter(|p| p.is_file());
+    match built_path {
+        Some(path) => {
+            let built = std::fs::read(&path)?;
+            r.check(
+                "it is the bootloader this project builds, not just the same version",
+                bootloader::same_image(&built, &flashed),
+                format!("compared with {}", path.display()),
+            );
+        }
+        None => info("no target/bootloader.bin on this host; compared the version only"),
+    }
+    Ok(r)
+}
 
 /// The server answers the firmware's own client, and the documents fit their
 /// budgets — before any hardware is involved.

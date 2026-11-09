@@ -406,11 +406,19 @@ telemetry payload).
 
 ### 6.2 On-device scenario — `gateway-hil`
 
-Ten phases, run in order because they share state — `reconfig` is only
+Eleven phases, run in order because they share state — `reconfig` is only
 meaningful once `provision` has applied something. Individually selectable with
 `--phases` so a single failure can be re-run without repeating the whole thing.
 After the last one the runner puts the device's configuration back the way it
 found it (§7.4).
+
+#### Phase 0 — `bootloader`
+
+| | |
+| --- | --- |
+| **Action** | Detach the monitor, read the bootloader region (`0x0`–`0x8000`) back with `espflash read-flash`, re-attach. The chip reboots twice. Skipped without `--port`. |
+| **Asserts** | The bootloader on the chip carries ESP-IDF `ESP_IDF_VERSION` (`.cargo/config.toml`), not espflash's bundled `v5.5.1-838-gd66ebb86d2e`. If this host built the firmware, it is also the same image as `target/bootloader.bin`, apart from the flash settings espflash patches in, the build timestamp, and the checksum and hash over them. |
+| **Why** | Only the project's bootloader has OTA rollback; on espflash's, a bad OTA image boot-loops instead (#22). The boot log cannot tell them apart: the monitor attaches after the USB-Serial-JTAG re-enumerates, long after the bootloader's lines. |
 
 #### Phase 1 — `preflight` (no device involved)
 
@@ -533,7 +541,7 @@ cargo run -p gateway-hil --target host-tuple -- \
 
 | Flag | Effect |
 | --- | --- |
-| `--flash` | Flashes the existing release build with `partitions.csv` into `ota_0` first. |
+| `--flash` | Flashes the existing release build with `partitions.csv` into `ota_0` first, with the bootloader that build produced (`target/bootloader.bin`). |
 | `--phases a,b` | Run a subset. |
 | `--cleanup` | Clear the retained tag bundles the run published, so a later boot cannot pick up a stale config from a forgotten run. The bundle the restored configuration points at, and the pre-run one, are kept (§7.4). |
 | `--restore` | Put back the configuration a run that did not finish saved, then exit (§7.4). Needs only `--thing`. |
@@ -564,6 +572,7 @@ re-delivery (§9.9).
 
 | Phase | Asserts |
 | --- | --- |
+| `bootloader` | As in §6.2. |
 | `preflight` | As in §6.2. |
 | `offline_config` | The config arrives on both planes and is cached to NVS. The device runs the new firmware and logs the unencrypted-link warning. The failure is reported in the shadow, naming the endpoint, rather than an endless `connecting` (§8.12). Every connect attempt ends by itself. Reconnects back off at ≥ 1 s. No panic and no failed allocation. |
 | `offline_disable` | `enabled: false` idles the driver while it is still trying to connect (§8.11), and no attempts follow. |
@@ -1230,7 +1239,8 @@ cached:
 . ~/export-esp.sh
 ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.stack-debug" \
     CARGO_TARGET_DIR=target/stack-debug cargo build --release
-espflash flash --port <port> --partition-table partitions.csv --target-app-partition ota_0 \
+espflash flash --port <port> --bootloader target/stack-debug/bootloader.bin \
+    --partition-table partitions.csv --target-app-partition ota_0 \
     target/stack-debug/xtensa-esp32s3-espidf/release/esp32-opcua-gateway
 ```
 
@@ -1259,6 +1269,7 @@ espflash flash --port <port> --partition-table partitions.csv --target-app-parti
 | `last_error: "session lost: …"`, then `running` again | The server went away and came back | Expected; backoff is 1 s doubling to 60 s with jitter. |
 | `reported` never updates | Reports are throttled to state-change or every 30 s | Wait, or trigger a state change. |
 | Telemetry absent from CloudWatch but the device says it published | `dt/+/opcua` rule or its log group missing | §8.1's terraform also creates them. |
+| `bootloader` fails: `v5.5.1-838-gd66ebb86d2e: no OTA rollback` | Flashed with `espflash flash` and no `--bootloader`, from outside the repository root (where `espflash.toml` supplies it) | `espflash write-bin --chip esp32s3 0x0 target/bootloader.bin`, or rerun with `--flash` (#22). |
 | `espflash not found` | `export-esp.sh` does not add `~/.cargo/bin` | `cargo install espflash`; the runner looks in `~/.cargo/bin` itself. |
 | Serial log is a few hundred bytes; every log assertion fails | Monitor attached while the USB-JTAG was re-enumerating | §8.9b |
 | Monitor shows `Using flash stub`, then nothing; the device goes silent | Attached with `espflash monitor --no-reset`, which leaves the chip in its bootloader | §8.20. Attach without it; `espflash reset` recovers the device. |

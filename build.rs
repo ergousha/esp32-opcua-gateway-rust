@@ -35,6 +35,56 @@ fn main() {
     }
 
     embuild::espidf::sysenv::output();
+
+    stage_bootloader();
+}
+
+/// Copies the second-stage bootloader this build produced to
+/// `<target-dir>/bootloader.bin`, where `espflash.toml` and `gateway-hil` find
+/// it.
+///
+/// `espflash flash` otherwise writes its own bundled bootloader, which is built
+/// without `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`: it ignores OTA image states,
+/// never rolls a bad image back, and boot-loops it instead (issue #22). OTA
+/// never replaces the bootloader, so what USB flashing writes is what the unit
+/// keeps.
+///
+/// esp-idf-sys builds it under its own `OUT_DIR`, whose name carries a hash,
+/// and stale ones from earlier configurations stay next to it. The exact one
+/// is the build directory esp-idf-sys passes on in its C include arguments
+/// (`-isystem<OUT_DIR>/build/config`), which esp-idf-svc relays to us.
+fn stage_bootloader() {
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    // <target-dir>/<triple>/<profile>/build/<pkg>-<hash>/out
+    let target_dir = out_dir
+        .ancestors()
+        .nth(5)
+        .expect("OUT_DIR is <target-dir>/<triple>/<profile>/build/<pkg>-<hash>/out");
+    let staged = target_dir.join("bootloader.bin");
+    // Whatever happens below, never leave an earlier build's bootloader there
+    // for espflash to write.
+    let _ = std::fs::remove_file(&staged);
+
+    let args = embuild::espidf::sysenv::cincl_args()
+        .expect("esp-idf-svc relays esp-idf-sys's C include arguments")
+        .args;
+    let build_dir = args
+        .split_whitespace()
+        .filter_map(|arg| arg.trim_matches('"').strip_prefix("-isystem"))
+        .map(Path::new)
+        .find(|dir| dir.ends_with("build/config"))
+        .and_then(Path::parent)
+        .unwrap_or_else(|| {
+            panic!("no <esp-idf build>/build/config in esp-idf-sys's include arguments: {args}")
+        });
+    let built = build_dir.join("bootloader").join("bootloader.bin");
+    std::fs::copy(&built, &staged).unwrap_or_else(|e| {
+        panic!(
+            "copying the bootloader {} to {}: {e}",
+            built.display(),
+            staged.display()
+        )
+    });
 }
 
 fn write_file(rel: &str, content: &str) {

@@ -86,10 +86,36 @@ pub fn wait_for_port(_port: &str, timeout: Duration, settle: Duration) -> bool {
     true
 }
 
-/// Flashes `elf` into the `ota_0` slot.
+/// The bootloader the build of `elf` produced: the firmware's `build.rs`
+/// copies it to `<target-dir>/bootloader.bin`, and the ELF is
+/// `<target-dir>/<triple>/<profile>/<name>`.
+pub fn bootloader_for(elf: &Path) -> Option<PathBuf> {
+    elf.ancestors()
+        .nth(3)
+        .map(|target_dir| target_dir.join("bootloader.bin"))
+}
+
+/// Flashes `elf` into the `ota_0` slot, with the bootloader its build
+/// produced.
+///
+/// Never espflash's bundled bootloader, which it writes when not given one:
+/// that one is built without `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`, so a bad
+/// OTA image boot-loops instead of being rolled back (issue #22). OTA never
+/// replaces the bootloader, so the unit would keep it.
 pub async fn flash(port: &str, elf: &Path, repo: &Path) -> Result<()> {
+    let bootloader = bootloader_for(elf)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            anyhow!(
+                "no bootloader.bin in the target dir of {}; the firmware build writes it \
+                 there (build.rs), so rebuild with `cargo build --release`",
+                elf.display()
+            )
+        })?;
     let mut cmd = Command::new(espflash()?);
     cmd.args(["flash", "--port", port])
+        .arg("--bootloader")
+        .arg(&bootloader)
         .args(["--partition-table", "partitions.csv"])
         .args(["--target-app-partition", "ota_0", "--non-interactive"])
         .arg(elf)
@@ -102,6 +128,35 @@ pub async fn flash(port: &str, elf: &Path, repo: &Path) -> Result<()> {
         bail!("espflash flash failed with {status}");
     }
     Ok(())
+}
+
+/// Reads `len` bytes of flash from `offset`. Needs the port: detach the
+/// monitor first. Resets the chip, into the ROM loader and back out.
+pub async fn read_flash(port: &str, offset: u32, len: u32) -> Result<Vec<u8>> {
+    let file = std::env::temp_dir().join(format!(
+        "gateway-hil-flash-{}-{offset:#x}.bin",
+        std::process::id()
+    ));
+    let mut cmd = Command::new(espflash()?);
+    cmd.args(["read-flash", "--port", port, "--non-interactive"])
+        .arg(format!("{offset:#x}"))
+        .arg(format!("{len:#x}"))
+        .arg(&file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    let output = tokio::task::spawn_blocking(move || cmd.output())
+        .await?
+        .context("running espflash read-flash")?;
+    if !output.status.success() {
+        bail!(
+            "espflash read-flash failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let data = std::fs::read(&file).with_context(|| format!("reading {}", file.display()));
+    let _ = std::fs::remove_file(&file);
+    data
 }
 
 /// Captures the device's serial log for the whole run.
@@ -184,6 +239,21 @@ impl SerialMonitor {
         self.stop();
         tokio::time::sleep(Duration::from_secs(1)).await;
         self.start().await
+    }
+
+    /// The firmware ELF the log is decoded against.
+    pub fn elf(&self) -> &Path {
+        &self.elf
+    }
+
+    /// Reads flash with the monitor detached, then re-attaches, which reboots
+    /// the chip like [`SerialMonitor::restart`].
+    pub async fn read_flash(&mut self, offset: u32, len: u32) -> Result<Vec<u8>> {
+        self.stop();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let data = read_flash(&self.port, offset, len).await;
+        self.start().await?;
+        data
     }
 
     /// Current size of the log, for reading only what a phase produced.

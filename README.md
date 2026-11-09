@@ -565,17 +565,32 @@ cargo run --release               # builds, flashes, and opens the serial monito
 ```
 
 [`.cargo/config.toml`](.cargo/config.toml) sets `espflash flash --monitor` as the
-runner, with the project's partition table and the `ota_0` slot, so
-`cargo run` builds, flashes and attaches the monitor in one step. To flash by
-hand, pass the same partition options — without them `espflash` uses its
-default table, which does not match [`partitions.csv`](partitions.csv):
+runner, with the project's bootloader, its partition table and the `ota_0`
+slot, so `cargo run` builds, flashes and attaches the monitor in one step. To
+flash by hand, pass the same options:
 
 ```sh
 espflash flash --port /dev/cu.usbmodem<n> \
+    --bootloader target/bootloader.bin \
     --partition-table partitions.csv --target-app-partition ota_0 \
     target/xtensa-esp32s3-espidf/release/esp32-opcua-gateway
 espflash monitor --port /dev/cu.usbmodem<n>   # optional: view logs over serial
 ```
+
+- **`--bootloader`**: without it `espflash` writes its own bundled bootloader,
+  which is built without OTA rollback. A bad OTA release then boot-loops the
+  unit instead of being rolled back, and OTA never replaces the bootloader
+  ([#22](https://github.com/ergousha/esp32-opcua-gateway-rust/issues/22)). The
+  build ([`build.rs`](build.rs)) copies the bootloader it produced to
+  `target/bootloader.bin` (`<target-dir>/bootloader.bin` with another
+  `CARGO_TARGET_DIR`).
+- **`--partition-table`**: without it `espflash` uses its default table, which
+  does not match [`partitions.csv`](partitions.csv).
+
+[`espflash.toml`](espflash.toml) sets both for any `espflash flash` run from
+the repository root, so a command that leaves them out still gets them. To
+put the project's bootloader on a unit flashed without it:
+`espflash write-bin --chip esp32s3 0x0 target/bootloader.bin`.
 
 To find the port:
 
