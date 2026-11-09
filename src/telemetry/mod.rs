@@ -86,7 +86,8 @@ pub fn run(id: &DeviceIdentity, job_store: JobStore) -> Result<()> {
 
     let opcua = start_opcua();
 
-    let mut jobs = JobsClient::new(&id.thing_name, job_store, Ota, boot);
+    let mut jobs =
+        JobsClient::new(&id.thing_name, job_store, Ota, boot).with_product(crate::config::PRODUCT);
     let mut config_plane = ConfigPlane::new(&id.thing_name, opcua.clone());
     let mut store = SettingsStore::new().context("opening the OPC UA settings store")?;
     // Events the Jobs client took off the channel while it waited for an

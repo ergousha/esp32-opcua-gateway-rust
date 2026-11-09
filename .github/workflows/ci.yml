@@ -42,11 +42,11 @@ jobs:
             "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" \
             --jq '.[].filename')"
 
-          # The firmware links gateway-core and gateway-opcua, so changes
-          # there rebuild it too.
+          # The firmware links iot-jobs, gateway-core and gateway-opcua, so
+          # changes there rebuild it too.
           while IFS= read -r path; do
             case "$path" in
-              src/*|gateway-core/*|gateway-opcua/*|crates/*|Cargo.toml|Cargo.lock|build.rs|.cargo/*|rust-toolchain.toml|sdkconfig.defaults|partitions.csv|certs/AmazonRootCA1.pem)
+              src/*|iot-jobs/*|gateway-core/*|gateway-opcua/*|crates/*|Cargo.toml|Cargo.lock|build.rs|.cargo/*|rust-toolchain.toml|sdkconfig.defaults|partitions.csv|certs/AmazonRootCA1.pem)
                 echo "firmware=true" >> "$GITHUB_OUTPUT"
                 exit 0
                 ;;
@@ -112,7 +112,7 @@ jobs:
       # rust-toolchain.toml pins Espressif's fork for the firmware; the host
       # crates build on upstream stable.
       RUSTUP_TOOLCHAIN: stable
-      HOST_CRATES: -p gateway-core -p gateway-opcua -p opcua-test-server -p gateway-hil -p seed-device
+      HOST_CRATES: -p iot-jobs -p gateway-core -p gateway-opcua -p opcua-test-server -p gateway-hil -p seed-device
     steps:
       - name: Check changed paths
         id: filter
@@ -126,7 +126,7 @@ jobs:
 
           while IFS= read -r path; do
             case "$path" in
-              gateway-core/*|gateway-opcua/*|opcua-test-server/*|gateway-hil/*|seed-device/*|crates/*|Cargo.toml|Cargo.lock|.cargo/*|.github/workflows/ci.yml)
+              iot-jobs/*|gateway-core/*|gateway-opcua/*|opcua-test-server/*|gateway-hil/*|seed-device/*|crates/*|Cargo.toml|Cargo.lock|.cargo/*|.github/workflows/ci.yml)
                 echo "host=true" >> "$GITHUB_OUTPUT"
                 exit 0
                 ;;

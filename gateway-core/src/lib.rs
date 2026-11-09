@@ -14,7 +14,9 @@ pub mod bundle;
 pub mod codec;
 pub mod diff;
 pub mod health;
-pub mod jobs;
+/// The AWS IoT Jobs firmware-update protocol, which lives in the shared
+/// `iot-jobs` crate; re-exported so `gateway_core::jobs::…` paths keep working.
+pub use iot_jobs as jobs;
 pub mod node;
 pub mod plan;
 pub mod queue;

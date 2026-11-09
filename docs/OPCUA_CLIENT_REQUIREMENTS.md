@@ -447,7 +447,7 @@ Key boundaries that make it testable:
   client only through its `Client` handle: `apply`, `disable`, `drain`, `reported`.
 - **`MqttTransport` trait** (`src/mqtt_util.rs`) is what `ConfigPlane` and `Publisher` are
   written against, not `EspMqttClient`. The Jobs state machine, `JobsClient`, lives in
-  `gateway-core/src/jobs/client.rs` behind its own `Transport`, `Store` and `Installer`
+  `iot-jobs/src/client.rs` behind its own `Transport`, `Store` and `Installer`
   traits, and is tested on the host.
 - **Explicit `now_ms` parameters** rather than an ambient clock: `batcher.rs` flush-on-age is
   deterministic in tests without any injection machinery.

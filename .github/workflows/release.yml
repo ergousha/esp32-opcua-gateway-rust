@@ -25,6 +25,7 @@ on:
     paths:
       - 'src/**'
       # The firmware links these crates, so a change there is a firmware change.
+      - 'iot-jobs/**'
       - 'gateway-core/**'
       - 'gateway-opcua/**'
       - 'crates/**'
@@ -196,4 +197,6 @@ jobs:
         env:
           AWS_FIRMWARE_BUCKET: ${{ vars.AWS_FIRMWARE_BUCKET }}
         run: |
-          aws s3 cp firmware.bin "s3://${AWS_FIRMWARE_BUCKET}/firmware_${TAG_NAME}.bin"
+          # Under the product's prefix: the platform's OTA trigger maps
+          # gateway/ to the gateway fleet group only (iot-platform-infra).
+          aws s3 cp firmware.bin "s3://${AWS_FIRMWARE_BUCKET}/gateway/firmware_${TAG_NAME}.bin"
