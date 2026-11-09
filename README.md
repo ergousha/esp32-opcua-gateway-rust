@@ -106,7 +106,7 @@ flowchart TB
         shared["SampleQueue + Reported<br/>shared state"]
     end
 
-    core["gateway-core — pure logic<br/>settings · bundle · value encoding ·<br/>batching · diff · plan · backoff ·<br/>OTA job outcome"]
+    core["gateway-core — pure logic<br/>settings · bundle · value encoding ·<br/>batching · diff · plan · backoff ·<br/>OTA jobs state machine"]
     lib["async-opcua 0.19"]
 
     boot --> net --> ident --> tloop
@@ -352,7 +352,7 @@ completes within 3 s even if the server never answers.
 | `$aws/things/{thing}/shadow/name/opcua/get` (`/accepted`, `/rejected`) | both | config | read `state.desired` |
 | `$aws/things/{thing}/shadow/name/opcua/update` (`/delta`, `/rejected`) | both | config | change notifications in, `state.reported` out |
 | `cmd/{thing}/opcua/tags/v{N}` | cloud → device, retained | config | the tag bundle for config version N |
-| `$aws/things/{thing}/jobs/notify-next`, `…/jobs/$next/get` (`/accepted`), `…/jobs/{jobId}/update` (`/accepted`, `/rejected`) | both | control | OTA jobs and their status |
+| `$aws/things/{thing}/jobs/notify-next`, `…/jobs/$next/get` (`/accepted`), `…/jobs/{jobId}/update` (`/accepted`, `/rejected`), `…/jobs/{jobId}/get` (`/accepted`, `/rejected`) | both | control | OTA jobs and their status; `{jobId}/get` asks, before an image is activated, whether its job is still wanted |
 | `dt/{thing}/opcua` (set in the shadow's `telemetry.topic`) | device → cloud | data | telemetry batches |
 
 The device policy must grant the named-shadow topics as well as the others: an
@@ -415,10 +415,11 @@ everything else builds and runs on the development host.
 │   ├── telemetry/           # normal operation: MQTT loop + batched publisher
 │   ├── shadow.rs            # config plane: `opcua` named shadow + tag bundle
 │   ├── settings_store.rs    # NVS cache of the last applied OPC UA config
-│   ├── jobs.rs, ota.rs      # AWS IoT Jobs / OTA
-│   ├── job_store.rs         # NVS record of the OTA job the next boot must report
+│   ├── jobs.rs, ota.rs      # AWS IoT Jobs / OTA: MQTT + OTA partitions for the Jobs client
+│   ├── job_store.rs         # NVS: the OTA job the next boot must report, download count
 │   └── mqtt_util.rs         # mutual-TLS MQTT client wrapper
-├── gateway-core/            # pure logic: settings, bundle, encoding, batching, backoff
+├── gateway-core/            # pure logic: settings, bundle, encoding, batching, backoff,
+│                            # the OTA Jobs state machine
 ├── gateway-opcua/           # the OPC UA client: session, subscriptions, reconnect
 │                            # state machine — platform-neutral, plugged into src/
 ├── opcua-test-server/       # OPC UA test server on async-opcua-server (the server

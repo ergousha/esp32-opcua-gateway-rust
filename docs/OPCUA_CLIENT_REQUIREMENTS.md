@@ -430,7 +430,7 @@ opcua-test-server/       // async-opcua-server + the tag catalogue (test fixture
 src/                     // firmware: the effectful shell
   settings_store.rs      // NVS blob cache in the dedicated `opcua` partition
   shadow.rs              // ConfigPlane: shadow conversation + retained bundle -> Client::apply
-  jobs.rs                // AWS IoT Jobs / OTA, flattened out of the telemetry loop
+  jobs.rs                // AWS IoT Jobs / OTA: MQTT and OTA for gateway-core's JobsClient
   mqtt_util.rs           // MqttTransport trait + EspMqttClient impl
   telemetry/
     mod.rs               // orchestrator: one MQTT loop over config/control/data planes
@@ -445,8 +445,10 @@ Key boundaries that make it testable:
 - **`gateway-opcua` has none either.** The firmware injects what only it can provide — a clock, a
   per-device backoff seed, the thread (after registering the eventfd VFS) — and talks to the
   client only through its `Client` handle: `apply`, `disable`, `drain`, `reported`.
-- **`MqttTransport` trait** (`src/mqtt_util.rs`) is what `ConfigPlane`, `JobsClient` and
-  `Publisher` are written against, not `EspMqttClient`.
+- **`MqttTransport` trait** (`src/mqtt_util.rs`) is what `ConfigPlane` and `Publisher` are
+  written against, not `EspMqttClient`. The Jobs state machine, `JobsClient`, lives in
+  `gateway-core/src/jobs/client.rs` behind its own `Transport`, `Store` and `Installer`
+  traits, and is tested on the host.
 - **Explicit `now_ms` parameters** rather than an ambient clock: `batcher.rs` flush-on-age is
   deterministic in tests without any injection machinery.
 - **Bounded queue with an explicit overflow policy** between driver and publisher: at capacity a

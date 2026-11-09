@@ -63,18 +63,30 @@ fn main() -> Result<()> {
 
     let result = run();
     if let Err(e) = &result {
-        // Returning ends the main task and parks the device, and a fresh OTA
-        // image parked unverified is never rolled back; on Ethernet an image
-        // that cannot reach AWS IoT did exactly that. Restarting now hands the
-        // device back to the previous image, which then reports the job FAILED.
+        // Returning ends the main task and parks the device until someone
+        // resets it: no MQTT, so no Jobs either, and no way to deliver a fix.
+        // A fresh OTA image parked unverified is never rolled back, either; on
+        // Ethernet an image that could not reach AWS IoT did exactly that.
+        // Restarting hands an unverified image back to the previous one,
+        // which then reports the job FAILED, and gives a valid one another go
+        // at whatever failed: most often reaching AWS IoT.
         if ota::running_unverified() {
             log::error!("{e:#}; restarting so the bootloader restores the previous image");
             std::thread::sleep(std::time::Duration::from_secs(2));
-            esp_idf_svc::hal::reset::restart();
+        } else {
+            log::error!("{e:#}; restarting in {} s", RESTART_AFTER_FAILURE.as_secs());
+            std::thread::sleep(RESTART_AFTER_FAILURE);
         }
+        esp_idf_svc::hal::reset::restart();
     }
     result
 }
+
+/// How long a valid image waits after `run` failed before it restarts. Long
+/// enough that a failure that persists, such as AWS IoT being unreachable,
+/// does not turn into a tight boot loop; each attempt already spends up to
+/// 30 s waiting for the connection.
+const RESTART_AFTER_FAILURE: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn run() -> Result<()> {
     // Claim the OPC UA type table before TLS and the OPC UA session take their
