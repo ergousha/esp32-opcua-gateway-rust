@@ -25,6 +25,7 @@
 //! found it — after a failure, a panic in a phase, or Ctrl-C too; see
 //! [`restore`]. A run that dies before it can leaves that to `--restore`.
 
+mod bootloader;
 mod cloud;
 mod device;
 mod interrupt;
@@ -58,7 +59,8 @@ usage: gateway-hil --thing NAME --server-host LAN-IP [options]
   --server-port PORT    OPC UA server port                        (default 4855)
   --server-path PATH    OPC UA endpoint path                      (default /ergousha/test)
   --port DEVICE         serial port of the device; enables log assertions and `reboot`
-  --flash               flash target/xtensa-esp32s3-espidf/release/esp32-opcua-gateway first
+  --flash               flash target/xtensa-esp32s3-espidf/release/esp32-opcua-gateway first,
+                        with the bootloader that build produced (target/bootloader.bin)
   --elf PATH            firmware ELF to flash and to decode the log against
   --offline             for a host the device cannot reach (e.g. a firewalled
                         workstation): run the phases that need no route from the

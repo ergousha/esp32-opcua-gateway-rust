@@ -30,6 +30,7 @@ use crate::report::{info, PhaseResult};
 
 /// Default run order with `--offline`.
 pub const PHASES: &[&str] = &[
+    "bootloader",
     "preflight",
     "offline_config",
     "offline_disable",

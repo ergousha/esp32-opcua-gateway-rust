@@ -1,0 +1,11 @@
+# Read by `espflash flash` (and `cargo run`, whose runner calls it) when run
+# from the repository root. Paths are relative to the working directory.
+[idf_format_args]
+# The bootloader this project builds, which build.rs copies here. Without this
+# entry espflash writes its own bundled one, which has no OTA rollback: a bad
+# OTA image then boot-loops instead of being rolled back (issue #22). A build
+# with a different CARGO_TARGET_DIR puts it in that directory instead; pass
+# --bootloader <target-dir>/bootloader.bin for those.
+bootloader = "target/bootloader.bin"
+# The single partition table, also used by the ESP-IDF build (sdkconfig.defaults).
+partition_table = "partitions.csv"
