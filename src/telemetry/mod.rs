@@ -244,8 +244,9 @@ fn start_opcua() -> Client {
         if let Err(e) = named.set() {
             log::warn!("could not name the OPC UA thread: {e}");
         }
+        let heap = InternalHeap::now();
         let spawned = gateway_opcua::spawn_thread(driver, "opcua", OPCUA_STACK_BYTES)
-            .map(drop)
+            .map(|_| heap)
             .context("starting the OPC UA thread");
         // The configuration is per calling thread; later spawns must not inherit the name.
         if let Err(e) = ThreadSpawnConfiguration::default().set() {
@@ -253,14 +254,76 @@ fn start_opcua() -> Client {
         }
         spawned
     });
-    if let Err(e) = started {
-        log::error!("OPC UA is unavailable: {e:#}");
-        client.update_reported(|r| {
-            r.state = DriverState::Error;
-            r.set_error(format!("OPC UA did not start: {e:#}"));
-        });
+    match started {
+        Ok(heap_before) => log_stack_placement(heap_before),
+        Err(e) => {
+            log::error!("OPC UA is unavailable: {e:#}");
+            client.update_reported(|r| {
+                r.state = DriverState::Error;
+                r.set_error(format!("OPC UA did not start: {e:#}"));
+            });
+        }
     }
     client
+}
+
+/// Free internal heap, in total and as its largest block: what a thread stack
+/// is carved from.
+#[derive(Clone, Copy)]
+struct InternalHeap {
+    free: usize,
+    largest_block: usize,
+}
+
+impl InternalHeap {
+    fn now() -> Self {
+        use esp_idf_svc::sys::{
+            heap_caps_get_free_size, heap_caps_get_largest_free_block, MALLOC_CAP_INTERNAL,
+        };
+
+        // Safe: read-only queries of the allocator.
+        unsafe {
+            Self {
+                free: heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                largest_block: heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+            }
+        }
+    }
+}
+
+/// Logs, once at boot, what stack the OPC UA task actually got, where it is,
+/// and what starting the thread cost the internal heap.
+///
+/// The stack is a block of internal heap, and FreeRTOS only notices an
+/// overflow by a changed canary at its low end, which the heap block below it
+/// can overrun just as well. A 48 KiB stack that "overflowed" on the first
+/// connect where 40 KiB did not is unexplained; this is the first thing to
+/// look at when it is tried again.
+fn log_stack_placement(before: InternalHeap) {
+    use esp_idf_svc::sys::{heap_caps_get_allocated_size, pxTaskGetStackStart, xTaskGetHandle};
+
+    let after = InternalHeap::now();
+    // Null if the thread has already gone, or was not named.
+    let task = unsafe { xTaskGetHandle(OPCUA_TASK_NAME.as_ptr()) };
+    if task.is_null() {
+        return;
+    }
+    // Sound: the task lives as long as its `Client`, held here, and FreeRTOS
+    // allocated its stack as one heap block, as `heap_caps_get_allocated_size`
+    // requires.
+    let (start, size) = unsafe {
+        let start = pxTaskGetStackStart(task);
+        (start, heap_caps_get_allocated_size(start.cast()))
+    };
+    log::info!(
+        "OPC UA stack: {size} B at {start:p}..{:p} ({OPCUA_STACK_BYTES} B requested); \
+         internal heap {} -> {} B free, largest block {} -> {} B",
+        start.wrapping_add(size),
+        before.free,
+        after.free,
+        before.largest_block,
+        after.largest_block,
+    );
 }
 
 fn update_counters(opcua: &Client, publisher: Option<&Publisher>) {
