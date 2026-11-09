@@ -1821,6 +1821,7 @@ dependencies = [
  "env_logger",
  "gateway-core",
  "gateway-opcua",
+ "libc",
  "log",
  "opcua-test-server",
  "regex",
