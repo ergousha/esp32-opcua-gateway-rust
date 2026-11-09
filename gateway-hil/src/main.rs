@@ -71,6 +71,9 @@ usage: gateway-hil --thing NAME --server-host LAN-IP [options]
   --artifacts DIR       where logs and the summary go             (default gateway-hil/artifacts)
   --cleanup             clear the retained tag bundles this run published, except
                         the ones the restored configuration points at
+  --keep-test-config    restore a pre-run configuration that uses the test namespace
+                        (urn:ergousha:opcua-test) instead of taking it for a
+                        leftover and leaving the device disabled
   --restore             put back the configuration a run that did not finish
                         saved in --artifacts, then exit; needs only --thing
 
@@ -93,6 +96,7 @@ struct Args {
     iot_endpoint: Option<String>,
     artifacts: PathBuf,
     cleanup: bool,
+    keep_test_config: bool,
     restore: bool,
 }
 
@@ -123,6 +127,7 @@ fn parse_args() -> Result<Args> {
         iot_endpoint: None,
         artifacts: default_artifacts(),
         cleanup: false,
+        keep_test_config: false,
         restore: false,
     };
     let mut it = std::env::args().skip(1);
@@ -142,6 +147,7 @@ fn parse_args() -> Result<Args> {
             "--iot-endpoint" => args.iot_endpoint = Some(value()?),
             "--artifacts" => args.artifacts = value()?.into(),
             "--cleanup" => args.cleanup = true,
+            "--keep-test-config" => args.keep_test_config = true,
             "--restore" => args.restore = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -329,9 +335,18 @@ async fn run() -> Result<bool> {
     // As late as possible, and on disk before anything changes: from here on
     // nothing may return early, because the device has to be put back.
     banner("PRE-RUN CONFIGURATION");
-    let snapshot = restore::take(&ctx.cloud, &args.thing, &ctx.server.endpoint())
-        .await
-        .context("saving the configuration the run is about to change")?;
+    let snapshot = restore::take(
+        &ctx.cloud,
+        &args.thing,
+        &ctx.server.endpoint(),
+        args.keep_test_config,
+    )
+    .await
+    .context("saving the configuration the run is about to change")?;
+    // Before the file exists: a Ctrl-C that killed the runner after it would
+    // leave a snapshot of a device nothing has changed, and the next run would
+    // insist on a `--restore` first. Caught from here, it just ends the run.
+    catch_interrupts("stops the run and restores the device");
     snapshot.save(&pending)?;
     for line in snapshot.describe() {
         info(line);
@@ -341,12 +356,14 @@ async fn run() -> Result<bool> {
         pending.display()
     ));
     ctx.last_version = snapshot.last_version;
-    catch_interrupts("stops the run and restores the device");
 
     let mut results = Vec::new();
     let interrupted = tokio::select! {
-        () = run_phases(&mut ctx, &args.phases, &mut results) => false,
+        // A signal that came while the snapshot was saved must stop the run
+        // before the first phase has changed anything.
+        biased;
         () = interrupt::wait() => true,
+        () = run_phases(&mut ctx, &args.phases, &mut results) => false,
     };
     if interrupted {
         // The phase in flight is the first one without a result.
@@ -367,6 +384,7 @@ async fn run() -> Result<bool> {
     let changed = !published.is_empty();
     let restored = restore::finish(
         &mut ctx.cloud,
+        ctx.monitor.as_ref(),
         &snapshot,
         ctx.last_version,
         &mut published,
@@ -437,11 +455,15 @@ async fn restore_pending(args: &Args, repo: &Path, pending: &Path) -> Result<boo
     if args.cleanup {
         info("--cleanup does nothing here: the list of bundles the run published died with it");
     }
+    if args.keep_test_config {
+        info("--keep-test-config does nothing here: the run that saved the snapshot decided");
+    }
     let mut cloud = Cloud::new(&args.thing, &args.region, &iot_endpoint(args, repo)?).await?;
     catch_interrupts("stops waiting for the device");
 
     let restored = restore::finish(
         &mut cloud,
+        None,
         &snapshot,
         snapshot.last_version,
         &mut Vec::new(),
