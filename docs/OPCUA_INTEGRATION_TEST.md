@@ -545,6 +545,7 @@ cargo run -p gateway-hil --target host-tuple -- \
 | `--phases a,b` | Run a subset. |
 | `--cleanup` | Clear the retained tag bundles the run published, so a later boot cannot pick up a stale config from a forgotten run. The bundle the restored configuration points at, and the pre-run one, are kept (§7.4). |
 | `--restore` | Put back the configuration a run that did not finish saved, then exit (§7.4). Needs only `--thing`. |
+| `--keep-test-config` | Restore a pre-run configuration in the test namespace (`urn:ergousha:opcua-test`) as found, instead of taking it for a leftover and leaving the device disabled (§7.4). |
 | `--artifacts DIR` | Where the serial log and JSON summary land (default `gateway-hil/artifacts/`). |
 | `--iot-endpoint HOST` | IoT data endpoint, if not the one in `cfg.toml`. |
 | `--offline` | Run the phases that need no route from the device to this host (§7.3). Requires `--port`. |
@@ -611,7 +612,13 @@ A run that changed nothing (`--phases preflight`) restores nothing.
   written after the restore, that shows the device on it: `cfg_v` at the new
   version, or `connecting`/`error` naming the restored endpoint (the pre-run
   server need not be reachable from the test LAN), or `idle` when it is
-  disabled.
+  disabled. A disabled config leaves `cfg_v` alone, so a device that already
+  reported `idle` before the restore — the run ended in `disable`, or a
+  rejected config left it there — would pass that at once, read or not. Then
+  the serial log decides instead: the firmware logs
+  `shadow v…: config v<N>: OPC UA disabled` when it reads the restore. Without
+  `--port` such a restore is recorded unconfirmed (`confirmed: null` and a
+  note), not failed: the shadow says disabled either way.
 
 The result is the `restore` phase of the summary. The `restore :` line and the
 `restore` object of `summary-*.json` say what was put back, under which
@@ -625,16 +632,18 @@ configuration cannot or must not go back:
 | --- | --- |
 | no `desired` | There is nothing to go back to. |
 | `desired` dials this run's own endpoint | It was left by an earlier run, and the server is stopping. |
+| `desired` uses the test namespace `urn:ergousha:opcua-test` | Only `opcua-test-server` serves it, so a run left it, most likely from another host whose server is gone too. `--keep-test-config` restores it as found. |
 | the bundle it names is gone | Its tags are unknown. An earlier `--cleanup` could do this. |
 | it fails the firmware's own checks (`AppliedConfig::new`) | The device was refusing it, not running it. Re-issued under a fresh digest it would be accepted. |
 
-The run then prints the pre-run document in a warning. A pre-run config that
-uses the test namespace but some other host, as a run from another machine
-leaves it, is restored as found, with a note saying so.
+The run then prints the pre-run document in a warning. `--keep-test-config` is
+saved with the snapshot, so a later `--restore` decides as the run did.
 
 **Interrupted runs.** The first Ctrl-C (or, on Unix, SIGTERM) stops the phases
-and restores the device without waiting for it to confirm; a second one quits
-at once. The snapshot is written to `<artifacts>/restore-<thing>.json` before
+and restores the device without waiting for it to confirm; a second one,
+either signal, quits at once. The runner catches it from just before it saves
+the snapshot, so one that comes earlier still ends the run without a file to
+`--restore`. The snapshot is written to `<artifacts>/restore-<thing>.json` before
 the first phase and removed once the restore has gone through. It stays behind
 when a run dies first — killed, or stopped by a second Ctrl-C — and when the
 restore fails, which also exits non-zero and prints what to do. The next run on

@@ -15,6 +15,7 @@
 
 pub mod publisher;
 
+use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
@@ -27,11 +28,12 @@ use gateway_opcua::Client;
 
 use crate::device_id::{self, DeviceIdentity};
 use crate::job_store::JobStore;
-use crate::jobs::JobsClient;
+use crate::jobs::{JobsClient, Link, Ota, RESTART_GRACE};
 use crate::mqtt_util::{self, MqttEvent};
 use crate::settings_store::SettingsStore;
 use crate::shadow::ConfigPlane;
 use crate::{config, ota};
+use gateway_core::jobs::client::Next;
 
 use publisher::Publisher;
 
@@ -84,12 +86,24 @@ pub fn run(id: &DeviceIdentity, job_store: JobStore) -> Result<()> {
 
     let opcua = start_opcua();
 
-    let mut jobs = JobsClient::new(&id.thing_name, job_store, boot);
+    let mut jobs = JobsClient::new(&id.thing_name, job_store, Ota, boot);
     let mut config_plane = ConfigPlane::new(&id.thing_name, opcua.clone());
     let mut store = SettingsStore::new().context("opening the OPC UA settings store")?;
+    // Events the Jobs client took off the channel while it waited for an
+    // answer of its own; handled before the channel is read again.
+    let mut backlog: VecDeque<MqttEvent> = VecDeque::new();
+    macro_rules! link {
+        () => {
+            &mut Link {
+                client: &mut session.client,
+                events: &session.events,
+                backlog: &mut backlog,
+            }
+        };
+    }
 
     config_plane.bootstrap(&store);
-    jobs.start(&mut session.client)?;
+    jobs.start(link!()).map_err(anyhow::Error::msg)?;
     config_plane.start(&mut session.client)?;
 
     let mut publisher: Option<Publisher> = None;
@@ -97,16 +111,19 @@ pub fn run(id: &DeviceIdentity, job_store: JobStore) -> Result<()> {
     let mut stack_probe = StackProbe::new();
 
     loop {
-        match session
-            .events
-            .recv_timeout(Duration::from_millis(TICK_MS as u64))
-        {
+        let event = match backlog.pop_front() {
+            Some(event) => Ok(event),
+            None => session
+                .events
+                .recv_timeout(Duration::from_millis(TICK_MS as u64)),
+        };
+        match event {
             Ok(MqttEvent::Connected) => {
                 // Subscriptions do not survive a dropped session, and the
                 // shadow response is not retained, so both planes restart.
                 log::info!("MQTT (re)connected; restoring subscriptions");
-                if let Err(e) = jobs.start(&mut session.client) {
-                    log::error!("could not restore Jobs subscriptions: {e:#}");
+                if let Err(e) = jobs.start(link!()) {
+                    log::error!("could not restore Jobs subscriptions: {e}");
                 }
                 if let Err(e) = config_plane.start(&mut session.client) {
                     log::error!("could not restore shadow subscriptions: {e:#}");
@@ -117,7 +134,11 @@ pub fn run(id: &DeviceIdentity, job_store: JobStore) -> Result<()> {
             }
             Ok(MqttEvent::Message { topic, data }) => {
                 if jobs.owns(&topic) {
-                    jobs.handle(&topic, &data, &mut session.client);
+                    if jobs.handle(&topic, &data, link!()) == Next::Restart {
+                        std::thread::sleep(RESTART_GRACE);
+                        // SAFETY: always sound to call; it does not return.
+                        unsafe { esp_idf_svc::sys::esp_restart() };
+                    }
                 } else {
                     config_plane.handle(&topic, &data, &mut session.client, &mut store);
                 }
@@ -158,7 +179,7 @@ pub fn run(id: &DeviceIdentity, job_store: JobStore) -> Result<()> {
 
         update_counters(&opcua, publisher.as_ref());
         config_plane.report(&mut session.client, now);
-        jobs.tick(&mut session.client);
+        jobs.tick(link!(), Instant::now());
         stack_probe.check();
     }
 }

@@ -157,7 +157,14 @@ impl ConfigPlane {
         }
 
         if !doc.settings.enabled {
-            log::info!("shadow v{}: OPC UA disabled", doc.version);
+            // With the config version: a disabled config leaves `cfg_v`
+            // alone, so this line is the only sign of which one was read
+            // (`gateway-hil`'s restore waits for it).
+            log::info!(
+                "shadow v{}: config v{}: OPC UA disabled",
+                doc.version,
+                doc.settings.cfg.v
+            );
             self.pending = None;
             if self.opcua.disable().is_err() {
                 log::error!("OPC UA task is gone; disable not applied");

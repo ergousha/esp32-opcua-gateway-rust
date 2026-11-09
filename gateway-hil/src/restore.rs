@@ -17,13 +17,22 @@
 //!   there. A field the run added and the pre-run document lacks — the test
 //!   namespace's `ns_uri`, say — would survive a plain update and quietly
 //!   change the restored config.
-//! * **Never the run's own server.** A pre-run document that dials this run's
+//! * **Never a test server.** A pre-run document that dials this run's
 //!   endpoint is left over from an earlier run; restoring it would point the
-//!   device at a server that is about to stop.
+//!   device at a server that is about to stop. So is one in the test
+//!   namespace, which only `opcua-test-server` serves: typically a run from
+//!   another host, whose server is gone too. `--keep-test-config` restores
+//!   that one all the same.
 //!
 //! When the pre-run config cannot be restored — there was none, its bundle is
 //! gone, or it is such a leftover — the device is left disabled instead, so it
 //! ends `idle` rather than dialling a host that no longer serves.
+//!
+//! Confirming that is the weak spot: the firmware writes `cfg_v` only for a
+//! config it syncs, never for a disabled one, so `idle` is all a report can
+//! show. A device that was idle already shows it whether or not it read the
+//! restore. Then only the serial log can tell (the firmware logs the disabled
+//! config's version); without `--port` the restore is recorded unconfirmed.
 //!
 //! The snapshot is also saved next to the run's artifacts until the restore
 //! has gone through, so a run that died first can be finished with
@@ -43,6 +52,7 @@ use opcua_test_server::documents::{self, Desired};
 use serde_json::{json, Map, Value};
 
 use crate::cloud::{cfg_version, now_ms, Cloud};
+use crate::device::SerialMonitor;
 use crate::interrupt;
 use crate::phases::{show, truncate};
 use crate::report::{banner, info, PhaseResult};
@@ -77,6 +87,10 @@ pub struct Snapshot {
     pub desired: Option<Value>,
     /// The retained bundle `desired.cfg.topic` named, if it was there.
     pub bundle: Option<Retained>,
+    /// `--keep-test-config`: a pre-run config in the test namespace is
+    /// restored rather than taken for a leftover. Kept with the snapshot so a
+    /// later `--restore` decides as the run did.
+    pub keep_test_config: bool,
 }
 
 /// Why the device is left disabled rather than on its pre-run config.
@@ -86,6 +100,9 @@ pub enum Fallback {
     NoPriorConfig,
     /// The pre-run document dialled this run's own server.
     RunsOwnServer(String),
+    /// The pre-run document used the test namespace, so it was left by a run,
+    /// most likely from another host.
+    TestNamespace(String),
     /// The retained bundle the pre-run document named was gone.
     BundleMissing(String),
     /// The pre-run config was not one the device could apply.
@@ -100,6 +117,11 @@ impl fmt::Display for Fallback {
                 f,
                 "the pre-run configuration dialled this run's own server ({endpoint}), \
                  left there by an earlier run"
+            ),
+            Fallback::TestNamespace(endpoint) => write!(
+                f,
+                "the pre-run configuration used the test namespace {NAMESPACE_URI} at \
+                 {endpoint}, so an earlier run left it (--keep-test-config restores it)"
             ),
             Fallback::BundleMissing(topic) => write!(
                 f,
@@ -218,6 +240,9 @@ fn restored(snapshot: &Snapshot, version: u32) -> Result<(Value, Retained), Fall
     if same_endpoint(&settings.instance.endpoint, &snapshot.run_endpoint) {
         return Err(Fallback::RunsOwnServer(settings.instance.endpoint));
     }
+    if settings.instance.ns_uri.as_deref() == Some(NAMESPACE_URI) && !snapshot.keep_test_config {
+        return Err(Fallback::TestNamespace(settings.instance.endpoint));
+    }
     let bundle = snapshot
         .bundle
         .as_ref()
@@ -271,9 +296,12 @@ fn same_endpoint(a: &str, b: &str) -> bool {
 /// is disabled; otherwise synced to it, or trying to reach its server. Only
 /// a successful sync writes `cfg_v`, and the pre-run server need not be
 /// reachable from where the device is now.
+///
+/// For a device that was [`idle_already`] this proves nothing; see
+/// [`disabled_line`].
 pub fn took_up(plan: &Plan, reported: &Value) -> bool {
     let state = reported["state"].as_str().unwrap_or("");
-    if !plan.desired["enabled"].as_bool().unwrap_or(true) {
+    if is_disabled(plan) {
         return state == "idle";
     }
     let endpoint = plan.desired["instance"]["endpoint"]
@@ -285,6 +313,23 @@ pub fn took_up(plan: &Plan, reported: &Value) -> bool {
             && reported["last_error"]
                 .as_str()
                 .is_some_and(|e| names_endpoint(e, endpoint)))
+}
+
+fn is_disabled(plan: &Plan) -> bool {
+    !plan.desired["enabled"].as_bool().unwrap_or(true)
+}
+
+/// Whether the device's reports cannot show it taking `plan` up: the restore
+/// leaves it disabled, and it already reported `idle` before the restore, so
+/// its next routine report says `idle` whether or not it read the restore.
+pub fn idle_already(plan: &Plan, reported_before: Option<&Value>) -> bool {
+    is_disabled(plan) && reported_before.is_some_and(|r| r["state"] == "idle")
+}
+
+/// What the firmware logs when it reads the disabled config `plan` restores;
+/// a regular expression.
+pub fn disabled_line(plan: &Plan) -> String {
+    format!(r"config v{}: OPC UA disabled\b", plan.version)
 }
 
 /// Whether `error` names `endpoint` as a whole URL, not as a prefix of a
@@ -364,7 +409,8 @@ impl Snapshot {
                 if ns_uri == Some(NAMESPACE_URI) {
                     lines.push(format!(
                         "note: it uses the test namespace {NAMESPACE_URI}, so it looks left over \
-                         from an earlier gateway-hil run; the device goes back to it all the same"
+                         from an earlier gateway-hil run; --keep-test-config puts it back all \
+                         the same"
                     ));
                 }
             }
@@ -386,6 +432,7 @@ impl Snapshot {
                 "topic": b.topic,
                 "payload": String::from_utf8_lossy(&b.payload),
             })),
+            "keep_test_config": self.keep_test_config,
         })
     }
 
@@ -417,6 +464,7 @@ impl Snapshot {
             last_version: doc["last_version"].as_u64().unwrap_or(0) as u32,
             desired: Some(doc["desired"].clone()).filter(Value::is_object),
             bundle,
+            keep_test_config: doc["keep_test_config"].as_bool().unwrap_or(false),
         })
     }
 
@@ -502,6 +550,7 @@ pub(crate) async fn take(
     planes: &impl Planes,
     thing: &str,
     run_endpoint: &str,
+    keep_test_config: bool,
 ) -> Result<Snapshot> {
     let shadow = planes
         .read_shadow()
@@ -526,18 +575,22 @@ pub(crate) async fn take(
         last_version: shadow.as_ref().map_or(0, cfg_version),
         desired,
         bundle,
+        keep_test_config,
     })
 }
 
 /// Plans against the shadow as it is now and publishes: the bundles first,
 /// so the device finds them the moment the patch sends it looking. Every
 /// topic written is added to `published`.
+///
+/// Also returns `reported` as it was before the restore, for
+/// [`idle_already`].
 pub(crate) async fn apply(
     planes: &impl Planes,
     snapshot: &Snapshot,
     last_version: u32,
     published: &mut Vec<String>,
-) -> Result<Plan> {
+) -> Result<(Plan, Option<Value>)> {
     let shadow = planes
         .read_shadow()
         .await
@@ -565,7 +618,10 @@ pub(crate) async fn apply(
         .write_desired(&plan.patch)
         .await
         .context("updating the opcua shadow's desired")?;
-    Ok(plan)
+    let reported_before = shadow
+        .map(|doc| doc["state"]["reported"].clone())
+        .filter(Value::is_object);
+    Ok((plan, reported_before))
 }
 
 /// Clears what [`to_clear`] allows. What `desired` points at is read back
@@ -621,9 +677,11 @@ pub struct Outcome {
 ///
 /// `changed` is false when the run published nothing; then nothing is
 /// touched. After Ctrl-C the device is not waited for: whoever pressed it
-/// does not want to sit through another three minutes.
+/// does not want to sit through another three minutes. `monitor` confirms a
+/// restore the shadow cannot ([`idle_already`]).
 pub async fn finish(
     cloud: &mut Cloud,
+    monitor: Option<&SerialMonitor>,
     snapshot: &Snapshot,
     last_version: u32,
     published: &mut Vec<String>,
@@ -662,8 +720,9 @@ pub async fn finish(
     }
 
     let since_ms = now_ms();
-    let plan = match apply(&*cloud, snapshot, last_version, published).await {
-        Ok(plan) => plan,
+    let mark = monitor.map(SerialMonitor::mark);
+    let (plan, reported_before) = match apply(&*cloud, snapshot, last_version, published).await {
+        Ok(applied) => applied,
         Err(e) => {
             let error = format!("{e:#}");
             result.check(
@@ -702,16 +761,26 @@ pub async fn finish(
         }
     };
 
+    let idle_already = idle_already(&plan, reported_before.as_ref());
     let confirmed = if interrupt::caught() {
         None
     } else {
+        let confirming = async {
+            match (idle_already, monitor.zip(mark)) {
+                (false, _) => Confirmation::Shadow(confirm(cloud, &plan, since_ms).await),
+                (true, Some((monitor, mark))) => {
+                    Confirmation::Serial(confirm_on_serial(monitor, mark, &plan).await)
+                }
+                (true, None) => Confirmation::Unconfirmed,
+            }
+        };
         tokio::select! {
-            confirmed = confirm(cloud, &plan, since_ms) => Some(confirmed),
+            confirmed = confirming => Some(confirmed),
             () = interrupt::wait() => None,
         }
     };
     let took = match &confirmed {
-        Some((ok, reported)) => {
+        Some(Confirmation::Shadow((ok, reported))) => {
             let mut detail = reported_summary(reported);
             if !ok {
                 if let Some(stale) = cloud.stale_note() {
@@ -724,6 +793,31 @@ pub async fn finish(
             } else {
                 "the device did NOT report taking it up"
             }
+        }
+        Some(Confirmation::Serial(line)) => {
+            let ok = line.is_some();
+            let detail = line.clone().unwrap_or_else(|| {
+                format!(
+                    "no {:?} in the serial log within {} s; the device was idle already, so \
+                     its reports cannot tell",
+                    disabled_line(&plan),
+                    CONFIRM_TIMEOUT.as_secs()
+                )
+            });
+            result.check("the device took it up (serial log)", ok, detail);
+            if ok {
+                "the device took it up (serial log)"
+            } else {
+                "the device did NOT log taking it up"
+            }
+        }
+        Some(Confirmation::Unconfirmed) => {
+            let why = "the device was idle already, and a disabled config leaves \
+                       `cfg_v` alone, so its reports cannot show it taking the restore up; \
+                       pass --port to confirm on the serial log";
+            info(format!("unconfirmed: {why}"));
+            result.note = format!("unconfirmed: {why}");
+            "unconfirmed (the device was idle already)"
         }
         None => {
             info("not waiting for the device to take it up: the run was interrupted");
@@ -740,9 +834,42 @@ pub async fn finish(
     Outcome {
         result,
         line,
-        json: record(action, Some(&plan), confirmed.map(|(ok, _)| ok), None),
+        json: record(
+            action,
+            Some(&plan),
+            confirmed.as_ref().and_then(Confirmation::ok),
+            None,
+        ),
         settled: true,
     }
+}
+
+/// How [`finish`] told whether the device took the restore up.
+enum Confirmation {
+    /// From a fresh report: whether it showed the restore, and the report.
+    Shadow((bool, Value)),
+    /// From the serial log, for a device that was idle already: the line, if
+    /// it came.
+    Serial(Option<String>),
+    /// Not at all: the device was idle already, and there is no serial log.
+    Unconfirmed,
+}
+
+impl Confirmation {
+    /// `summary.json`'s `confirmed`: `null` when nothing could tell.
+    fn ok(&self) -> Option<bool> {
+        match self {
+            Confirmation::Shadow((ok, _)) => Some(*ok),
+            Confirmation::Serial(line) => Some(line.is_some()),
+            Confirmation::Unconfirmed => None,
+        }
+    }
+}
+
+async fn confirm_on_serial(monitor: &SerialMonitor, mark: u64, plan: &Plan) -> Option<String> {
+    info("the device was idle already; waiting for it to log the restored configuration…");
+    let pattern = regex::Regex::new(&disabled_line(plan)).expect("valid pattern");
+    monitor.wait_for(&pattern, mark, CONFIRM_TIMEOUT).await
 }
 
 async fn confirm(cloud: &mut Cloud, plan: &Plan, since_ms: i64) -> (bool, Value) {
@@ -939,6 +1066,7 @@ mod tests {
                 payload,
             }),
             desired,
+            keep_test_config: false,
         }
     }
 
@@ -971,7 +1099,7 @@ mod tests {
     #[tokio::test]
     async fn a_run_is_undone_apart_from_the_version() {
         let fake = configured();
-        let snapshot = take(&fake, THING, RUN).await.unwrap();
+        let snapshot = take(&fake, THING, RUN, false).await.unwrap();
         assert_eq!(snapshot.last_version, 8);
         let mut published = fake.run_the_scenario().await;
         // The run overwrote the pre-run bundle with its own v8.
@@ -980,7 +1108,7 @@ mod tests {
             pre_run_bundle()
         );
 
-        let plan = apply(&fake, &snapshot, 8, &mut published).await.unwrap();
+        let (plan, _) = apply(&fake, &snapshot, 8, &mut published).await.unwrap();
         assert_eq!(plan.fallback, None);
         assert_eq!(plan.version, 9);
 
@@ -1013,11 +1141,11 @@ mod tests {
     #[tokio::test]
     async fn a_device_without_prior_config_is_left_disabled() {
         let fake = Fake::default();
-        let snapshot = take(&fake, THING, RUN).await.unwrap();
+        let snapshot = take(&fake, THING, RUN, false).await.unwrap();
         assert_eq!(snapshot.desired, None);
         let mut published = vec![fake.publish(1, |_| {}).await];
 
-        let plan = apply(&fake, &snapshot, 1, &mut published).await.unwrap();
+        let (plan, before) = apply(&fake, &snapshot, 1, &mut published).await.unwrap();
         assert_eq!(plan.fallback, Some(Fallback::NoPriorConfig));
         let desired = fake.desired.borrow().clone();
         assert_eq!(desired["enabled"], false);
@@ -1028,6 +1156,59 @@ mod tests {
 
         assert!(took_up(&plan, &json!({"state": "idle"})));
         assert!(!took_up(&plan, &json!({"state": "running", "cfg_v": 2})));
+        // It was running the run's v1, so an idle report is news.
+        assert!(!idle_already(&plan, before.as_ref()));
+    }
+
+    /// A device the run left idle (the scenario's v7 disables it, and an
+    /// interrupted run can stop there) reports `idle` whether or not it read
+    /// the restore; only the serial log can tell.
+    #[tokio::test]
+    async fn an_idle_device_left_disabled_cannot_confirm_through_its_reports() {
+        let fake = Fake::default();
+        let snapshot = take(&fake, THING, RUN, false).await.unwrap();
+        let mut published = vec![fake.publish(7, |d| d.enabled = false).await];
+        *fake.reported.borrow_mut() = json!({ "state": "idle", "cfg_v": 6 });
+
+        let (plan, before) = apply(&fake, &snapshot, 7, &mut published).await.unwrap();
+        assert_eq!(plan.version, 8);
+        assert!(idle_already(&plan, before.as_ref()));
+        let line = regex::Regex::new(&disabled_line(&plan)).unwrap();
+        assert!(line.is_match(
+            "I (123) esp32_opcua_gateway::shadow: shadow v41: config v8: OPC UA disabled"
+        ));
+        assert!(!line.is_match("shadow v40: config v7: OPC UA disabled"));
+        assert!(!line.is_match("shadow v40: config v80: OPC UA disabled"));
+    }
+
+    #[test]
+    fn idle_before_an_enabled_restore_is_no_obstacle() {
+        let snapshot = snapshot_of(Some(pre_run_desired()), Some(pre_run_bundle()));
+        let plan = plan(&snapshot, None, 9, None);
+        assert!(!idle_already(&plan, Some(&json!({"state": "idle"}))));
+    }
+
+    #[test]
+    fn a_test_namespace_config_from_another_host_is_a_leftover() {
+        let bundle = documents::bundle(THING, 8, &catalogue::tags());
+        let other_host = "opc.tcp://192.168.50.77:4855/ergousha/test";
+        let leftover = Desired::new(other_host, 2).to_json(THING, &bundle);
+        assert_eq!(leftover["instance"]["ns_uri"], NAMESPACE_URI);
+        let mut snapshot = snapshot_of(Some(leftover), Some(bundle.payload));
+
+        let disabled = plan(&snapshot, None, 9, None);
+        assert_eq!(
+            disabled.fallback,
+            Some(Fallback::TestNamespace(other_host.into()))
+        );
+        assert_eq!(disabled.desired["enabled"], false);
+
+        snapshot.keep_test_config = true;
+        let kept = plan(&snapshot, None, 9, None);
+        assert_eq!(kept.fallback, None);
+        assert_eq!(kept.desired["instance"]["endpoint"], other_host);
+        // And the choice outlives the file.
+        assert_eq!(Snapshot::from_json(&snapshot.to_json()).unwrap(), snapshot);
     }
 
     /// Acceptance: `--cleanup` keeps the bundle `desired` points at, and the
@@ -1035,7 +1216,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_keeps_the_bundles_the_device_needs() {
         let fake = configured();
-        let snapshot = take(&fake, THING, RUN).await.unwrap();
+        let snapshot = take(&fake, THING, RUN, false).await.unwrap();
         let mut published = fake.run_the_scenario().await;
         apply(&fake, &snapshot, 8, &mut published).await.unwrap();
 
@@ -1055,7 +1236,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_after_a_failed_restore_keeps_what_the_device_runs_on() {
         let fake = configured();
-        let snapshot = take(&fake, THING, RUN).await.unwrap();
+        let snapshot = take(&fake, THING, RUN, false).await.unwrap();
         let published = fake.run_the_scenario().await;
         // No restore: desired still points at the run's v8.
         let (cleared, kept) = cleanup(&fake, &snapshot, &published).await.unwrap();

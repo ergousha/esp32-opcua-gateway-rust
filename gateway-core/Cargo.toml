@@ -8,4 +8,5 @@ description = "Pure, host-testable core logic for the ESP32 OPC UA gateway (no e
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+log = "0.4"
 sha2 = "0.10"
