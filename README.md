@@ -94,7 +94,7 @@ flowchart TB
         tloop["telemetry/mod.rs<br/>MQTT event loop"]
         plane["shadow.rs — ConfigPlane<br/>shadow + retained tag bundle"]
         store["settings_store.rs<br/>config cache, opcua NVS partition"]
-        jobs["jobs.rs · ota.rs<br/>AWS IoT Jobs, OTA"]
+        jobs["jobs.rs · ota.rs · job_store.rs<br/>AWS IoT Jobs, OTA,<br/>pending job in NVS"]
         publ["telemetry/publisher.rs<br/>batching, rate limit"]
         mqtt["mqtt_util.rs<br/>esp-mqtt, mutual TLS"]
     end
@@ -106,7 +106,7 @@ flowchart TB
         shared["SampleQueue + Reported<br/>shared state"]
     end
 
-    core["gateway-core — pure logic<br/>settings · bundle · value encoding ·<br/>batching · diff · plan · backoff"]
+    core["gateway-core — pure logic<br/>settings · bundle · value encoding ·<br/>batching · diff · plan · backoff ·<br/>OTA job outcome"]
     lib["async-opcua 0.19"]
 
     boot --> net --> ident --> tloop
@@ -194,6 +194,7 @@ sequenceDiagram
     GW->>IOT: connect as thingName with its own certificate
     GW->>GW: mark the running OTA slot valid
     GW->>GW: apply the cached OPC UA config from NVS, if any
+    GW->>IOT: report the outcome of the OTA job the previous boot left pending, if any
     GW->>IOT: subscribe to Jobs and the opcua shadow, request the shadow
 ```
 
@@ -276,19 +277,45 @@ sequenceDiagram
     participant BE as Operator
     participant IOT as AWS IoT Jobs
     participant GW as Gateway
+    participant NVS as NVS (nvs partition)
     participant IMG as Image host
 
-    BE->>IOT: create job with operation firmware_update and an https download_url
+    BE->>IOT: create job: firmware_update, firmware_version, https download_url
     IOT-->>GW: notify-next
     GW->>IOT: $next/get
     IOT-->>GW: job document
-    GW->>IOT: status IN_PROGRESS
-    GW->>IMG: GET download_url (https only, plaintext refused)
-    IMG-->>GW: image, streamed into the inactive OTA slot
-    GW->>IOT: status SUCCEEDED
-    GW->>GW: restart into the new slot
-    Note over GW: The new image marks itself valid only after it reaches AWS IoT again.<br/>If it resets before that, the bootloader rolls back to the previous slot.
+    alt firmware_version is the running version
+        GW->>IOT: SUCCEEDED, nothing downloaded
+    else any other version
+        GW->>IOT: IN_PROGRESS, phase downloading
+        GW->>IMG: GET download_url (https only, plaintext refused)
+        IMG-->>GW: image, streamed into the inactive OTA slot and verified
+        GW->>NVS: record job id, target version, target slot
+        GW->>GW: make the new slot the boot slot
+        GW->>IOT: IN_PROGRESS, phase rebooting
+        GW->>GW: restart into the new slot
+        Note over GW: The new image marks itself valid only after it reaches AWS IoT again.<br/>If it resets before that, the bootloader rolls back to the previous slot.
+        GW->>GW: whichever image boots connects, marks itself valid,<br/>and compares its slot and version with the record
+        alt the new image runs
+            GW->>IOT: SUCCEEDED, reported by the new image
+        else the previous image runs
+            GW->>IOT: FAILED, reason rolled back
+        end
+        IOT-->>GW: update accepted, or rejected because the execution already ended
+        GW->>NVS: clear the record
+    end
 ```
+
+The image that downloads an update never reports it SUCCEEDED: until the new
+image has reached AWS IoT and marked itself valid, the bootloader can still
+roll it back. The outcome is reported by whichever image runs after the
+reboot, from the record kept in NVS. Until the Jobs service has acknowledged
+it, the device takes no other job, and the execution the service offers again
+at boot (still IN_PROGRESS) is settled, never downloaded a second time. A fresh
+image that fails before it can mark itself valid restarts rather than stopping,
+so the bootloader does roll it back. The full flow, its edge cases, and a
+hardware check for a good and a bad update:
+[`docs/FIRMWARE_INTEGRATION.md`](docs/FIRMWARE_INTEGRATION.md) §4.
 
 ### OPC UA driver lifecycle
 
@@ -325,7 +352,7 @@ completes within 3 s even if the server never answers.
 | `$aws/things/{thing}/shadow/name/opcua/get` (`/accepted`, `/rejected`) | both | config | read `state.desired` |
 | `$aws/things/{thing}/shadow/name/opcua/update` (`/delta`, `/rejected`) | both | config | change notifications in, `state.reported` out |
 | `cmd/{thing}/opcua/tags/v{N}` | cloud → device, retained | config | the tag bundle for config version N |
-| `$aws/things/{thing}/jobs/notify-next`, `…/jobs/$next/get` (`/accepted`), `…/jobs/{jobId}/update` | both | control | OTA jobs and their status |
+| `$aws/things/{thing}/jobs/notify-next`, `…/jobs/$next/get` (`/accepted`), `…/jobs/{jobId}/update` (`/accepted`, `/rejected`) | both | control | OTA jobs and their status |
 | `dt/{thing}/opcua` (set in the shadow's `telemetry.topic`) | device → cloud | data | telemetry batches |
 
 The device policy must grant the named-shadow topics as well as the others: an
@@ -347,7 +374,7 @@ included ([`docs/OPCUA_INTEGRATION_TEST.md`](docs/OPCUA_INTEGRATION_TEST.md) §8
 | Backpressure | Coalescing queue, count/size/age batching, spaced publishes | Bounded heap; well inside AWS IoT publish limits. |
 | Memory budget | 250-tag cap, 16 KiB OPC UA messages, type table preloaded at boot, mbedTLS dynamic buffers | ~300 KB of heap and no PSRAM. |
 | Identity | Per-device X.509 from fleet provisioning by claim, gated by a MAC + secret registry | Zero-touch, and only registered devices can enrol. (The PoC secret is shared and built into the firmware; per-device secrets are a production item, see [`src/config.rs`](src/config.rs).) |
-| Updates | HTTPS-only OTA into dual 7 MiB slots, rollback until the new image reaches AWS | A bad image cannot brick a unit in the field. |
+| Updates | HTTPS-only OTA into dual 7 MiB slots, rollback until the new image reaches AWS; the job outcome reported after the reboot, by the image that actually runs | A bad image cannot brick a unit in the field, and a rollback cannot pass for a success. |
 | Testability | Everything but device I/O builds for the host; OPC UA tested against a server from the same library | Fast feedback, and no dependence on a LAN or host firewall. |
 | Flash layout | Frozen, with spare partitions reserved up front | The partition table is not rewritten by OTA. |
 
@@ -362,7 +389,7 @@ bench.
 
 | Partition | Offset | Size | Holds |
 | --- | --- | --- | --- |
-| `nvs` | `0x9000` | 24 KiB | device identity (AWS IoT certificate + key) |
+| `nvs` | `0x9000` | 24 KiB | device identity (AWS IoT certificate + key), the pending OTA job |
 | `phy_init` | `0xf000` | 4 KiB | RF calibration |
 | `otadata` | `0x10000` | 8 KiB | which OTA slot boots |
 | `nvs_key` | `0x12000` | 4 KiB | reserved: NVS encryption keys |
@@ -389,6 +416,7 @@ everything else builds and runs on the development host.
 │   ├── shadow.rs            # config plane: `opcua` named shadow + tag bundle
 │   ├── settings_store.rs    # NVS cache of the last applied OPC UA config
 │   ├── jobs.rs, ota.rs      # AWS IoT Jobs / OTA
+│   ├── job_store.rs         # NVS record of the OTA job the next boot must report
 │   └── mqtt_util.rs         # mutual-TLS MQTT client wrapper
 ├── gateway-core/            # pure logic: settings, bundle, encoding, batching, backoff
 ├── gateway-opcua/           # the OPC UA client: session, subscriptions, reconnect

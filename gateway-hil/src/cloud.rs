@@ -10,10 +10,10 @@
 //!   device that reboots gets it without any request/response dance.
 //!
 //! Everything here goes through IAM-authorised HTTPS — `UpdateThingShadow`,
-//! `GetThingShadow`, `Publish` with `retain`, and CloudWatch `FilterLogEvents`
-//! — so the harness needs no device certificate of its own. Telemetry is
-//! observed through the `dt/+/opcua` IoT rule rather than by subscribing,
-//! which is what keeps that true.
+//! `GetThingShadow`, `Publish` with `retain`, `GetRetainedMessage`, and
+//! CloudWatch `FilterLogEvents` — so the harness needs no device certificate
+//! of its own. Telemetry is observed through the `dt/+/opcua` IoT rule rather
+//! than by subscribing, which is what keeps that true.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -92,7 +92,24 @@ impl Cloud {
         self.publish_retained(topic, Vec::new()).await
     }
 
-    async fn publish_retained(&self, topic: &str, payload: Vec<u8>) -> Result<()> {
+    /// The message retained on `topic`, if there is one.
+    pub async fn get_retained(&self, topic: &str) -> Result<Option<Vec<u8>>> {
+        match self.data.get_retained_message().topic(topic).send().await {
+            Ok(out) => Ok(out
+                .payload()
+                .map(|b| b.as_ref().to_vec())
+                .filter(|p| !p.is_empty())),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|se| se.is_resource_not_found_exception()) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e).with_context(|| format!("GetRetainedMessage {topic}")),
+        }
+    }
+
+    pub async fn publish_retained(&self, topic: &str, payload: Vec<u8>) -> Result<()> {
         self.data
             .publish()
             .topic(topic)
@@ -146,14 +163,6 @@ impl Cloud {
             }
             Err(e) => Err(e).context("GetThingShadow"),
         }
-    }
-
-    /// Highest config version the shadow knows of, desired or reported.
-    pub async fn last_cfg_version(&self) -> Result<u32> {
-        let doc = self.get_shadow().await?.unwrap_or(Value::Null);
-        let desired = doc["state"]["desired"]["cfg"]["v"].as_u64().unwrap_or(0);
-        let reported = doc["state"]["reported"]["cfg_v"].as_u64().unwrap_or(0);
-        Ok(desired.max(reported) as u32)
     }
 
     /// The `reported` block and when AWS last wrote any of it.
@@ -269,6 +278,13 @@ impl Cloud {
         }
         batches
     }
+}
+
+/// Highest config version a shadow document knows of, desired or reported.
+pub fn cfg_version(doc: &Value) -> u32 {
+    let desired = doc["state"]["desired"]["cfg"]["v"].as_u64().unwrap_or(0);
+    let reported = doc["state"]["reported"]["cfg_v"].as_u64().unwrap_or(0);
+    desired.max(reported) as u32
 }
 
 /// Newest `timestamp` anywhere under a shadow `metadata` subtree, in ms.

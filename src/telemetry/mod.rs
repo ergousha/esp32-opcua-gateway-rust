@@ -18,7 +18,7 @@ pub mod publisher;
 use std::ffi::CStr;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
@@ -26,6 +26,7 @@ use gateway_core::health::DriverState;
 use gateway_opcua::Client;
 
 use crate::device_id::{self, DeviceIdentity};
+use crate::job_store::JobStore;
 use crate::jobs::JobsClient;
 use crate::mqtt_util::{self, MqttEvent};
 use crate::settings_store::SettingsStore;
@@ -52,8 +53,9 @@ const OPCUA_TASK_NAME: &CStr = c"opcua";
 const TICK_MS: i64 = 50;
 
 /// Connects with the device identity and runs until something unrecoverable
-/// happens.
-pub fn run(id: &DeviceIdentity) -> Result<()> {
+/// happens. `job_store` holds the OTA job, if any, whose outcome the previous
+/// boot left for this one to report.
+pub fn run(id: &DeviceIdentity, job_store: JobStore) -> Result<()> {
     log::info!("starting gateway. thing={}", id.thing_name);
 
     let mut session = mqtt_util::connect(
@@ -72,13 +74,17 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
 
     // Only once we are on the network with a working identity is this image
     // worth keeping; before this point a rollback is the correct outcome.
-    if let Err(e) = ota::mark_valid() {
+    let valid = ota::mark_valid();
+    if let Err(e) = &valid {
         log::warn!("could not mark the firmware valid: {e:#}");
     }
+    // Read after marking valid, so a pending OTA job is settled with the
+    // verdict on this image already in.
+    let boot = ota::boot_facts(&valid);
 
     let opcua = start_opcua();
 
-    let jobs = JobsClient::new(&id.thing_name);
+    let mut jobs = JobsClient::new(&id.thing_name, job_store, boot);
     let mut config_plane = ConfigPlane::new(&id.thing_name, opcua.clone());
     let mut store = SettingsStore::new().context("opening the OPC UA settings store")?;
 
@@ -152,6 +158,7 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
 
         update_counters(&opcua, publisher.as_ref());
         config_plane.report(&mut session.client, now);
+        jobs.tick(&mut session.client);
         stack_probe.check();
     }
 }
@@ -186,14 +193,31 @@ impl StackProbe {
     }
 }
 
+/// How long a fresh OTA image keeps trying to reach AWS IoT before it gives
+/// up and lets the bootloader roll it back.
+const UNVERIFIED_CONNECT_PATIENCE: Duration = Duration::from_secs(180);
+
 fn wait_for_connection(session: &mqtt_util::MqttSession) -> Result<()> {
+    // Giving up on an unverified image rolls it back, and its job is then
+    // reported FAILED for good; one TLS or DNS hiccup on its first boot must
+    // not decide that. esp-mqtt keeps reconnecting on its own meanwhile.
+    let patience = if ota::running_unverified() {
+        UNVERIFIED_CONNECT_PATIENCE
+    } else {
+        Duration::ZERO
+    };
+    let deadline = Instant::now() + patience;
     loop {
-        match session.events.recv_timeout(Duration::from_secs(30)) {
+        let failure = match session.events.recv_timeout(Duration::from_secs(30)) {
             Ok(MqttEvent::Connected) => return Ok(()),
-            Ok(MqttEvent::Disconnected) => bail!("connection lost before it was established"),
+            Ok(MqttEvent::Disconnected) => "connection lost before it was established",
             Ok(_) => continue,
-            Err(_) => bail!("timed out connecting to AWS IoT Core"),
+            Err(_) => "timed out connecting to AWS IoT Core",
+        };
+        if Instant::now() >= deadline {
+            bail!("{failure}");
         }
+        log::warn!("{failure}; this image is not verified yet, so still trying");
     }
 }
 
@@ -244,8 +268,9 @@ fn start_opcua() -> Client {
         if let Err(e) = named.set() {
             log::warn!("could not name the OPC UA thread: {e}");
         }
+        let heap = InternalHeap::now();
         let spawned = gateway_opcua::spawn_thread(driver, "opcua", OPCUA_STACK_BYTES)
-            .map(drop)
+            .map(|_| heap)
             .context("starting the OPC UA thread");
         // The configuration is per calling thread; later spawns must not inherit the name.
         if let Err(e) = ThreadSpawnConfiguration::default().set() {
@@ -253,14 +278,76 @@ fn start_opcua() -> Client {
         }
         spawned
     });
-    if let Err(e) = started {
-        log::error!("OPC UA is unavailable: {e:#}");
-        client.update_reported(|r| {
-            r.state = DriverState::Error;
-            r.set_error(format!("OPC UA did not start: {e:#}"));
-        });
+    match started {
+        Ok(heap_before) => log_stack_placement(heap_before),
+        Err(e) => {
+            log::error!("OPC UA is unavailable: {e:#}");
+            client.update_reported(|r| {
+                r.state = DriverState::Error;
+                r.set_error(format!("OPC UA did not start: {e:#}"));
+            });
+        }
     }
     client
+}
+
+/// Free internal heap, in total and as its largest block: what a thread stack
+/// is carved from.
+#[derive(Clone, Copy)]
+struct InternalHeap {
+    free: usize,
+    largest_block: usize,
+}
+
+impl InternalHeap {
+    fn now() -> Self {
+        use esp_idf_svc::sys::{
+            heap_caps_get_free_size, heap_caps_get_largest_free_block, MALLOC_CAP_INTERNAL,
+        };
+
+        // Safe: read-only queries of the allocator.
+        unsafe {
+            Self {
+                free: heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                largest_block: heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+            }
+        }
+    }
+}
+
+/// Logs, once at boot, what stack the OPC UA task actually got, where it is,
+/// and what starting the thread cost the internal heap.
+///
+/// The stack is a block of internal heap, and FreeRTOS only notices an
+/// overflow by a changed canary at its low end, which the heap block below it
+/// can overrun just as well. A 48 KiB stack that "overflowed" on the first
+/// connect where 40 KiB did not is unexplained; this is the first thing to
+/// look at when it is tried again.
+fn log_stack_placement(before: InternalHeap) {
+    use esp_idf_svc::sys::{heap_caps_get_allocated_size, pxTaskGetStackStart, xTaskGetHandle};
+
+    let after = InternalHeap::now();
+    // Null if the thread has already gone, or was not named.
+    let task = unsafe { xTaskGetHandle(OPCUA_TASK_NAME.as_ptr()) };
+    if task.is_null() {
+        return;
+    }
+    // Sound: the task lives as long as its `Client`, held here, and FreeRTOS
+    // allocated its stack as one heap block, as `heap_caps_get_allocated_size`
+    // requires.
+    let (start, size) = unsafe {
+        let start = pxTaskGetStackStart(task);
+        (start, heap_caps_get_allocated_size(start.cast()))
+    };
+    log::info!(
+        "OPC UA stack: {size} B at {start:p}..{:p} ({OPCUA_STACK_BYTES} B requested); \
+         internal heap {} -> {} B free, largest block {} -> {} B",
+        start.wrapping_add(size),
+        before.free,
+        after.free,
+        before.largest_block,
+        after.largest_block,
+    );
 }
 
 fn update_counters(opcua: &Client, publisher: Option<&Publisher>) {

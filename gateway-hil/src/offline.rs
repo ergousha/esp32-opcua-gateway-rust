@@ -468,7 +468,7 @@ pub async fn reboot(ctx: &mut Ctx) -> Result<PhaseResult> {
         ),
     );
     info(format!(
-        "the device is left on {which} config, cached in NVS"
+        "the device runs {which} config, cached in NVS, until the restore"
     ));
     Ok(r)
 }
