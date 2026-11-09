@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.2.0](https://github.com/ergousha/esp32-opcua-gateway-rust/compare/v0.1.0...v0.2.0) (2026-11-09)
+
+
+### Features
+
+* **firmware:** log where the OPC UA stack is and what it cost the heap ([b53c496](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/b53c4969551925d4db8c8406ab71ccc47dceb436))
+
+
+### Bug Fixes
+
+* **deps:** update rustls and ctutils for new RustSec advisories ([1ea9a0d](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/1ea9a0d791a8c82c12f655d6c4710922008ad36d))
+* **deps:** update rustls-webpki for RUSTSEC-2026-0382 ([04acf42](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/04acf42b4c6d89d88adec979a2e78311f5bb1ffc))
+* **firmware:** restart an unverified OTA image that cannot reach AWS IoT ([ec51a26](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/ec51a269e72b146ef47b8e569c8472989404279a))
+* **hil:** match the restored endpoint as a whole URL; harden the snapshot file ([5d988d8](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/5d988d806ef5336e2182ff108addeb77176a0d83))
+* **hil:** put the device back the way the run found it ([d343793](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/d343793848d42b670ae660a6a34ffdb0dd05f4e6))
+* **opcua:** box the driver future before the thread reports ready ([69aad32](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/69aad3285b3d97bfb3678cd9e37ba8d9d942d09d))
+* **ota:** report a job's outcome from the image that runs after the reboot ([b322e2b](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/b322e2b771a4902763d9c3abc5ee681be32df7ea))
+* **ota:** stop re-settling a refused job; give a fresh image time to connect ([11154ab](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/11154ab6be084eecfbd4dce094e7595d05f0e03f))
+
+
+### Performance Improvements
+
+* **opcua:** box the driver future before block_on ([c21e566](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/c21e566b0eb6178fd48a768248a23a4a7a0080bd))
+* **opcua:** poll the session event loop's stream from our own task ([85d3ced](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/85d3cede18d10b1b67e8d58069e5da980e632d42))
+
 ## [0.1.0](https://github.com/ergousha/esp32-opcua-gateway-rust/compare/v0.0.1...v0.1.0) (2026-09-27)
 
 
