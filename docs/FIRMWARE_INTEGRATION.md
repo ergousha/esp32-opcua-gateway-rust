@@ -100,6 +100,8 @@ A manual procedure; it touches real AWS resources and one real device. It needs 
 
 The device must already run a build that contains this logic, flashed over USB (`espflash flash --partition-table partitions.csv --target-app-partition ota_0 target/xtensa-esp32s3-espidf/release/esp32-opcua-gateway`): the image it rolls back to is the one that reports the rollback. Each image below gets its own version, or it would be reported as already running. The slot names below assume the USB-flashed image runs from `ota_0`; swap them if the serial log says otherwise.
 
+**The bootloader must be the project's.** `espflash flash` writes espflash's own bundled bootloader unless it is given `--bootloader`, and that one is built without `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`: it ignores the OTA image states, never rolls back, and boots the bad image below again and again. Check the boot log (`boot: ESP-IDF v5.5.3 2nd stage bootloader`, not espflash's v5.5.1), or write the one this build produced: `espflash write-bin --chip esp32s3 0x0 target/xtensa-esp32s3-espidf/release/build/esp-idf-sys-*/out/build/bootloader/bootloader.bin`.
+
 **Setup.**
 
 ```sh
@@ -166,7 +168,7 @@ show_job "$JOB"
 Expected:
 
 1. `IN_PROGRESS`, `phase: rebooting`, `target: 0.1.1-ota.bad`, `target_slot: ota_0`.
-2. The bad image cannot connect, retries for up to 3 minutes (`…; this image is not verified yet, so still trying`), and logs `<error>; restarting so the bootloader restores the previous image`, the error being `Failed to set up MQTT client`, `connection lost before it was established` or `timed out connecting to AWS IoT Core`. On WiFi, a failed association restarts it just the same.
+2. The bad image cannot connect. With an empty endpoint it fails at once (`Error parse uri = mqtts://:8883`); a server it cannot reach is retried for up to 3 minutes first (`…; this image is not verified yet, so still trying`). It then restarts: either with `<error>; restarting so the bootloader restores the previous image`, or, on a unit that fell back to WiFi, through a panic in esp-idf-hal while the unused Ethernet SPI driver is dropped (`spi.rs:651`, `ESP_ERR_INVALID_STATE`). Both restart the device with the image still unverified.
 3. The bootloader boots `ota_1` again. That image logs `OTA job …: rolled back (the bootloader marked ota_0 invalid and booted ota_1); reporting FAILED` and `outcome recorded`.
 4. `show_job` returns `FAILED` with `reason: rolled back`, `running: 0.1.1-ota.1`, `running_slot: ota_1`, `target: 0.1.1-ota.bad`, `target_slot: ota_0`. `show_fw` still prints `0.1.1-ota.1`.
 
