@@ -30,6 +30,26 @@ pub const THING: &str = "local-test";
 /// Driver thread stack. Generous: this is the host, not the device.
 const STACK_BYTES: usize = 4 * 1024 * 1024;
 
+/// Overrides [`STACK_BYTES`], so the stack the client needs can be bisected
+/// over loopback: a run that overflows aborts the whole test binary. The OS
+/// rounds the size up to whole pages, so the resolution is 4 KiB on x86_64
+/// Linux but 16 KiB on Apple silicon.
+///
+/// ```sh
+/// OPCUA_TEST_STACK_BYTES=65536 cargo test --release -p gateway-opcua --target host-tuple --test scenario
+/// ```
+const STACK_BYTES_ENV: &str = "OPCUA_TEST_STACK_BYTES";
+
+/// [`STACK_BYTES`], or the override from [`STACK_BYTES_ENV`].
+fn stack_bytes() -> usize {
+    match std::env::var(STACK_BYTES_ENV) {
+        Ok(bytes) => bytes
+            .parse()
+            .unwrap_or_else(|_| panic!("{STACK_BYTES_ENV}={bytes:?} is not a byte count")),
+        Err(_) => STACK_BYTES,
+    }
+}
+
 /// A server plus a gateway client pointed at it.
 pub struct Rig {
     pub server: TestServer,
@@ -83,7 +103,7 @@ impl Rig {
 pub fn client() -> Client {
     init_logging();
     let (client, driver) = gateway_opcua::new(Options::new("test"));
-    gateway_opcua::spawn_thread(driver, "opcua", STACK_BYTES).expect("driver thread starts");
+    gateway_opcua::spawn_thread(driver, "opcua", stack_bytes()).expect("driver thread starts");
     client
 }
 

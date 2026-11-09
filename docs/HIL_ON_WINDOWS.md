@@ -38,8 +38,11 @@ on-device scenario — not a green run at any cost.
 - Do not commit or push unless the user asks. Do not print, log or commit AWS
   secrets.
 - Only touch AWS through `gateway-hil` itself. It writes the `opcua` shadow of
-  thing `28848553144F` and retained topics `cmd/28848553144F/opcua/tags/v*`;
-  `--cleanup` removes the retained bundles it published. Nothing else.
+  thing `28848553144F` and retained topics `cmd/28848553144F/opcua/tags/v*`,
+  and on exit puts the shadow back the way it found it
+  (`docs/OPCUA_INTEGRATION_TEST.md` §7.4); `--cleanup` removes the retained
+  bundles it published that the restored configuration does not use. Nothing
+  else.
 - Natively on Windows is the simplest setup. WSL2 also works, but its NAT
   hides the listening port from the LAN (§3.5), so the port and the USB
   device have to be forwarded into WSL; see "Running from WSL2" below.
@@ -87,7 +90,9 @@ on-device scenario — not a green run at any cost.
    COM port (`[System.IO.Ports.SerialPort]::GetPortNames()`, or Device
    Manager → Ports). Make sure no other program holds the port open.
 7. **Run the full scenario. It takes about 5 minutes, a few more if the
-   device's WiFi needs a restart at boot; do not interrupt it:**
+   device's WiFi needs a restart at boot, and up to 3 more while the device
+   takes its restored configuration up; do not interrupt it.** If you have
+   to, press Ctrl-C once: the run restores the device before it exits.
 
    ```powershell
    cargo run -p gateway-hil --target host-tuple -- `
@@ -97,7 +102,8 @@ on-device scenario — not a green run at any cost.
 
    If Windows asks whether to allow `gateway-hil.exe` on the network, allow
    it on Private networks. Artifacts (serial log, `summary-*.json`) land in
-   `gateway-hil\artifacts\`.
+   `gateway-hil\artifacts\`. If the run ends with "THE DEVICE WAS NOT
+   RESTORED", run the `--restore` command it prints before anything else.
 8. **Before calling anything a firmware bug**, apply §9.2:
    - a `reported: (stale …)` line means the device is not reporting at all;
    - identical snapshots with the same `uptime_s` across phases mean a
@@ -144,12 +150,13 @@ on-device scenario — not a green run at any cost.
 
 ## Report back
 
-1. The summary table (passed/total per phase) and every failed check with its
-   detail line.
+1. The summary table (passed/total per phase, including `restore`), the
+   `restore :` line, and every failed check with its detail line.
 2. For each failure: the relevant serial-log excerpt with timestamps, your
    diagnosis, and whether it is firmware, harness, network or environment.
-3. The measured `free_heap`, the reconnect delays seen in `server_down`, and
-   the lowest `OPC UA stack headroom` value in the serial log.
+3. The measured `free_heap`, the reconnect delays seen in `server_down`, the
+   lowest `OPC UA stack headroom` value in the serial log, and the boot line
+   `OPC UA stack: … at …` (§9.10 of `docs/OPCUA_INTEGRATION_TEST.md`).
 4. Paths of the artifacts, and anything you had to install or change on this
    PC.
 
@@ -158,10 +165,10 @@ a loopback test that reproduces the problem (`gateway-opcua/tests/`) where the
 problem is in the OPC UA client. Building and flashing firmware needs the ESP
 toolchain; the Mac has it, and so does the WSL2 setup below.
 
-A stack problem in the OPC UA client reproduces over loopback. Make the
-driver stack in `gateway-opcua/tests/common/mod.rs` configurable, then run
-`cargo test --release -p gateway-opcua --target host-tuple --test scenario`
-at decreasing sizes. The host needs more stack than the device, so compare
+A stack problem in the OPC UA client reproduces over loopback. Run
+`OPCUA_TEST_STACK_BYTES=<bytes> cargo test --release -p gateway-opcua --target host-tuple --test scenario`
+at decreasing sizes; a run that overflows aborts with `thread 'opcua' has
+overflowed its stack`. The host needs more stack than the device, so compare
 sizes against each other, not against the device's 40 KiB.
 
 ## Running from WSL2

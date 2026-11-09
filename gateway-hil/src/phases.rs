@@ -117,7 +117,8 @@ pub struct Ctx {
     pub applied_version: u32,
     /// Unix ms at the start of the run; nothing older counts.
     pub t0_ms: i64,
-    /// Bundle versions published by this run, for `--cleanup`.
+    /// Bundle versions published by this run, for the restore and
+    /// `--cleanup`.
     pub published: Vec<u32>,
     /// Highest config version the shadow had asked for, or this run has
     /// published; [`Ctx::next_version`] continues from it.
@@ -144,12 +145,14 @@ impl Ctx {
         let bundle = documents::bundle(&self.thing, version, tags);
         let mut desired = Desired::new(self.server.endpoint(), self.server.namespace_index());
         tweak(&mut desired);
+        // Recorded first: a publish that failed or was interrupted may still
+        // have landed, and the restore has to come after it and clean it up.
+        self.published.push(version);
+        self.last_version = self.last_version.max(version);
         self.cloud.publish_bundle(&bundle).await?;
         self.cloud
             .update_desired(&desired.to_json(&self.thing, &bundle))
             .await?;
-        self.published.push(version);
-        self.last_version = self.last_version.max(version);
         info(format!(
             "published config v{version}: {} tags, {} B bundle, sha256={}…",
             bundle.count,
