@@ -18,7 +18,7 @@ pub mod publisher;
 use std::ffi::CStr;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
@@ -193,14 +193,31 @@ impl StackProbe {
     }
 }
 
+/// How long a fresh OTA image keeps trying to reach AWS IoT before it gives
+/// up and lets the bootloader roll it back.
+const UNVERIFIED_CONNECT_PATIENCE: Duration = Duration::from_secs(180);
+
 fn wait_for_connection(session: &mqtt_util::MqttSession) -> Result<()> {
+    // Giving up on an unverified image rolls it back, and its job is then
+    // reported FAILED for good; one TLS or DNS hiccup on its first boot must
+    // not decide that. esp-mqtt keeps reconnecting on its own meanwhile.
+    let patience = if ota::running_unverified() {
+        UNVERIFIED_CONNECT_PATIENCE
+    } else {
+        Duration::ZERO
+    };
+    let deadline = Instant::now() + patience;
     loop {
-        match session.events.recv_timeout(Duration::from_secs(30)) {
+        let failure = match session.events.recv_timeout(Duration::from_secs(30)) {
             Ok(MqttEvent::Connected) => return Ok(()),
-            Ok(MqttEvent::Disconnected) => bail!("connection lost before it was established"),
+            Ok(MqttEvent::Disconnected) => "connection lost before it was established",
             Ok(_) => continue,
-            Err(_) => bail!("timed out connecting to AWS IoT Core"),
+            Err(_) => "timed out connecting to AWS IoT Core",
+        };
+        if Instant::now() >= deadline {
+            bail!("{failure}");
         }
+        log::warn!("{failure}; this image is not verified yet, so still trying");
     }
 }
 

@@ -46,6 +46,11 @@ pub struct JobsClient {
     boot: BootFacts,
     /// The outcome this boot is reporting, until the Jobs service takes it.
     settling: Option<Settling>,
+    /// Jobs whose outcome the service refused outright during this boot. An
+    /// execution it still holds open is offered again on the next
+    /// `$next/get`; settling it again would only be refused again, in a loop
+    /// as fast as the round trip.
+    dropped: Vec<String>,
 }
 
 /// A job outcome on its way to the Jobs service.
@@ -93,6 +98,7 @@ impl JobsClient {
             store,
             boot,
             settling: None,
+            dropped: Vec::new(),
         };
         if let Some(pending) = client.store.load() {
             client.settle(pending);
@@ -166,6 +172,7 @@ impl JobsClient {
                     "OTA job {}: outcome rejected ({rejection}); dropping it",
                     settling.job_id
                 );
+                self.dropped.push(settling.job_id.clone());
                 self.finish_settling(client);
             } else {
                 // Everything else waits until the outcome is on record: the
@@ -189,7 +196,20 @@ impl JobsClient {
             return;
         }
 
-        match jobs::parse_next(payload) {
+        let next = jobs::parse_next(payload);
+        if let Ok(
+            NextJob::Install(FirmwareJob { job_id, .. })
+            | NextJob::Settle(PendingUpdate { job_id, .. }),
+        ) = &next
+        {
+            if self.dropped.contains(job_id) {
+                log::warn!(
+                    "OTA job {job_id}: its outcome was refused earlier; ignoring it until reboot"
+                );
+                return;
+            }
+        }
+        match next {
             Ok(NextJob::Idle) => {}
             Ok(NextJob::Unsupported { job_id, operation }) => {
                 log::info!("ignoring job {job_id}: unsupported operation {operation:?}");
