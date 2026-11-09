@@ -284,7 +284,17 @@ pub fn took_up(plan: &Plan, reported: &Value) -> bool {
             && !endpoint.is_empty()
             && reported["last_error"]
                 .as_str()
-                .is_some_and(|e| e.contains(endpoint)))
+                .is_some_and(|e| names_endpoint(e, endpoint)))
+}
+
+/// Whether `error` names `endpoint` as a whole URL, not as a prefix of a
+/// longer one: `opc.tcp://h:4855` must not match an error about
+/// `opc.tcp://h:4855/ergousha/test`, the run's own server.
+fn names_endpoint(error: &str, endpoint: &str) -> bool {
+    error
+        .split_whitespace()
+        .map(|word| word.trim_end_matches([':', ',', ';', ')']))
+        .any(|word| same_endpoint(word, endpoint))
 }
 
 /// Bundles `--cleanup` may clear: ones the run published, less `keep`.
@@ -410,9 +420,17 @@ impl Snapshot {
         })
     }
 
+    /// Written to a temporary file and renamed into place, so a run killed
+    /// mid-write leaves no half-written snapshot for the next run to trip on.
     pub fn save(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, serde_json::to_vec_pretty(&self.to_json())?)
-            .with_context(|| format!("saving the snapshot to {}", path.display()))
+        let tmp = path.with_extension("json.tmp");
+        let write = || -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(&self.to_json())?)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, path)
+        };
+        write().with_context(|| format!("saving the snapshot to {}", path.display()))
     }
 
     /// The snapshot a run left behind, if one did.
@@ -1139,10 +1157,23 @@ mod tests {
             &plan,
             &error("could not connect to opc.tcp://plc.local:4840: refused")
         ));
+        assert!(took_up(
+            &plan,
+            &error("timed out after 40 s connecting to opc.tcp://plc.local:4840")
+        ));
         assert!(!took_up(&plan, &json!({"state": "running", "cfg_v": 8})));
         assert!(!took_up(
             &plan,
             &error(&format!("could not connect to {RUN}"))
+        ));
+        // A longer URL that starts with the restored one is another server.
+        assert!(!took_up(
+            &plan,
+            &error("could not connect to opc.tcp://plc.local:4840/ergousha/test: refused")
+        ));
+        assert!(!took_up(
+            &plan,
+            &error("could not connect to opc.tcp://plc.local:48401: refused")
         ));
     }
 

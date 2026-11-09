@@ -417,6 +417,16 @@ async fn restore_pending(args: &Args, repo: &Path, pending: &Path) -> Result<boo
             pending.display()
         )
     })?;
+    // `path()` folds characters a file name cannot hold, so two things can
+    // share a file; never write one thing's shadow from the other's snapshot.
+    if snapshot.thing != args.thing {
+        bail!(
+            "{} was saved for thing {}, not {}",
+            pending.display(),
+            snapshot.thing,
+            args.thing
+        );
+    }
     banner("PRE-RUN CONFIGURATION");
     info(format!("saved by a run at {}", when(snapshot.taken_ms)));
     for line in snapshot.describe() {
@@ -439,7 +449,11 @@ async fn restore_pending(args: &Args, repo: &Path, pending: &Path) -> Result<boo
     report::print_summary(std::slice::from_ref(&restored.result));
     println!("  restore    : {}", restored.line);
     if restored.settled {
-        std::fs::remove_file(pending).with_context(|| format!("removing {}", pending.display()))?;
+        // The device is back; a file that will not go is worth a warning, not
+        // a failed exit.
+        if let Err(e) = std::fs::remove_file(pending) {
+            log::warn!("could not remove {}: {e}", pending.display());
+        }
     } else {
         print_unrestored(args, pending);
     }
