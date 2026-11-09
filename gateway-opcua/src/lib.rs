@@ -302,8 +302,12 @@ pub fn spawn_thread(
                     return;
                 }
             };
+            // Boxed before `ready`: the caller measures the heap the thread
+            // cost as soon as `ready` arrives, and the driver allocates
+            // nothing more until its first command.
+            let run = boxed_run(driver);
             let _ = ready_tx.send(Ok(()));
-            runtime.block_on(boxed_run(driver));
+            runtime.block_on(run);
             log::warn!("OPC UA driver exited");
         })?;
 

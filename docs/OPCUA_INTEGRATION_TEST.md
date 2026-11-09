@@ -1110,8 +1110,11 @@ should never do, so do not raise the size until that is explained (issue #11).
 The firmware logs:
 
 - once at boot, `OPC UA stack: N B at <start>..<end> (40960 B requested);
-  internal heap A -> B B free, largest block C -> D B`: the stack the task
-  actually got, where it is, and what starting the thread cost;
+  internal heap A -> B B free, largest block C -> D B`: the heap block the
+  stack lives in (the stack FreeRTOS can use is slightly smaller), where it
+  is, and what starting the thread cost. That cost is the stack, the TCB, the
+  tokio runtime and the boxed driver future, all allocated before the thread
+  reports ready, so it is the same on every boot;
 - `OPC UA stack headroom: N of 40960 B never used`, at each new low.
 
 Over loopback, `OPCUA_TEST_STACK_BYTES` (§7.1) bisects the stack the client
