@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/ergousha/esp32-opcua-gateway-rust/compare/v0.2.1...v0.3.0) (2026-11-09)
+
+
+### Features
+
+* share the Jobs protocol as iot-jobs, refuse other products' images ([caef958](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/caef958914cec0117dbe8f323b8a0b3fcb26d1d6))
+
 ## [0.2.1](https://github.com/ergousha/esp32-opcua-gateway-rust/compare/v0.2.0...v0.2.1) (2026-11-09)
 
 
