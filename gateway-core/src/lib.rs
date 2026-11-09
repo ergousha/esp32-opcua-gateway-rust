@@ -14,6 +14,7 @@ pub mod bundle;
 pub mod codec;
 pub mod diff;
 pub mod health;
+pub mod jobs;
 pub mod node;
 pub mod plan;
 pub mod queue;

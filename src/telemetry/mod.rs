@@ -18,7 +18,7 @@ pub mod publisher;
 use std::ffi::CStr;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
@@ -26,6 +26,7 @@ use gateway_core::health::DriverState;
 use gateway_opcua::Client;
 
 use crate::device_id::{self, DeviceIdentity};
+use crate::job_store::JobStore;
 use crate::jobs::JobsClient;
 use crate::mqtt_util::{self, MqttEvent};
 use crate::settings_store::SettingsStore;
@@ -52,8 +53,9 @@ const OPCUA_TASK_NAME: &CStr = c"opcua";
 const TICK_MS: i64 = 50;
 
 /// Connects with the device identity and runs until something unrecoverable
-/// happens.
-pub fn run(id: &DeviceIdentity) -> Result<()> {
+/// happens. `job_store` holds the OTA job, if any, whose outcome the previous
+/// boot left for this one to report.
+pub fn run(id: &DeviceIdentity, job_store: JobStore) -> Result<()> {
     log::info!("starting gateway. thing={}", id.thing_name);
 
     let mut session = mqtt_util::connect(
@@ -72,13 +74,17 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
 
     // Only once we are on the network with a working identity is this image
     // worth keeping; before this point a rollback is the correct outcome.
-    if let Err(e) = ota::mark_valid() {
+    let valid = ota::mark_valid();
+    if let Err(e) = &valid {
         log::warn!("could not mark the firmware valid: {e:#}");
     }
+    // Read after marking valid, so a pending OTA job is settled with the
+    // verdict on this image already in.
+    let boot = ota::boot_facts(&valid);
 
     let opcua = start_opcua();
 
-    let jobs = JobsClient::new(&id.thing_name);
+    let mut jobs = JobsClient::new(&id.thing_name, job_store, boot);
     let mut config_plane = ConfigPlane::new(&id.thing_name, opcua.clone());
     let mut store = SettingsStore::new().context("opening the OPC UA settings store")?;
 
@@ -152,6 +158,7 @@ pub fn run(id: &DeviceIdentity) -> Result<()> {
 
         update_counters(&opcua, publisher.as_ref());
         config_plane.report(&mut session.client, now);
+        jobs.tick(&mut session.client);
         stack_probe.check();
     }
 }
@@ -186,14 +193,31 @@ impl StackProbe {
     }
 }
 
+/// How long a fresh OTA image keeps trying to reach AWS IoT before it gives
+/// up and lets the bootloader roll it back.
+const UNVERIFIED_CONNECT_PATIENCE: Duration = Duration::from_secs(180);
+
 fn wait_for_connection(session: &mqtt_util::MqttSession) -> Result<()> {
+    // Giving up on an unverified image rolls it back, and its job is then
+    // reported FAILED for good; one TLS or DNS hiccup on its first boot must
+    // not decide that. esp-mqtt keeps reconnecting on its own meanwhile.
+    let patience = if ota::running_unverified() {
+        UNVERIFIED_CONNECT_PATIENCE
+    } else {
+        Duration::ZERO
+    };
+    let deadline = Instant::now() + patience;
     loop {
-        match session.events.recv_timeout(Duration::from_secs(30)) {
+        let failure = match session.events.recv_timeout(Duration::from_secs(30)) {
             Ok(MqttEvent::Connected) => return Ok(()),
-            Ok(MqttEvent::Disconnected) => bail!("connection lost before it was established"),
+            Ok(MqttEvent::Disconnected) => "connection lost before it was established",
             Ok(_) => continue,
-            Err(_) => bail!("timed out connecting to AWS IoT Core"),
+            Err(_) => "timed out connecting to AWS IoT Core",
+        };
+        if Instant::now() >= deadline {
+            bail!("{failure}");
         }
+        log::warn!("{failure}; this image is not verified yet, so still trying");
     }
 }
 

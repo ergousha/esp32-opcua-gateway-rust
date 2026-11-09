@@ -13,6 +13,7 @@
 mod config;
 mod device_id;
 mod eth;
+mod job_store;
 mod jobs;
 mod mqtt_util;
 mod ota;
@@ -60,6 +61,22 @@ fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    let result = run();
+    if let Err(e) = &result {
+        // Returning ends the main task and parks the device, and a fresh OTA
+        // image parked unverified is never rolled back; on Ethernet an image
+        // that cannot reach AWS IoT did exactly that. Restarting now hands the
+        // device back to the previous image, which then reports the job FAILED.
+        if ota::running_unverified() {
+            log::error!("{e:#}; restarting so the bootloader restores the previous image");
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            esp_idf_svc::hal::reset::restart();
+        }
+    }
+    result
+}
+
+fn run() -> Result<()> {
     // Claim the OPC UA type table before TLS and the OPC UA session take their
     // share of the heap. It is ~9 kB in one block, built lazily on the first
     // ExtensionObject decode; deferred, that decode lands when the heap is
@@ -109,7 +126,8 @@ fn main() -> Result<()> {
     };
 
     // --- 2) Persistent identity check -----------------------------------------
-    let mut store = device_id::DeviceStore::new(nvs_part)?;
+    let mut store = device_id::DeviceStore::new(nvs_part.clone())?;
+    let job_store = job_store::JobStore::new(nvs_part)?;
 
     let identity = if store.exists() {
         log::info!("Registered device identity found; skipping provisioning.");
@@ -123,5 +141,5 @@ fn main() -> Result<()> {
     };
 
     // --- 3) Device connection (infinite loop) ---------------------------------
-    telemetry::run(&identity)
+    telemetry::run(&identity, job_store)
 }
