@@ -22,6 +22,11 @@ on-device scenario — not a green run at any cost.
   CloudWatch, and on the device's serial log. Eleven phases: `bootloader`,
   `preflight`, `provision`, `telemetry`, `reconfig`, `ns_uri`, `reject_security`,
   `reject_digest`, `server_down`, `disable`, `reboot`.
+- Telemetry reaches CloudWatch only while the platform's `dt/+/opcua` rule is
+  enabled. It is off by default; the owner turns it on for a HIL run with
+  `terraform apply -var debug_telemetry_logs=true` in iot-platform-infra (and
+  off again afterwards). With it off, `telemetry` and `reconfig` fail and
+  `disable` passes without proving anything.
 - The device: thing `28848553144F`, on WiFi at `192.168.50.75`
   (subnet `192.168.50.0/24`). It already runs the current firmware, including
   the stack-overflow fix in `gateway_opcua::session::open`, so do **not**
