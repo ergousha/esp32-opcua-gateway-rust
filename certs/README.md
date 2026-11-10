@@ -11,20 +11,27 @@ this prevents the `cargo build`/CI from breaking (but TLS will not work until a 
 | File | What | Source |
 | --- | --- | --- |
 | `AmazonRootCA1.pem` | AWS IoT server validation (public) | Amazon Trust — committable |
-| `claim.crt.pem` | **Claim (bootstrap) certificate** — common across all devices | `terraform output` |
-| `claim.private.key` | Claim private key (**secret**) | `terraform output` |
+| `claim.crt.pem` | **Claim (bootstrap) certificate** — common across all devices | SSM `/esp32-ztp/poc/claim_certificate_pem` |
+| `claim.private.key` | Claim private key (**secret**) | SSM `/esp32-ztp/poc/claim_private_key` |
 
 ## Generating the Real Claim Identity
 
-After running Terraform apply:
+`build.rs` fetches both from SSM when the AWS CLI has credentials. By hand
+(the platform no longer exposes them as Terraform outputs):
 
 ```sh
-cd ../terraform
-terraform output -raw claim_certificate_pem > ../certs/claim.crt.pem
-terraform output -raw claim_private_key     > ../certs/claim.private.key
+aws ssm get-parameter --name /esp32-ztp/poc/claim_certificate_pem --with-decryption \
+  --query Parameter.Value --output text > certs/claim.crt.pem
+aws ssm get-parameter --name /esp32-ztp/poc/claim_private_key --with-decryption \
+  --query Parameter.Value --output text > certs/claim.private.key
 # Root CA (once):
-curl -s https://www.amazontrust.com/repository/AmazonRootCA1.pem > ../certs/AmazonRootCA1.pem
+curl -s https://www.amazontrust.com/repository/AmazonRootCA1.pem > certs/AmazonRootCA1.pem
 ```
+
+The claim certificate is **INACTIVE** on the platform except during an
+enrolment window (`scripts/claim-window.sh` in iot-platform-infra), and a
+registry record enrols a device only once. A provisioned gateway never uses the
+claim again; to re-enrol one, register it again with `seed-device`.
 
 ## Preventing Committing the Real Secret
 

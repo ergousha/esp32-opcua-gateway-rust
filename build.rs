@@ -103,7 +103,7 @@ fn ensure_placeholder(rel: &str, content: &str) {
     if !path.exists() {
         write_file(rel, content);
         println!(
-            "cargo:warning=Placeholder created: {rel} — use terraform output / AWS SSM for actual claim identity"
+            "cargo:warning=Placeholder created: {rel} — fetch the claim identity from AWS SSM (see certs/README.md)"
         );
     }
 }

@@ -75,7 +75,7 @@ flowchart LR
 | **OPC UA server** (PLC / SCADA) | The gateway is the OPC UA *client*: it opens one session, one subscription per scan rate, and reads the `NamespaceArray` to resolve namespace URIs. Phase 1 is SecurityPolicy `None` + anonymous only, on a trusted OT network. |
 | **AWS IoT Core** | One mutually authenticated MQTT connection carries every plane: provisioning, the `opcua` named shadow, the retained tag bundle, Jobs, and telemetry. |
 | **DynamoDB registry + Lambda** | Fleet provisioning succeeds only for a MAC and secret registered here (`cargo run -p seed-device`). |
-| **CloudWatch Logs** | Where the `dt/+/opcua` IoT rule lands telemetry; also what the on-device test reads. |
+| **CloudWatch Logs** | Where the `dt/+/opcua` IoT rule lands telemetry; also what the on-device test reads. The rule is off by default to save cost: enable it with `-var debug_telemetry_logs=true` in iot-platform-infra for debugging or a HIL run. |
 | **SSM Parameter Store** | Read by `build.rs` at build time for the claim certificate, the IoT endpoint and the provisioning template name. Never contacted by the device. |
 | **Image host** | The HTTPS `download_url` of an OTA job, typically a presigned S3 URL. |
 
