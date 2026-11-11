@@ -1021,8 +1021,8 @@ mod tests {
                 "topic": "dt/T/opcua",
                 "qos": 0,
                 "batch_max_items": 50,
-                "batch_max_bytes": 8192,
-                "batch_max_age_ms": 500,
+                "batch_max_bytes": 4096,
+                "batch_max_age_ms": 10000,
             },
             "cfg": {
                 "v": 8,

@@ -5,15 +5,23 @@ An edge gateway that reads tags from a PLC over **OPC UA** and publishes them to
 [Waveshare ESP32-S3-ETH](hardware/README.md), an ESP32-S3 (Xtensa LX7) with an
 on-board W5500 wired Ethernet chip.
 
-- **Zero-touch provisioning.** On first boot the device obtains its own X.509
-  identity through AWS IoT *Fleet Provisioning by Claim*, keeps it in NVS, and
-  from then on connects as itself.
+- **On the Ergousha IoT platform.** Enrolment, AWS IoT Jobs (OTA), the
+  `platform` shadow and the bench console come from the platform's device SDK,
+  [`ergousha/iot-device-sdk`](https://github.com/ergousha/iot-device-sdk)
+  (`device-sdk`, feature `nvs-soft-key`). This repository is the gateway on top
+  of it.
+- **Enrolment with its own key, no secrets in the image.** The device generates
+  a P-256 key in NVS and, with a claim written to it at the bench
+  (`ergo commission`), obtains its X.509 certificate through AWS IoT *Fleet
+  Provisioning by Claim* from a CSR. It keeps the identity in NVS and from then
+  on connects as itself. A build needs no AWS access.
 - **Configured from the cloud, not at build time.** Which server to read, which
   tags, how often and how to batch them all arrive at runtime through a device
   shadow plus a retained tag bundle. The last good configuration is cached on
   flash, so the gateway keeps collecting when the WAN is down.
 - **OPC UA subscriptions, batched telemetry.** Values are reported by exception,
-  encoded losslessly, and published in size- and rate-limited batches.
+  encoded losslessly, and published in size- and rate-limited batches, only
+  while the platform has switched telemetry on.
 - **Remote firmware updates** through AWS IoT Jobs, into dual OTA slots with
   automatic rollback.
 - **Testable without hardware.** Everything except device I/O builds for the
@@ -21,13 +29,14 @@ on-board W5500 wired Ethernet chip.
   against a real OPC UA server over loopback.
 
 Networking tries wired Ethernet (W5500 + DHCP) first and falls back to WiFi
-(`cfg.toml`) when there is no link or lease.
+(from NVS `platform`, written at the bench) when there is no link or lease.
 
 **Contents:**
 [Architecture](#architecture) ·
 [Repository layout](#repository-layout) ·
 [Running and testing without hardware](#running-and-testing-the-opc-ua-client-without-hardware) ·
 [Getting started](#getting-started) ·
+[Commissioning](#commissioning-a-gateway) ·
 [Hardware](#hardware) ·
 [Documentation](#documentation)
 
@@ -47,41 +56,42 @@ flowchart LR
         gw["ESP32-S3 gateway<br/>this firmware"]
     end
 
-    subgraph aws["AWS account (provisioned by iot-platform-infra)"]
-        iot["AWS IoT Core<br/>MQTT broker · named shadow ·<br/>Jobs · fleet provisioning"]
+    subgraph aws["AWS account (provisioned by iot-platform)"]
+        iot["AWS IoT Core<br/>MQTT broker · named shadows ·<br/>Jobs · fleet provisioning"]
         hook["Lambda<br/>pre-provisioning hook"]
         ddb[("DynamoDB<br/>device registry")]
         cw[("CloudWatch Logs<br/>telemetry")]
-        ssm[("SSM Parameter Store<br/>claim identity, endpoint")]
+        ssm[("SSM Parameter Store<br/>claim identity")]
     end
 
     img[("Firmware image host<br/>HTTPS download_url")]
     backend(["Operator / backend"])
-    dev(["Developer workstation"])
+    dev(["Owner at the bench<br/>ergo (iot-device-sdk)"])
 
     gw -->|"opc.tcp subscriptions<br/>SecurityPolicy None"| plc
     gw <-->|"MQTT over mutual TLS, port 8883"| iot
     gw -->|"OTA download over HTTPS"| img
     iot -->|"RegisterThing"| hook
-    hook -->|"MAC + secret lookup"| ddb
+    hook -->|"MAC + public key lookup"| ddb
     iot -->|"IoT rule dt/+/opcua"| cw
     backend -->|"shadow desired, retained tag bundle, jobs"| iot
-    dev -->|"seed-device"| ddb
-    dev -.->|"build.rs, at build time"| ssm
+    dev -->|"register MAC + public key"| ddb
+    dev -.->|"claim, read at the bench"| ssm
+    dev -->|"serial console: claim, WiFi"| gw
 ```
 
 | External system | What the gateway exchanges with it |
 | --- | --- |
 | **OPC UA server** (PLC / SCADA) | The gateway is the OPC UA *client*: it opens one session, one subscription per scan rate, and reads the `NamespaceArray` to resolve namespace URIs. Phase 1 is SecurityPolicy `None` + anonymous only, on a trusted OT network. |
-| **AWS IoT Core** | One mutually authenticated MQTT connection carries every plane: provisioning, the `opcua` named shadow, the retained tag bundle, Jobs, and telemetry. |
-| **DynamoDB registry + Lambda** | Fleet provisioning succeeds only for a MAC and secret registered here (`cargo run -p seed-device`). |
-| **CloudWatch Logs** | Where the `dt/+/opcua` IoT rule lands telemetry; also what the on-device test reads. The rule is off by default to save cost: enable it with `-var debug_telemetry_logs=true` in iot-platform-infra for debugging or a HIL run. |
-| **SSM Parameter Store** | Read by `build.rs` at build time for the claim certificate, the IoT endpoint and the provisioning template name. Never contacted by the device. |
+| **AWS IoT Core** | One mutually authenticated MQTT connection carries every plane: enrolment, the `platform` and `opcua` named shadows, the retained tag bundle, Jobs, and telemetry. |
+| **DynamoDB registry + Lambda** | Enrolment succeeds only for a MAC and public key registered here, once, inside its enrolment window (`ergo commission`, below). |
+| **CloudWatch Logs** | Where the `dt/+/opcua` IoT rule lands telemetry; also what the on-device test reads. The rule is off by default to save cost: enable it with `-var debug_telemetry_logs=true` in iot-platform for debugging or a HIL run. The gateway publishes only while the `platform` shadow's `desired.telemetry.enabled` is `true`. |
+| **SSM Parameter Store** | Holds the claim certificate and key, which `ergo commission` reads at the bench and writes to the device over its serial console. Never read by the build or contacted by the device. |
 | **Image host** | The HTTPS `download_url` of an OTA job, typically a presigned S3 URL. |
 
 The AWS resources — IoT policy, provisioning template, Lambda hook, registry
 table, IoT rule and SSM parameters — live in the separate
-`iot-platform-infra` repository.
+[`iot-platform`](https://github.com/ergousha/iot-platform) repository.
 
 ### Components
 
@@ -90,13 +100,16 @@ flowchart TB
     subgraph firmware["esp32-opcua-gateway — src/ (ESP-IDF, xtensa only)"]
         boot["main.rs<br/>boot sequence"]
         net["eth.rs · wifi.rs<br/>W5500 Ethernet, WiFi fallback"]
-        ident["device_id.rs · provisioning.rs<br/>NVS identity, fleet provisioning"]
-        tloop["telemetry/mod.rs<br/>MQTT event loop"]
+        tloop["telemetry/mod.rs<br/>session event loop"]
         plane["shadow.rs — ConfigPlane<br/>shadow + retained tag bundle"]
         store["settings_store.rs<br/>config cache, opcua NVS partition"]
-        jobs["jobs.rs · ota.rs · job_store.rs<br/>AWS IoT Jobs, OTA,<br/>pending job in NVS"]
         publ["telemetry/publisher.rs<br/>batching, rate limit"]
-        mqtt["mqtt_util.rs<br/>esp-mqtt, mutual TLS"]
+        mqtt["mqtt_util.rs<br/>MqttTransport on the SDK client"]
+    end
+
+    subgraph sdk["device-sdk — ergousha/iot-device-sdk"]
+        platform["Platform<br/>boot count, soft key, console,<br/>identity / enrolment"]
+        session["Session<br/>MQTT, mutual TLS, publish limiter ·<br/>Jobs + OTA · platform shadow"]
     end
 
     subgraph client["gateway-opcua — platform-neutral OPC UA client"]
@@ -106,14 +119,16 @@ flowchart TB
         shared["SampleQueue + Reported<br/>shared state"]
     end
 
-    core["gateway-core — pure logic<br/>settings · bundle · value encoding ·<br/>batching · diff · plan · backoff ·<br/>OTA jobs state machine (iot-jobs)"]
+    core["gateway-core — pure logic<br/>settings · bundle · value encoding ·<br/>batching · diff · plan · backoff"]
     lib["async-opcua 0.19"]
 
-    boot --> net --> ident --> tloop
+    boot --> platform
+    boot --> net --> tloop
+    platform --> session
+    session -->|"opcua shadow, tag bundle"| tloop
     tloop --> plane
-    tloop --> jobs
     tloop --> publ
-    tloop --- mqtt
+    mqtt --- session
     plane --> store
     plane -->|"AppliedConfig"| handle
     publ -->|"drain samples"| handle
@@ -125,9 +140,12 @@ flowchart TB
     client -.-> core
 ```
 
-The firmware crate is the only part tied to the device. It is a thin
-effectful shell: networking, identity, MQTT, NVS, OTA, and the glue between
-them. The decisions — what a valid configuration is, how a value is encoded,
+The firmware crate is the only part of this repository tied to the device. It
+is a thin effectful shell: networking, the `opcua` shadow, the NVS config
+cache, and the glue between them. Identity, enrolment, the MQTT connection,
+Jobs and OTA are the platform SDK's: the session handles Jobs and the
+`platform` shadow itself and hands the gateway only its own messages. The
+decisions — what a valid configuration is, how a value is encoded,
 when a batch is flushed, how long to back off — live in `gateway-core` as pure
 functions. The OPC UA client lives in `gateway-opcua`, which the firmware
 plugs in through a single handle:
@@ -145,10 +163,10 @@ let health = client.reported();  // mirrored into the shadow
 ```mermaid
 flowchart LR
     subgraph mqtttask["esp-mqtt task"]
-        cb["event callback<br/>copies each event"]
+        cb["event callback (device-sdk)<br/>copies each event"]
     end
     subgraph maintask["main task · 16 KiB stack"]
-        ml["telemetry loop, 50 ms tick<br/>config plane · jobs · publisher ·<br/>shadow reports"]
+        ml["telemetry loop, 50 ms tick<br/>Session::poll (Jobs, platform shadow) ·<br/>config plane · publisher · opcua shadow reports"]
     end
     subgraph opcuathread["opcua thread · 40 KiB stack<br/>tokio current-thread runtime"]
         drv["Driver + OPC UA session<br/>event loop"]
@@ -171,32 +189,48 @@ firmware update. The driver never panics; every failure becomes
 ```mermaid
 sequenceDiagram
     autonumber
+    participant OWN as Owner (ergo commission)
     participant GW as ESP32-S3 gateway
     participant NVS as NVS (nvs partition)
     participant IOT as AWS IoT Core
     participant HOOK as Lambda hook
     participant DB as DynamoDB registry
 
-    GW->>GW: Ethernet up (W5500 + DHCP), else WiFi fallback
-    GW->>NVS: device identity stored?
-    alt first boot
-        GW->>IOT: connect with the shared claim certificate
-        GW->>IOT: CreateKeysAndCertificate
-        IOT-->>GW: device certificate, private key, ownership token
-        GW->>IOT: RegisterThing with MAC, serial and secret
+    GW->>GW: rollback guard, if this is a new OTA image
+    GW->>NVS: platform init: count the boot, and without an identity generate<br/>a P-256 key in device_id/key (radio still off), start the serial console
+    GW->>GW: Ethernet up (W5500 + DHCP), else WiFi from NVS platform
+    GW->>NVS: platform.identity(), device identity stored?
+    alt not enrolled
+        OWN->>GW: PLATFORM INFO over the serial console
+        GW-->>OWN: PLATFORM REGISTER mac=… pubkey=…
+        OWN->>DB: registry record (MAC, public key, enrolment window)
+        OWN->>GW: claim certificate + key, WiFi (into NVS platform)
+        OWN->>IOT: claim certificate ACTIVE for the window
+        GW->>IOT: connect with the claim certificate
+        GW->>IOT: CreateCertificateFromCsr (CSR signed with the soft key)
+        IOT-->>GW: device certificate, ownership token
+        GW->>IOT: RegisterThing with the MAC
         IOT->>HOOK: pre-provisioning check
-        HOOK->>DB: look up mac_address
-        DB-->>HOOK: secret, allowed
+        HOOK->>DB: look up the MAC
+        DB-->>HOOK: product, public key, window, not yet provisioned
         HOOK-->>IOT: allow or deny
         IOT-->>GW: thingName
-        GW->>NVS: save identity
+        GW->>NVS: save identity, erase the claim
+        OWN->>IOT: claim certificate INACTIVE
     end
-    GW->>IOT: connect as thingName with its own certificate
+    GW->>IOT: platform.connect(), as thingName with its own certificate
     GW->>GW: mark the running OTA slot valid
-    GW->>GW: apply the cached OPC UA config from NVS, if any
     GW->>IOT: report the outcome of the OTA job the previous boot left pending, if any
-    GW->>IOT: subscribe to Jobs and the opcua shadow, request the shadow
+    GW->>IOT: subscribe to Jobs and the platform shadow, report it
+    GW->>GW: apply the cached OPC UA config from NVS, if any
+    GW->>IOT: subscribe to the opcua shadow, request it
 ```
+
+A refused enrolment is retried with a backoff from 60 s to 6 h. Units enrolled
+before the SDK keep the RSA identity `CreateKeysAndCertificate` gave them,
+in NVS `device_id` (certificate, key, thing name; a frozen layout), and keep
+connecting with it. New enrolments no longer use `CreateKeysAndCertificate` or
+a shared device secret.
 
 ### Configuration plane
 
@@ -244,8 +278,8 @@ re-delivering an applied version is a no-op. A security policy other than
 flowchart LR
     plc["OPC UA server"] -->|"DataChange notifications"| sink["subscription sink<br/>Variant to TagValue,<br/>stamped with cfg version"]
     sink --> queue["SampleQueue<br/>bounded 500,<br/>coalesces per address"]
-    queue -->|"drain up to 128<br/>every 50 ms"| batcher["Batcher<br/>flush on count, bytes,<br/>age or config version"]
-    batcher --> publisher["Publisher<br/>at least 20 ms apart,<br/>at most 2 batches pending"]
+    queue -->|"drain up to 128<br/>every 50 ms,<br/>dropped while telemetry is off"| batcher["Batcher<br/>flush on count, bytes (≤ 5,000),<br/>age (≥ 10 s) or config version"]
+    batcher --> publisher["Publisher<br/>at least 20 ms apart,<br/>at most 2 batches pending,<br/>SDK publish limiter"]
     publisher -->|"MQTT QoS 1<br/>dt/{thing}/opcua"| iot["AWS IoT Core"]
     iot -->|"IoT rule dt/+/opcua"| cw["CloudWatch Logs"]
 ```
@@ -266,9 +300,20 @@ A batch is a positional array of rows, `[address, source_ts_ms, value]`, plus a
   form.
 - `v` is the configuration version the rows were **collected** under; a batch
   never mixes two.
-- The queue and the batch limits bound memory; the publish spacing keeps the
-  connection far inside AWS IoT's per-connection publish rate, leaving room
-  for shadow, Jobs and OTA traffic.
+- **Telemetry is opt-in.** Batches are published only while the `platform`
+  shadow has `desired.telemetry.enabled = true`; otherwise samples are still
+  drained, and dropped, so the queue never backs up.
+- Every publish on the connection passes the SDK's publish limiter (10 a minute
+  and 5 KB each by default). Batches are therefore clamped to at most 5,000
+  bytes and at least 10 s apart, whatever the shadow asks for
+  (`TelemetrySettings::effective`, `PUBLISH_BATCH_BYTES`,
+  `MIN_PUBLISH_BATCH_AGE_MS` in `gateway-core`), which leaves room for shadow
+  and Jobs traffic. The defaults are 5,000 bytes and 60 s.
+- The topic may also be a Basic Ingest topic, `$aws/rules/gateway_<rule>[/…]`,
+  which goes straight to one of this product's IoT rules with no messaging
+  charge; the platform's device policy allows exactly that prefix. Any other
+  `$` topic is refused.
+- The queue and the batch limits bound memory.
 
 ### Firmware updates (OTA)
 
@@ -284,22 +329,27 @@ sequenceDiagram
     IOT-->>GW: notify-next
     GW->>IOT: $next/get
     IOT-->>GW: job document
-    alt firmware_version is the running version
+    alt another product, or an operation other than firmware_update
+        GW->>IOT: REJECTED, nothing downloaded
+    else firmware_version is the running version
         GW->>IOT: SUCCEEDED, nothing downloaded
-    else any other version
+    else not greater than the running version, and no downgrade
+        GW->>IOT: SUCCEEDED, reason already-newer, nothing downloaded
+    else a greater version (or downgrade)
+        GW->>GW: verify the signed manifest, if the job carries one
         GW->>IOT: IN_PROGRESS, phase downloading
         GW->>IMG: GET download_url (https only, plaintext refused)
-        IMG-->>GW: image, streamed into the inactive OTA slot and verified
+        IMG-->>GW: image, hashed as it streams into the inactive OTA slot, and verified
         GW->>NVS: record job id, target version, target slot
         GW->>GW: make the new slot the boot slot
         GW->>IOT: IN_PROGRESS, phase rebooting
         GW->>GW: restart into the new slot
-        Note over GW: The new image marks itself valid only after it reaches AWS IoT again.<br/>If it resets before that, the bootloader rolls back to the previous slot.
+        Note over GW: The new image marks itself valid only after it reaches AWS IoT again.<br/>If it resets before that, or has not got there within 10 minutes,<br/>the bootloader rolls back to the previous slot.
         GW->>GW: whichever image boots connects, marks itself valid,<br/>and compares its slot and version with the record
         alt the new image runs
             GW->>IOT: SUCCEEDED, reported by the new image
         else the previous image runs
-            GW->>IOT: FAILED, reason rolled back
+            GW->>IOT: FAILED, reason rollback
         end
         IOT-->>GW: update accepted, or rejected because the execution already ended
         GW->>NVS: clear the record
@@ -313,8 +363,10 @@ reboot, from the record kept in NVS. Until the Jobs service has acknowledged
 it, the device takes no other job, and the execution the service offers again
 at boot (still IN_PROGRESS) is settled, never downloaded a second time. A fresh
 image that fails before it can mark itself valid restarts rather than stopping,
-so the bootloader does roll it back. The full flow, its edge cases, and a
-hardware check for a good and a bad update:
+so the bootloader does roll it back. All of this is the platform SDK's
+(`iot-jobs` and `device-sdk` in `ergousha/iot-device-sdk`); failure reasons are
+`verify`, `sig`, `version`, `rollback`, `boot` and `download`. The full flow,
+its edge cases, and a hardware check for a good and a bad update:
 [`docs/FIRMWARE_INTEGRATION.md`](docs/FIRMWARE_INTEGRATION.md) §4.
 
 ### OPC UA driver lifecycle
@@ -347,13 +399,18 @@ completes within 3 s even if the server never answers.
 
 | Topic | Direction | Plane | Purpose |
 | --- | --- | --- | --- |
-| `$aws/certificates/create/json` (`/accepted`, `/rejected`) | both | provisioning | CreateKeysAndCertificate, first boot only, as `claim-<MAC>` |
-| `$aws/provisioning-templates/{template}/provision/json` (`/accepted`, `/rejected`) | both | provisioning | RegisterThing |
+| `$aws/certificates/create-from-csr/json` (`/accepted`, `/rejected`) | both | enrolment | CreateCertificateFromCsr, only until the device is enrolled, on the claim connection |
+| `$aws/provisioning-templates/{template}/provision/json` (`/accepted`, `/rejected`) | both | enrolment | RegisterThing |
+| `$aws/things/{thing}/shadow/name/platform/get` (`/accepted`, `/rejected`), `…/platform/update` (`/delta`) | both | platform | `desired.telemetry.enabled` in; `reported` (`contract, product, fw, slot, boot_reason, boot_count_since_update, uptime_s, key_id[], last_job, telemetry`) out on connect, on change and every 6 h |
 | `$aws/things/{thing}/shadow/name/opcua/get` (`/accepted`, `/rejected`) | both | config | read `state.desired` |
 | `$aws/things/{thing}/shadow/name/opcua/update` (`/delta`, `/rejected`) | both | config | change notifications in, `state.reported` out |
 | `cmd/{thing}/opcua/tags/v{N}` | cloud → device, retained | config | the tag bundle for config version N |
 | `$aws/things/{thing}/jobs/notify-next`, `…/jobs/$next/get` (`/accepted`), `…/jobs/{jobId}/update` (`/accepted`, `/rejected`), `…/jobs/{jobId}/get` (`/accepted`, `/rejected`) | both | control | OTA jobs and their status; `{jobId}/get` asks, before an image is activated, whether its job is still wanted |
-| `dt/{thing}/opcua` (set in the shadow's `telemetry.topic`) | device → cloud | data | telemetry batches |
+| `dt/{thing}/opcua` (set in the shadow's `telemetry.topic`; or a Basic Ingest topic `$aws/rules/gateway_<rule>[/…]`) | device → cloud | data | telemetry batches, only while the platform switch is on |
+
+The `opcua` shadow's `reported` is sent when the driver state, `cfg_v`, the
+applied or failed tag counts or `last_error` change, and otherwise every 6 h:
+every update is a billed message.
 
 The device policy must grant the named-shadow topics as well as the others: an
 unauthorised SUBSCRIBE makes AWS IoT drop the **whole** connection, Jobs and OTA
@@ -373,8 +430,10 @@ included ([`docs/OPCUA_INTEGRATION_TEST.md`](docs/OPCUA_INTEGRATION_TEST.md) §8
 | Telemetry format | Positional rows, self-describing lossless values, status only when not Good | Small payloads without silent data loss. |
 | Backpressure | Coalescing queue, count/size/age batching, spaced publishes | Bounded heap; well inside AWS IoT publish limits. |
 | Memory budget | 250-tag cap, 16 KiB OPC UA messages, type table preloaded at boot, mbedTLS dynamic buffers | ~300 KB of heap and no PSRAM. |
-| Identity | Per-device X.509 from fleet provisioning by claim, gated by a MAC + secret registry | Zero-touch, and only registered devices can enrol. (The PoC secret is shared and built into the firmware; per-device secrets are a production item, see [`src/config.rs`](src/config.rs).) |
-| Updates | HTTPS-only OTA into dual 7 MiB slots, rollback until the new image reaches AWS; the job outcome reported after the reboot, by the image that actually runs | A bad image cannot brick a unit in the field, and a rollback cannot pass for a success. |
+| Identity | Per-device X.509 from fleet provisioning by claim with a CSR for a P-256 key generated on the device; the claim written at the bench, gated by a MAC + public key registry and an enrolment window | The private key never leaves the device, only registered devices can enrol, and the image carries no secrets. |
+| Platform | Enrolment, MQTT, Jobs/OTA and the `platform` shadow from `ergousha/iot-device-sdk` | One implementation for every product on the platform, with one publish limiter bounding the bill. |
+| Cost | Telemetry off until the platform switches it on; batches ≤ 5,000 bytes, ≥ 10 s apart; shadow reports on change or every 6 h | AWS IoT bills per message and per 5 KB. |
+| Updates | HTTPS-only OTA into dual 7 MiB slots, only to a greater version unless the job says `downgrade`, rollback until the new image reaches AWS; the job outcome reported after the reboot, by the image that actually runs | A bad image cannot brick a unit in the field, and a rollback cannot pass for a success. |
 | Testability | Everything but device I/O builds for the host; OPC UA tested against a server from the same library | Fast feedback, and no dependence on a LAN or host firewall. |
 | Flash layout | Frozen, with spare partitions reserved up front | The partition table is not rewritten by OTA. |
 
@@ -389,7 +448,7 @@ bench.
 
 | Partition | Offset | Size | Holds |
 | --- | --- | --- | --- |
-| `nvs` | `0x9000` | 24 KiB | device identity (AWS IoT certificate + key), the pending OTA job |
+| `nvs` | `0x9000` | 24 KiB | device identity and key (`device_id`), claim, WiFi, endpoint override and boot count (`platform`), the pending OTA job (`ota_job`) |
 | `phy_init` | `0xf000` | 4 KiB | RF calibration |
 | `otadata` | `0x10000` | 8 KiB | which OTA slot boots |
 | `nvs_key` | `0x12000` | 4 KiB | reserved: NVS encryption keys |
@@ -403,37 +462,37 @@ bench.
 ## Repository layout
 
 A Cargo workspace. Only the firmware crate at the root is tied to the device;
-everything else builds and runs on the development host.
+everything else builds and runs on the development host. The platform side —
+enrolment, OTA, the `platform` shadow, the bench console, and `ergo`, the
+owner's CLI — is in
+[`ergousha/iot-device-sdk`](https://github.com/ergousha/iot-device-sdk), which
+the firmware depends on (`device-sdk`, and `platform-build` for the build
+script). `Cargo.toml` points at a checkout of it next to this one
+(`../iot-device-sdk`).
 
 ```
 .
 ├── src/                     # the firmware (ESP-IDF, xtensa only)
-│   ├── main.rs              # boot: eth up -> provision-or-load -> telemetry
-│   ├── eth.rs, wifi.rs      # W5500 via esp_eth (DHCP); WiFi fallback (cfg.toml)
-│   ├── device_id.rs         # embedded claim certs + NVS device identity + MAC
-│   ├── provisioning.rs      # Fleet Provisioning by Claim client
-│   ├── telemetry/           # normal operation: MQTT loop + batched publisher
+│   ├── main.rs              # boot: platform init -> eth/WiFi -> identity -> connect -> telemetry
+│   ├── eth.rs, wifi.rs      # W5500 via esp_eth (DHCP); WiFi fallback (NVS platform)
+│   ├── telemetry/           # normal operation: session loop + batched publisher
 │   ├── shadow.rs            # config plane: `opcua` named shadow + tag bundle
 │   ├── settings_store.rs    # NVS cache of the last applied OPC UA config
-│   ├── jobs.rs, ota.rs      # AWS IoT Jobs / OTA: MQTT + OTA partitions for the Jobs client
-│   ├── job_store.rs         # NVS: the OTA job the next boot must report, download count
-│   └── mqtt_util.rs         # mutual-TLS MQTT client wrapper
-├── iot-jobs/                # the AWS IoT Jobs OTA protocol and state machine, shared
-│                            # with the platform's other products (Vaktus)
-├── gateway-core/            # pure logic: settings, bundle, encoding, batching, backoff;
-│                            # re-exports iot-jobs as gateway_core::jobs
+│   └── mqtt_util.rs         # the MqttTransport trait, on the SDK's MQTT client
+├── gateway-core/            # pure logic: settings, bundle, encoding, batching, backoff
 ├── gateway-opcua/           # the OPC UA client: session, subscriptions, reconnect
 │                            # state machine — platform-neutral, plugged into src/
 ├── opcua-test-server/       # OPC UA test server on async-opcua-server (the server
 │                            # half of the client's own library) + tag catalogue
 ├── gateway-hil/             # on-device scenario runner (ESP32 + AWS + test server)
-├── seed-device/             # registers a device (MAC, product, secret or public key)
-│                            # in the DynamoDB registry
 ├── crates/                  # vendored [patch.crates-io] sources (ESP-IDF fixes)
-├── build.rs                 # fetches the claim identity and endpoint from SSM
+├── platform.toml            # this product on the platform: chip, MAC type, key storage,
+│                            # IoT endpoint and template (public), frozen partitions
+├── build.rs                 # platform_build::configure(): reads platform.toml, pins
+│                            # FW_VERSION, stages the bootloader; no AWS access
 ├── partitions.csv           # the frozen flash layout
-├── cfg.toml.example         # WiFi creds / IoT endpoint -> copy to cfg.toml (gitignored)
-├── certs/                   # claim cert + root CA (build-embedded; see certs/README.md)
+├── scripts/scan-image.py    # fails a release image that carries a key or an unexpected certificate
+├── certs/                   # the Amazon root CA (see certs/README.md)
 └── docs/                    # firmware notes, OPC UA requirements, test architecture
 ```
 
@@ -449,7 +508,10 @@ flowchart BT
     subgraph host["Host only"]
         ts["opcua-test-server<br/>test fixture"]
         hil["gateway-hil<br/>on-device scenario"]
-        seed["seed-device<br/>registry tool"]
+    end
+    subgraph sdkrepo["ergousha/iot-device-sdk"]
+        sdk["device-sdk<br/>feature nvs-soft-key"]
+        pbuild["platform-build<br/>build script"]
     end
     aclient["async-opcua-client"]
     aserver["async-opcua-server"]
@@ -457,13 +519,14 @@ flowchart BT
 
     fw --> opcua
     fw --> core
+    fw --> sdk
+    fw -.->|"build-dependency"| pbuild
     opcua --> core
     opcua --> aclient
     ts --> aserver
     hil --> opcua
     hil --> ts
     hil --> aws
-    seed --> aws
     opcua -.->|"dev-dependency: tests, example"| ts
 ```
 
@@ -536,30 +599,22 @@ That needs `python3`, `git`, `cmake` and `ninja` on `PATH` and takes a while;
 it is cached under `.embuild/` afterwards. The host-only crates need none of
 this — any recent Rust toolchain will do, including upstream stable.
 
-### AWS setup
+### Platform setup
 
-1. **Deploy the infrastructure** from the `iot-platform-infra` repository
-   (IoT policy and provisioning template, Lambda hook, DynamoDB registry, IoT
-   rule, SSM parameters).
-2. **Credentials.** Copy `aws-env.sh.example` to `aws-env.sh`, fill it in, and
-   `source ./aws-env.sh`. `build.rs` reads the same file.
-3. **Claim identity and endpoint.** Nothing to copy by hand: on every build,
-   `build.rs` fetches the claim certificate and key into `certs/` (gitignored)
-   and writes `iot_endpoint` and `provisioning_template` into `cfg.toml` from
-   SSM (`/esp32-ztp/poc/*`, via the `aws` CLI). Without access it writes
-   placeholders and the build still succeeds, but TLS will not work. For the
-   WiFi fallback, copy `cfg.toml.example` to `cfg.toml` and set the SSID and
-   password.
-4. **Register the device** in the registry, with the MAC it logs on first boot
-   (`Provisioning starting. MAC=…`):
-   ```sh
-   cargo run -p seed-device --target host-tuple -- \
-       --mac AA:BB:CC:DD:EE:FF --secret change-me-shared-secret
-   ```
-   The secret must match `DEVICE_SECRET` in [`src/config.rs`](src/config.rs).
-5. **Build and flash** (below). On first boot the device provisions itself;
-   later boots reuse the identity in NVS. Its OPC UA configuration then arrives
-   through the `opcua` shadow.
+1. **Deploy the infrastructure** from the
+   [`iot-platform`](https://github.com/ergousha/iot-platform) repository (IoT
+   policy and provisioning template, Lambda hook, DynamoDB registry, IoT rule,
+   the claim in SSM).
+2. **Check out the SDK** next to this repository:
+   `git clone https://github.com/ergousha/iot-device-sdk ../iot-device-sdk`.
+   The firmware builds against it, and `ergo` runs from it.
+3. **Build and flash** (below). The build needs no AWS access and no secrets:
+   the IoT endpoint and provisioning template come from
+   [`platform.toml`](platform.toml), which is public. On its first boot the
+   unit generates its key and waits for commissioning.
+4. **Commission it** at the bench (below). It enrols, and later boots reuse
+   the identity in NVS. Its OPC UA configuration then arrives through the
+   `opcua` shadow; telemetry flows once the platform switches it on.
 
 ### Build and flash
 
@@ -610,13 +665,42 @@ and needs a real terminal with a TTY attached — it fails with "Failed to
 initialize input reader" if run from a script or a non-interactive shell.
 
 With an Ethernet cable connected, expect the serial log to show the W5500
-coming up and a DHCP lease (`Ethernet ready. IP: ...`), then — on first boot —
-the provisioning flow (`CreateKeysAndCertificate` → `RegisterThing` →
-`Provisioning APPROVED. thingName=...`), and finally the connection to AWS IoT
-Core. On later boots it logs
-`Registered device identity found; skipping provisioning.` and goes straight to
-the MQTT loop. Troubleshooting and NVS erase commands are in
+coming up and a DHCP lease (`Ethernet ready. IP: ...`). On the first boot the
+unit logs `device key: generated a P-256 key` and then waits for commissioning;
+once the claim is written, the enrolment (`enrolment: connected with the claim
+as …` → `enrolment: certificate … issued` → `enrolment: APPROVED, thing …` →
+`enrolled as …; the claim is erased`), and finally the connection to AWS IoT
+Core and `starting gateway. thing=...`. Later boots go straight to the
+connection. Troubleshooting and NVS erase commands are in
 [`docs/FIRMWARE_INTEGRATION.md`](docs/FIRMWARE_INTEGRATION.md).
+
+### Commissioning a gateway
+
+At the bench, with the board on USB and the owner's AWS session, from the SDK
+repository:
+
+```sh
+cd ../iot-device-sdk
+WIFI_PSK=... cargo run -p ergo -- commission --product gateway \
+    --port /dev/cu.usbmodem<n> --wifi-ssid <ssid> --wifi-psk-env WIFI_PSK
+```
+
+`ergo` reads `PLATFORM REGISTER mac=… pubkey=…` off the device's serial
+console, writes the registry record (MAC, public key, enrolment window), writes
+the claim and the WiFi into NVS `platform` over the console, activates the
+claim for the window only, and waits until the hook has marked the record
+`provisioned`. On any failure it deactivates the claim, removes the record and
+erases what it wrote. The device erases the claim itself once it has its
+certificate. To enrol an enrolled gateway again, add `--reprovision` (the
+device forgets its identity first, then enrols as above). More in the
+[SDK's README](https://github.com/ergousha/iot-device-sdk#commissioning-a-device).
+
+**WiFi of units deployed before the SDK.** Their fallback WiFi was compiled
+in, and ESP-IDF kept it in its own NVS storage (`nvs.net80211`) when it
+configured the station. With nothing in NVS `platform`, the firmware takes
+that stored configuration and copies it into NVS `platform`
+([`src/wifi.rs`](src/wifi.rs)), so the move to images without secrets needs
+no bench visit. A unit with neither waits for `ergo commission --wifi-ssid`.
 
 ---
 
@@ -647,5 +731,6 @@ camera interface. Full component list, pinout and dimensions:
 | [`docs/OPCUA_CLIENT_REQUIREMENTS.md`](docs/OPCUA_CLIENT_REQUIREMENTS.md) | OPC UA requirements, the settings and bundle schema, transport limits, memory budget, agreed decisions. |
 | [`docs/OPCUA_INTEGRATION_TEST.md`](docs/OPCUA_INTEGRATION_TEST.md) | Test architecture: unit, loopback and on-device layers, wire contracts, defects found, current status. |
 | [`docs/HIL_ON_WINDOWS.md`](docs/HIL_ON_WINDOWS.md) | A ready-made prompt for an AI agent to run the full on-device scenario from a Windows PC. |
-| [`certs/README.md`](certs/README.md) | The embedded certificates and how the claim identity is handled. |
+| [`certs/README.md`](certs/README.md) | The Amazon root CA, and where the claim identity went. |
+| [`iot-device-sdk`](https://github.com/ergousha/iot-device-sdk) | The platform SDK: enrolment, OTA, the `platform` shadow, the bench console, `ergo`. |
 | [`hardware/README.md`](hardware/README.md) | The board. |

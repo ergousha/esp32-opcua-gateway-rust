@@ -140,6 +140,24 @@ impl Cloud {
         Ok(())
     }
 
+    /// Turns the platform's telemetry switch (`platform` shadow,
+    /// `desired.telemetry.enabled`) on or off. The firmware publishes OPC UA
+    /// batches only while it is on, and the run reads them back from Logs.
+    pub async fn set_platform_telemetry(&self, enabled: bool) -> Result<()> {
+        let payload = serde_json::to_vec(
+            &json!({ "state": { "desired": { "telemetry": { "enabled": enabled } } } }),
+        )?;
+        self.data
+            .update_thing_shadow()
+            .thing_name(&self.thing)
+            .shadow_name("platform")
+            .payload(Blob::new(payload))
+            .send()
+            .await
+            .context("UpdateThingShadow platform")?;
+        Ok(())
+    }
+
     pub async fn get_shadow(&self) -> Result<Option<Value>> {
         match self
             .data

@@ -229,8 +229,8 @@ Two representations. The **authoring form** is what humans and the backend work 
         "topic": "dt/<thing>/opcua",
         "qos": 1,
         "batch_max_items": 200,
-        "batch_max_bytes": 65536,
-        "batch_max_age_ms": 1000
+        "batch_max_bytes": 5000,       // default; accepted 512..32768, published <= 5000
+        "batch_max_age_ms": 60000      // default; published >= 10000
       },
       "cfg": {
         "v": 7,
@@ -257,6 +257,16 @@ Two representations. The **authoring form** is what humans and the backend work 
 
 The `reported` block is deliberately bounded (`failed_sample` truncated to N entries, no full
 tag echo) so it can never approach 8 KB.
+
+`telemetry` is validated as written, but the publisher runs with
+`TelemetrySettings::effective()`: batches clamped to `PUBLISH_BATCH_BYTES` (5,000 bytes, under
+the platform SDK's 5 KB per-message limit and AWS IoT's 5 KB billing unit) and spaced at least
+`MIN_PUBLISH_BATCH_AGE_MS` (10 s) apart, since the SDK admits 10 publishes a minute for the whole
+connection. Documents written before these limits stay valid. `topic` must be free of wildcards
+and may start with `$` only as a Basic Ingest topic to one of this product's rules,
+`$aws/rules/gateway_<rule>[/...]` (no messaging charge; the platform's device policy grants that
+prefix). Whatever the document says, nothing is published unless the platform has switched
+telemetry on (`platform` shadow, `desired.telemetry.enabled`).
 
 ### 4.2 Tag bundle — retained on `cmd/<thing>/opcua/tags/v<N>`
 
@@ -325,7 +335,8 @@ constant — a bundle exceeding it is rejected wholesale with an explicit `repor
 never silently truncated.
 
 Even at 250 tags the following are still required:
-1. **Batched MQTT publishing** with `batch_max_bytes ≤ 64 KB` and a publish-rate limiter.
+1. **Batched MQTT publishing** with published batches of at most 5,000 bytes, at least 10 s
+   apart, behind the platform SDK's publish limiter (§4.1).
 2. **Chunked `CreateMonitoredItems`** — items sent in pages (e.g. 100/request), never all in one
    service call. `ClientBuilder::recreate_monitored_items_chunk` already covers the reconnect
    path; the initial creation path needs the same treatment.
@@ -430,10 +441,9 @@ opcua-test-server/       // async-opcua-server + the tag catalogue (test fixture
 src/                     // firmware: the effectful shell
   settings_store.rs      // NVS blob cache in the dedicated `opcua` partition
   shadow.rs              // ConfigPlane: shadow conversation + retained bundle -> Client::apply
-  jobs.rs                // AWS IoT Jobs / OTA: MQTT and OTA for gateway-core's JobsClient
-  mqtt_util.rs           // MqttTransport trait + EspMqttClient impl
+  mqtt_util.rs           // MqttTransport trait, implemented for the SDK's MQTT client
   telemetry/
-    mod.rs               // orchestrator: one MQTT loop over config/control/data planes
+    mod.rs               // orchestrator: the SDK session's loop over the config and data planes
     publisher.rs         // batch -> publish, rate limit, backlog cap, drop counters
 ```
 
@@ -446,9 +456,10 @@ Key boundaries that make it testable:
   per-device backoff seed, the thread (after registering the eventfd VFS) — and talks to the
   client only through its `Client` handle: `apply`, `disable`, `drain`, `reported`.
 - **`MqttTransport` trait** (`src/mqtt_util.rs`) is what `ConfigPlane` and `Publisher` are
-  written against, not `EspMqttClient`. The Jobs state machine, `JobsClient`, lives in
-  `iot-jobs/src/client.rs` behind its own `Transport`, `Store` and `Installer`
-  traits, and is tested on the host.
+  written against, not a concrete client; it is implemented for the platform SDK's MQTT client,
+  so every publish passes the SDK's limiter. Identity, Jobs/OTA and the `platform` shadow are not
+  in this repository: they are the SDK's (`ergousha/iot-device-sdk`), whose `iot-jobs` state
+  machine is tested on the host there.
 - **Explicit `now_ms` parameters** rather than an ambient clock: `batcher.rs` flush-on-age is
   deterministic in tests without any injection machinery.
 - **Bounded queue with an explicit overflow policy** between driver and publisher: at capacity a
@@ -495,8 +506,9 @@ and disable under each failure. The suite found seven defects the unit tests cou
   `iot:GetThingShadow` on the thing, so credentials must not simply be added to `desired`.
 - **Resilience:** exponential backoff with jitter (1 s → 60 s), no tight reconnect loop; the OPC
   UA task must never be able to panic the process or block the MQTT/OTA task.
-- **Observability:** `reported` state as in §4.1, updated on transition and at most every N
-  seconds (shadow allows 20 req/s per shadow; we should use ≪1/s).
+- **Observability:** `reported` state as in §4.1, updated when the state, `cfg_v`, the applied
+  or failed counts or `last_error` change, and otherwise every 6 h (every update is a billed
+  message; shadow allows 20 req/s per shadow).
 - **Boot behaviour:** apply the persisted bundle immediately, then reconcile with the shadow when
   connectivity is available.
 - **Idempotency:** re-delivery of the same `cfg.v` is a no-op.

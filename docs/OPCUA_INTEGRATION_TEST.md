@@ -71,7 +71,7 @@ Deliberately **not** under test anywhere:
 
 | Not tested | Why, and where it is covered |
 | --- | --- |
-| Fleet provisioning by claim | Already exercised; the device under test reuses its NVS identity. See [`PROVISIONING.md`](PROVISIONING.md). |
+| Enrolment (fleet provisioning by claim) | Already exercised; the device under test reuses its NVS identity. Enrolment is the platform SDK's ([`ergousha/iot-device-sdk`](https://github.com/ergousha/iot-device-sdk)); see [`FIRMWARE_INTEGRATION.md`](FIRMWARE_INTEGRATION.md) §1. |
 | OTA / Jobs | Separate concern. The HIL run only asserts that OPC UA faults never take the OTA path down (`server_down`). |
 | `Sign` / `SignAndEncrypt`, non-anonymous identity | Out of scope by decision D2/D3 in [`OPCUA_CLIENT_REQUIREMENTS.md`](OPCUA_CLIENT_REQUIREMENTS.md). Both layers assert they are **refused**, not that they work. |
 
@@ -149,7 +149,8 @@ types, a schema bug would agree with itself and pass.
 ### 2.4 Why the cloud side needs no device certificate
 
 Everything `gateway-hil` does with AWS goes through IAM-authorised HTTPS —
-`UpdateThingShadow`, `GetThingShadow`, `Publish` (with `retain`),
+`UpdateThingShadow` (the `opcua` shadow, and the `platform` shadow's telemetry
+switch), `GetThingShadow`, `Publish` (with `retain`),
 `GetRetainedMessage`, and CloudWatch `FilterLogEvents`. There is no MQTT client and therefore no X.509 identity to
 provision for the test itself. Telemetry is observed through the IoT rule rather
 than by subscribing, which is what keeps this true.
@@ -196,17 +197,24 @@ cargo install espflash --locked       # one-time; lands in ~/.cargo/bin
 cargo build --release                 # the firmware image the run flashes
 ```
 
+The firmware builds against the platform SDK, checked out next to this
+repository (`../iot-device-sdk`); the build needs no AWS access.
+
 `export-esp.sh` does not put `~/.cargo/bin` on `PATH`; the runner finds
 `espflash` there regardless.
 
 ### 3.4 AWS (HIL only)
 
-```sh
-source aws-env.sh                     # credentials for the account holding the thing
-```
+AWS credentials for the account holding the thing, in the environment (a
+profile or the `AWS_*` variables).
 
-The IoT data endpoint is read from `cfg.toml` (`iot_endpoint`, the same value the
-firmware is built with); pass `--iot-endpoint` to override. The device policy
+The IoT data endpoint is read from `platform.toml` (`[cloud] endpoint`, the same
+value the firmware is built with); pass `--iot-endpoint` to override.
+
+The device publishes telemetry only while its `platform` shadow has
+`desired.telemetry.enabled = true`. The runner switches that on at the start of
+a run and off again after the restore (also after `--restore`); if it cannot,
+it says so, and the switch has to be turned off by hand. The device policy
 **must** grant the named-shadow topics — see §8.1; this was missing and is the
 single most likely thing to be missing again in a fresh account.
 
@@ -527,7 +535,7 @@ cargo run -p opcua-test-server --target host-tuple -- --bind 0.0.0.0 --host <lan
 ### 7.2 Hardware-in-the-loop
 
 ```sh
-source aws-env.sh
+# AWS credentials in the environment (§3.4)
 . ~/export-esp.sh
 cargo build --release                     # the image --flash writes
 
@@ -547,7 +555,7 @@ cargo run -p gateway-hil --target host-tuple -- \
 | `--restore` | Put back the configuration a run that did not finish saved, then exit (§7.4). Needs only `--thing`. |
 | `--keep-test-config` | Restore a pre-run configuration in the test namespace (`urn:ergousha:opcua-test`) as found, instead of taking it for a leftover and leaving the device disabled (§7.4). |
 | `--artifacts DIR` | Where the serial log and JSON summary land (default `gateway-hil/artifacts/`). |
-| `--iot-endpoint HOST` | IoT data endpoint, if not the one in `cfg.toml`. |
+| `--iot-endpoint HOST` | IoT data endpoint, if not the one in `platform.toml` (`[cloud] endpoint`). |
 | `--offline` | Run the phases that need no route from the device to this host (§7.3). Requires `--port`. |
 
 Exit code is 0 only if every check in every phase passed, 1 on a failed check,
@@ -686,7 +694,7 @@ configuration from the **named** shadow `opcua`, so its first `SUBSCRIBE` was
 unauthorised — and AWS IoT does not merely refuse the subscription, it **drops
 the whole MQTT connection**, which would have taken Jobs and OTA down with it.
 
-Fixed in `iot-platform-infra/iot.tf` by adding Publish/Subscribe/Receive on
+Fixed in `iot.tf` of [`iot-platform`](https://github.com/ergousha/iot-platform) by adding Publish/Subscribe/Receive on
 `$aws/things/${iot:Connection.Thing.ThingName}/shadow/*`.
 
 The first attempt to apply it failed:
@@ -1123,7 +1131,11 @@ them:
 2. **A device that is crash-looping.** Symptom: every phase from some point on
    reports an *identical* snapshot, including the same `uptime_s`. That is one
    fault reported ten times, not ten faults. Check
-   `grep -c "memory allocation of" <serial log>` before reading further.
+   `grep -c "memory allocation of" <serial log>` before reading further. Since
+   `reported` goes out only on a change of state, `cfg_v`, counts or
+   `last_error` (or every 6 h), an unchanged snapshot across phases in which
+   none of those changed is expected; the serial log's boot banners tell the
+   two apart.
 
 And one new rule: **if the loopback suite fails, fix that first.** A behaviour
 it covers cannot be diagnosed faster on the device.
@@ -1276,13 +1288,14 @@ espflash flash --port <port> --bootloader target/stack-debug/bootloader.bin \
 | `tag bundle rejected: bundle sha256 …` | Bundle bytes differ from what the digest was computed over | Republish; do not reformat the JSON (§5.1). |
 | All items fail: "all N monitored items were rejected" | Wrong namespace or `id_type` | Check `ns_uri` is published by the server; `ns_uri` phase and `a_wrong_namespace_without_a_uri_fails_loudly` cover this. |
 | `last_error: "session lost: …"`, then `running` again | The server went away and came back | Expected; backoff is 1 s doubling to 60 s with jitter. |
-| `reported` never updates | Reports are throttled to state-change or every 30 s | Wait, or trigger a state change. |
-| Telemetry absent from CloudWatch but the device says it published | `dt/+/opcua` rule or its log group missing | §8.1's terraform also creates them. |
+| `reported` never updates | Reports go out when the state, `cfg_v`, the applied/failed counts or `last_error` change, otherwise every 6 h | Trigger a change, or reboot: the first report after a boot always goes out. |
+| Telemetry absent from CloudWatch but the device says it published | `dt/+/opcua` rule or its log group missing, or the rule disabled (`debug_telemetry_logs`) | §8.1's terraform also creates them. |
+| Serial log says `telemetry off`; no batches at all | The `platform` shadow's `desired.telemetry.enabled` is not `true` | The HIL run sets it; by hand, update the `platform` shadow. |
 | `bootloader` fails: `v5.5.1-838-gd66ebb86d2e: no OTA rollback` | Flashed with `espflash flash` and no `--bootloader`, from outside the repository root (where `espflash.toml` supplies it) | `espflash write-bin --chip esp32s3 0x0 target/bootloader.bin`, or rerun with `--flash` (#22). |
 | `espflash not found` | `export-esp.sh` does not add `~/.cargo/bin` | `cargo install espflash`; the runner looks in `~/.cargo/bin` itself. |
 | Serial log is a few hundred bytes; every log assertion fails | Monitor attached while the USB-JTAG was re-enumerating | §8.9b |
 | Monitor shows `Using flash stub`, then nothing; the device goes silent | Attached with `espflash monitor --no-reset`, which leaves the chip in its bootloader | §8.20. Attach without it; `espflash reset` recovers the device. |
-| Every phase reports the same `reported` snapshot, same `uptime_s` | Device is crash-looping | §9.2. `grep -c "memory allocation of" <serial log>`. |
+| Every phase reports the same `reported` snapshot, same `uptime_s`, although the state changed | Device is crash-looping | §9.2. `grep -c "memory allocation of" <serial log>`. |
 | `reported: (stale — nothing written since the run started)` | Device never booted, never joined the network, or is dead | Read the serial log; the shadow is from an earlier boot (§8.9c). |
 | `BadSecurityPolicyRejected: Cannot find user token type Anonymous` | Endpoint built without a token policy | §8.4 |
 | `memory allocation of N bytes failed`, device reboots | Heap exhaustion. Decode with `xtensa-esp32s3-elf-addr2line -e <elf> -f -C` | §8.5–8.8, §9.4 |

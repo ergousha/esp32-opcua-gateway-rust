@@ -4,7 +4,8 @@
 //!
 //! * **config** — the `opcua` named shadow plus the retained tag bundle
 //!   ([`crate::shadow`]),
-//! * **control** — AWS IoT Jobs, i.e. OTA ([`crate::jobs`]),
+//! * **control** — AWS IoT Jobs (OTA) and the `platform` shadow, which the
+//!   platform SDK's [`Session`] handles itself,
 //! * **data** — batched OPC UA samples ([`publisher`]).
 //!
 //! The OPC UA client (`gateway-opcua`) runs on its own thread with its own
@@ -15,25 +16,18 @@
 
 pub mod publisher;
 
-use std::collections::VecDeque;
 use std::ffi::CStr;
-use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use device_sdk::{Event, Session};
 use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
 use gateway_core::health::DriverState;
 use gateway_opcua::Client;
 
-use crate::device_id::{self, DeviceIdentity};
-use crate::job_store::JobStore;
-use crate::jobs::{JobsClient, Link, Ota, RESTART_GRACE};
-use crate::mqtt_util::{self, MqttEvent};
 use crate::settings_store::SettingsStore;
 use crate::shadow::ConfigPlane;
-use crate::{config, ota};
-use gateway_core::jobs::client::Next;
 
 use publisher::Publisher;
 
@@ -54,100 +48,43 @@ const OPCUA_TASK_NAME: &CStr = c"opcua";
 /// How often the periodic work below runs, at most.
 const TICK_MS: i64 = 50;
 
-/// Connects with the device identity and runs until something unrecoverable
-/// happens. `job_store` holds the OTA job, if any, whose outcome the previous
-/// boot left for this one to report.
-pub fn run(id: &DeviceIdentity, job_store: JobStore) -> Result<()> {
-    log::info!("starting gateway. thing={}", id.thing_name);
-
-    let mut session = mqtt_util::connect(
-        &config::mqtt_url(),
-        // client_id == thingName; the device policy is written that way.
-        &id.thing_name,
-        &mqtt_util::Creds {
-            root_ca: device_id::root_ca_pem(),
-            client_cert: &id.cert_pem,
-            private_key: &id.key_pem,
-        },
-    )?;
-
-    wait_for_connection(&session)?;
-    log::info!("connected to AWS IoT Core");
-
-    // Only once we are on the network with a working identity is this image
-    // worth keeping; before this point a rollback is the correct outcome.
-    let valid = ota::mark_valid();
-    if let Err(e) = &valid {
-        log::warn!("could not mark the firmware valid: {e:#}");
-    }
-    // Read after marking valid, so a pending OTA job is settled with the
-    // verdict on this image already in.
-    let boot = ota::boot_facts(&valid);
+/// Runs the gateway on `session` until something unrecoverable happens.
+///
+/// The session handles Jobs (OTA) and the `platform` shadow itself; what
+/// reaches this loop is the gateway's own: the `opcua` shadow and the tag
+/// bundle.
+pub fn run(mut session: Session) -> Result<()> {
+    log::info!("starting gateway. thing={}", session.thing_name());
 
     let opcua = start_opcua();
-
-    let mut jobs =
-        JobsClient::new(&id.thing_name, job_store, Ota, boot).with_product(crate::config::PRODUCT);
-    let mut config_plane = ConfigPlane::new(&id.thing_name, opcua.clone());
+    let mut config_plane = ConfigPlane::new(session.thing_name(), opcua.clone());
     let mut store = SettingsStore::new().context("opening the OPC UA settings store")?;
-    // Events the Jobs client took off the channel while it waited for an
-    // answer of its own; handled before the channel is read again.
-    let mut backlog: VecDeque<MqttEvent> = VecDeque::new();
-    macro_rules! link {
-        () => {
-            &mut Link {
-                client: &mut session.client,
-                events: &session.events,
-                backlog: &mut backlog,
-            }
-        };
-    }
 
     config_plane.bootstrap(&store);
-    jobs.start(link!()).map_err(anyhow::Error::msg)?;
-    config_plane.start(&mut session.client)?;
+    config_plane.start(&mut session.client())?;
 
     let mut publisher: Option<Publisher> = None;
     let mut last_tick = 0i64;
     let mut stack_probe = StackProbe::new();
+    let mut telemetry_on = false;
 
     loop {
-        let event = match backlog.pop_front() {
-            Some(event) => Ok(event),
-            None => session
-                .events
-                .recv_timeout(Duration::from_millis(TICK_MS as u64)),
-        };
-        match event {
-            Ok(MqttEvent::Connected) => {
+        match session.poll(Duration::from_millis(TICK_MS as u64)) {
+            Some(Event::Connected) => {
                 // Subscriptions do not survive a dropped session, and the
-                // shadow response is not retained, so both planes restart.
-                log::info!("MQTT (re)connected; restoring subscriptions");
-                if let Err(e) = jobs.start(link!()) {
-                    log::error!("could not restore Jobs subscriptions: {e}");
-                }
-                if let Err(e) = config_plane.start(&mut session.client) {
+                // shadow response is not retained, so the plane restarts.
+                if let Err(e) = config_plane.start(&mut session.client()) {
                     log::error!("could not restore shadow subscriptions: {e:#}");
                 }
             }
-            Ok(MqttEvent::Disconnected) => {
-                log::warn!("MQTT connection lost; esp-mqtt will reconnect");
+            Some(Event::Disconnected) => {
+                log::warn!("MQTT connection lost; the platform SDK reconnects");
             }
-            Ok(MqttEvent::Message { topic, data }) => {
-                if jobs.owns(&topic) {
-                    if jobs.handle(&topic, &data, link!()) == Next::Restart {
-                        std::thread::sleep(RESTART_GRACE);
-                        // SAFETY: always sound to call; it does not return.
-                        unsafe { esp_idf_svc::sys::esp_restart() };
-                    }
-                } else {
-                    config_plane.handle(&topic, &data, &mut session.client, &mut store);
-                }
+            Some(Event::Message { topic, data }) => {
+                config_plane.handle(&topic, &data, &mut session.client(), &mut store);
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                bail!("MQTT event channel closed");
-            }
+            Some(Event::Restart) => device_sdk::restart_into_update(),
+            None => {}
         }
 
         let now = now_ms();
@@ -160,27 +97,35 @@ pub fn run(id: &DeviceIdentity, job_store: JobStore) -> Result<()> {
             // Flush under the old policy first, otherwise samples collected
             // for the previous version go out stamped with the new one.
             if let Some(mut old) = publisher.take() {
-                old.flush(&mut session.client, now);
+                old.flush(&mut session.client(), now);
             }
+            let telemetry = settings.telemetry.effective();
             log::info!(
                 "telemetry -> {} (qos {}, <={} items, <={} B, <={} ms)",
-                settings.telemetry.topic,
-                settings.telemetry.qos,
-                settings.telemetry.batch_max_items,
-                settings.telemetry.batch_max_bytes,
-                settings.telemetry.batch_max_age_ms
+                telemetry.topic,
+                telemetry.qos,
+                telemetry.batch_max_items,
+                telemetry.batch_max_bytes,
+                telemetry.batch_max_age_ms
             );
-            publisher = Some(Publisher::new(&settings.telemetry));
+            publisher = Some(Publisher::new(&telemetry));
         }
 
-        if let Some(publisher) = publisher.as_mut() {
-            publisher.ingest(opcua.drain(DRAIN_CHUNK), now);
-            publisher.tick(&mut session.client, now);
+        // Telemetry is opt-in: the platform switches it on (`platform` shadow,
+        // telemetry.enabled) only when a cloud rule consumes it. Off, samples
+        // are drained and dropped, so the queue never backs up.
+        if session.telemetry_enabled() != telemetry_on {
+            telemetry_on = session.telemetry_enabled();
+            log::info!("telemetry {}", if telemetry_on { "on" } else { "off" });
+        }
+        let samples = opcua.drain(DRAIN_CHUNK);
+        if let (true, Some(publisher)) = (telemetry_on, publisher.as_mut()) {
+            publisher.ingest(samples, now);
+            publisher.tick(&mut session.client(), now);
         }
 
         update_counters(&opcua, publisher.as_ref());
-        config_plane.report(&mut session.client, now);
-        jobs.tick(link!(), Instant::now());
+        config_plane.report(&mut session.client(), now);
         stack_probe.check();
     }
 }
@@ -215,34 +160,6 @@ impl StackProbe {
     }
 }
 
-/// How long a fresh OTA image keeps trying to reach AWS IoT before it gives
-/// up and lets the bootloader roll it back.
-const UNVERIFIED_CONNECT_PATIENCE: Duration = Duration::from_secs(180);
-
-fn wait_for_connection(session: &mqtt_util::MqttSession) -> Result<()> {
-    // Giving up on an unverified image rolls it back, and its job is then
-    // reported FAILED for good; one TLS or DNS hiccup on its first boot must
-    // not decide that. esp-mqtt keeps reconnecting on its own meanwhile.
-    let patience = if ota::running_unverified() {
-        UNVERIFIED_CONNECT_PATIENCE
-    } else {
-        Duration::ZERO
-    };
-    let deadline = Instant::now() + patience;
-    loop {
-        let failure = match session.events.recv_timeout(Duration::from_secs(30)) {
-            Ok(MqttEvent::Connected) => return Ok(()),
-            Ok(MqttEvent::Disconnected) => "connection lost before it was established",
-            Ok(_) => continue,
-            Err(_) => "timed out connecting to AWS IoT Core",
-        };
-        if Instant::now() >= deadline {
-            bail!("{failure}");
-        }
-        log::warn!("{failure}; this image is not verified yet, so still trying");
-    }
-}
-
 /// Registers ESP-IDF's eventfd VFS driver, which Tokio's I/O driver requires.
 ///
 /// Tokio wakes its reactor through an `eventfd`. On ESP-IDF that syscall is not
@@ -274,7 +191,7 @@ fn register_eventfd() -> Result<()> {
 /// failure is put in the shadow's `last_error` instead of surfacing only as an
 /// absence of data (`docs/OPCUA_INTEGRATION_TEST.md` §8.2).
 fn start_opcua() -> Client {
-    let mut options = gateway_opcua::Options::new(env!("CARGO_PKG_VERSION"));
+    let mut options = gateway_opcua::Options::new(env!("FW_VERSION"));
     // A per-device backoff seed keeps a whole fleet from reconnecting in
     // lockstep after a server restart.
     options.backoff_seed = backoff_seed();
