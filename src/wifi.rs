@@ -1,9 +1,18 @@
 //! WiFi fallback: if wired Ethernet link/DHCP fails, device connects via WiFi.
-//! Credentials come from NVS `platform` (`ergo commission` writes them at the
-//! bench). ESP32-S3's internal WiFi is used; netif is attached to lwIP, so the
-//! same MQTT/TLS stack runs.
+//! ESP32-S3's internal WiFi is used; netif is attached to lwIP, so the same
+//! MQTT/TLS stack runs.
+//!
+//! The credentials, first found wins:
+//!
+//! 1. NVS `platform` (`ergo commission --wifi-ssid` writes them at the bench);
+//! 2. the station configuration ESP-IDF itself keeps in NVS
+//!    (`nvs.net80211`): every gateway that ran an image with WiFi compiled in
+//!    has it there, so moving to images without secrets needs no bench visit.
+//!    It is copied into NVS `platform` once it is found;
+//! 3. none: the unit waits for the bench console (a restart loop would cut
+//!    `ergo commission` off).
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -18,15 +27,33 @@ pub fn start<'d>(
     modem: Modem<'d>,
     sysloop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
-    credentials: Option<(String, String)>,
+    platform: &device_sdk::Platform,
 ) -> Result<Wifi<'d>> {
-    let Some((ssid, psk)) = credentials else {
-        bail!("no WiFi credentials in NVS platform (ergo commission --wifi-ssid)");
-    };
-    let (ssid, psk) = (ssid.as_str(), psk.as_str());
-
     let esp_wifi = EspWifi::new(modem, sysloop.clone(), Some(nvs)).context("EspWifi::new")?;
     let mut wifi = BlockingWifi::wrap(esp_wifi, sysloop).context("BlockingWifi::wrap")?;
+
+    let (ssid, psk) = match platform.wifi() {
+        Some(credentials) => credentials,
+        None => match stored(&wifi) {
+            Some((ssid, psk)) => {
+                log::info!("WiFi: using the station configuration ESP-IDF kept in NVS");
+                if let Err(e) = platform.seed_wifi(&ssid, &psk) {
+                    log::warn!("could not copy it to NVS platform: {e:#}");
+                }
+                (ssid, psk)
+            }
+            None => {
+                log::warn!("no WiFi credentials anywhere; waiting for WiFi from the bench console");
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    if let Some(credentials) = platform.wifi() {
+                        break credentials;
+                    }
+                }
+            }
+        },
+    };
+    let (ssid, psk) = (ssid.as_str(), psk.as_str());
 
     let auth_method = if psk.is_empty() {
         AuthMethod::None
@@ -55,4 +82,13 @@ pub fn start<'d>(
     log::info!("WiFi ready. IP: {ip:?}");
 
     Ok(Wifi { _wifi: wifi })
+}
+
+/// The station SSID and password ESP-IDF loaded from its own NVS storage.
+fn stored(wifi: &BlockingWifi<EspWifi<'_>>) -> Option<(String, String)> {
+    let client = match wifi.get_configuration().ok()? {
+        Configuration::Client(c) | Configuration::Mixed(c, _) => c,
+        _ => return None,
+    };
+    (!client.ssid.is_empty()).then(|| (client.ssid.to_string(), client.password.to_string()))
 }

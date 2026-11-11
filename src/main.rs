@@ -4,8 +4,8 @@
 //!   1. The platform SDK counts the boot, makes sure the device has its P-256
 //!      key (generated while the radio is still off) and starts the bench
 //!      console (`ergo commission`).
-//!   2. Bring up W5500 Ethernet with esp_eth (DHCP); fall back to WiFi from
-//!      NVS `platform`.
+//!   2. Bring up W5500 Ethernet with esp_eth (DHCP); fall back to WiFi
+//!      (`wifi.rs` says where the credentials come from).
 //!   3. The device's identity: the one in NVS, or enrolment with the claim
 //!      written at the bench (a CSR for the soft key).
 //!   4. Connect to AWS IoT and run the gateway (`telemetry::run`).
@@ -13,7 +13,6 @@
 //! Pins (`../hardware/pins.png`, SPI2/FSPI):
 //!   MOSI=GPIO11, MISO=GPIO12, SCLK=GPIO13, CS=GPIO14, INT=GPIO10, RST=GPIO9
 
-mod config;
 mod eth;
 mod mqtt_util;
 mod settings_store;
@@ -110,12 +109,6 @@ fn run() -> Result<()> {
     // Before the network: a soft key generated now draws on the RNG's
     // radio-off entropy source.
     let platform = device_sdk::Platform::init(&PLATFORM, nvs_part.clone())?;
-    // TRANSITIONAL (config.rs): the compiled-in fallback WiFi moves to NVS.
-    match platform.seed_wifi(config::CONFIG.wifi_ssid, config::CONFIG.wifi_psk) {
-        Ok(true) => log::info!("fallback WiFi moved to NVS"),
-        Ok(false) => {}
-        Err(e) => log::warn!("could not store the fallback WiFi in NVS: {e:#}"),
-    }
 
     // --- 1) Network: wired Ethernet first, if no link/DHCP, fallback to WiFi (lives throughout main) ---
     let (eth_handle, eth_up) = eth::start(
@@ -134,18 +127,7 @@ fn run() -> Result<()> {
         Net::Eth(eth_handle)
     } else {
         log::warn!("Ethernet unavailable; falling back to WiFi...");
-        // A unit with no WiFi in NVS (a new board on the bench) waits for
-        // `ergo commission` to write it over the console, which a restart
-        // loop would keep cutting off. Once it is there, carry on.
-        let mut credentials = platform.wifi();
-        if credentials.is_none() {
-            log::warn!("no Ethernet and no WiFi in NVS; waiting for WiFi from the bench console");
-            while credentials.is_none() {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                credentials = platform.wifi();
-            }
-        }
-        match wifi::start(peripherals.modem, sysloop, nvs_part.clone(), credentials) {
+        match wifi::start(peripherals.modem, sysloop, nvs_part.clone(), &platform) {
             Ok(wifi) => {
                 log::info!("Network interface: WiFi");
                 Net::Wifi {

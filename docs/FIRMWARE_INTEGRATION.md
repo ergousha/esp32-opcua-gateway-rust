@@ -14,7 +14,7 @@ The firmware boot process in `src/main.rs` follows this sequence. Everything abo
     *   Counts the boot (NVS `platform`).
     *   On a unit that is not enrolled, generates a P-256 key in NVS `device_id/key` while the radio is still off, so the RNG draws on its radio-off entropy source.
     *   Starts the serial console that `ergo commission` talks to (`PLATFORM INFO`, `SET`, `ENROL`, `ERASE`, `FORGET`).
-    *   *Transitional:* `Platform::seed_wifi` copies the fallback Wi-Fi compiled in from `cfg.toml` (`src/config.rs`) into NVS `platform`, if that has none yet. The next build drops this.
+    *   The fallback Wi-Fi comes from NVS `platform`, else from the station configuration ESP-IDF itself keeps in NVS (`nvs.net80211`, there on every unit that ever ran Wi-Fi), which is then copied into NVS `platform` (`src/wifi.rs`). Nothing is compiled in.
 
 3.  **Network Initialization**:
     The device starts by attempting to bring up the physical Ethernet interface (`eth::start(...)`). The W5500 transceiver brings up the link via `esp_eth` and waits up to 10 seconds for a link-up and DHCP lease.

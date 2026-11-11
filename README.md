@@ -474,7 +474,6 @@ script). `Cargo.toml` points at a checkout of it next to this one
 .
 ├── src/                     # the firmware (ESP-IDF, xtensa only)
 │   ├── main.rs              # boot: platform init -> eth/WiFi -> identity -> connect -> telemetry
-│   ├── config.rs            # TRANSITIONAL: compiled-in fallback WiFi, moved into NVS on first boot
 │   ├── eth.rs, wifi.rs      # W5500 via esp_eth (DHCP); WiFi fallback (NVS platform)
 │   ├── telemetry/           # normal operation: session loop + batched publisher
 │   ├── shadow.rs            # config plane: `opcua` named shadow + tag bundle
@@ -492,7 +491,6 @@ script). `Cargo.toml` points at a checkout of it next to this one
 ├── build.rs                 # platform_build::configure(): reads platform.toml, pins
 │                            # FW_VERSION, stages the bootloader; no AWS access
 ├── partitions.csv           # the frozen flash layout
-├── cfg.toml.example         # TRANSITIONAL: fallback WiFi for this one release (gitignored cfg.toml)
 ├── scripts/scan-image.py    # fails a release image that carries a key or an unexpected certificate
 ├── certs/                   # the Amazon root CA (see certs/README.md)
 └── docs/                    # firmware notes, OPC UA requirements, test architecture
@@ -610,9 +608,8 @@ this — any recent Rust toolchain will do, including upstream stable.
 2. **Check out the SDK** next to this repository:
    `git clone https://github.com/ergousha/iot-device-sdk ../iot-device-sdk`.
    The firmware builds against it, and `ergo` runs from it.
-3. **Build and flash** (below). The build needs no AWS access and no secrets
-   (apart from the [transitional WiFi](#commissioning-a-gateway) of this one
-   release): the IoT endpoint and provisioning template come from
+3. **Build and flash** (below). The build needs no AWS access and no secrets:
+   the IoT endpoint and provisioning template come from
    [`platform.toml`](platform.toml), which is public. On its first boot the
    unit generates its key and waits for commissioning.
 4. **Commission it** at the bench (below). It enrols, and later boots reuse
@@ -698,14 +695,12 @@ certificate. To enrol an enrolled gateway again, add `--reprovision` (the
 device forgets its identity first, then enrols as above). More in the
 [SDK's README](https://github.com/ergousha/iot-device-sdk#commissioning-a-device).
 
-**Transitional WiFi.** Gateways deployed before the SDK have their fallback
-WiFi compiled in and nothing in NVS. This one release still compiles it in
-from `cfg.toml` (`wifi_ssid`, `wifi_psk`; see
-[`cfg.toml.example`](cfg.toml.example)) and copies it into NVS `platform` on
-first boot (`Platform::seed_wifi`, [`src/config.rs`](src/config.rs)), unless
-NVS already has WiFi. For that reason it goes only to the private firmware
-bucket. The next build drops it; a developer build without `cfg.toml` compiles
-in nothing.
+**WiFi of units deployed before the SDK.** Their fallback WiFi was compiled
+in, and ESP-IDF kept it in its own NVS storage (`nvs.net80211`) when it
+configured the station. With nothing in NVS `platform`, the firmware takes
+that stored configuration and copies it into NVS `platform`
+([`src/wifi.rs`](src/wifi.rs)), so the move to images without secrets needs
+no bench visit. A unit with neither waits for `ergo commission --wifi-ssid`.
 
 ---
 

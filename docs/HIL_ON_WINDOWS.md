@@ -210,9 +210,7 @@ The 2026-09-27 runs used this setup; it replaces steps 5–7 above.
   `ldproxy`), clone `https://github.com/ergousha/iot-device-sdk` next to the
   repository (`../iot-device-sdk`, which the firmware builds against), and run
   `cargo +esp build --release`. The build needs no AWS access. The device's
-  WiFi lives in NVS `platform`; only if it has never run an SDK image, create
-  `cfg.toml` from `cfg.toml.example` with the WiFi credentials, so this
-  transitional build copies them there on its first boot. The first build
+  WiFi comes from NVS (see `src/wifi.rs`); nothing is compiled in. The first build
   downloads ESP-IDF into `.embuild/`. Flash with
   `espflash flash --port /dev/ttyACM0 --bootloader target/bootloader.bin --partition-table partitions.csv --target-app-partition ota_0 target/xtensa-esp32s3-espidf/release/esp32-opcua-gateway`.
   `--bootloader` is not optional: without it espflash writes its own, which

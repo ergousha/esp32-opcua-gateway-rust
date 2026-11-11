@@ -14,10 +14,9 @@ name: ESP32 Release
 # ("Re-run failed jobs"): release-please only reports a release as created
 # once, so a re-run of a single combined job would skip the build.
 #
-# The image carries no claim and no AWS access (platform Phase 2). This one
-# release still carries the fallback WiFi (src/config.rs, transitional), so it
-# goes only to the private firmware bucket — never to the GitHub Release, and
-# never into a build cache that fork PRs could restore.
+# The image carries no secrets (platform Phase 2): no claim, no WiFi, no AWS
+# access. WiFi comes from NVS (src/wifi.rs). Until releases are signed
+# (Phase 3) it is still delivered only through the firmware bucket.
 
 on:
   push:
@@ -105,14 +104,9 @@ jobs:
         env:
           AWS_FIRMWARE_BUCKET: ${{ vars.AWS_FIRMWARE_BUCKET }}
           AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
-          WIFI_SSID: ${{ secrets.WIFI_SSID }}
         run: |
           if [[ -z "$AWS_ROLE_ARN" || -z "$AWS_FIRMWARE_BUCKET" ]]; then
             echo "::error::Set the AWS_ROLE_ARN and AWS_FIRMWARE_BUCKET repository variables."
-            exit 1
-          fi
-          if [[ -z "$WIFI_SSID" ]]; then
-            echo "::error::Set the WIFI_SSID and WIFI_PSK repository secrets."
             exit 1
           fi
 
@@ -142,41 +136,25 @@ jobs:
           unzip -q "$archive" -d "$HOME/.cargo/bin"
           chmod +x "$HOME/.cargo/bin/cargo-espflash"
 
-      # TRANSITIONAL (src/config.rs): the fallback WiFi is compiled in one last
-      # time, so units in the field move it into NVS; the next release drops
-      # this step and the WIFI_* secrets. cfg.toml is gitignored; jq renders
-      # each value as a JSON string, which is also a valid TOML basic string.
-      - name: Write cfg.toml
-        env:
-          WIFI_SSID: ${{ secrets.WIFI_SSID }}
-          WIFI_PSK: ${{ secrets.WIFI_PSK }}
-        run: |
-          {
-            echo '[esp32-opcua-gateway]'
-            echo "wifi_ssid = $(jq -n --arg v "$WIFI_SSID" '$v')"
-            echo "wifi_psk = $(jq -n --arg v "$WIFI_PSK" '$v')"
-          } > cfg.toml
-
       # No AWS credentials: platform-build reads only platform.toml.
       # FW_VERSION pins the version the image reports to the release tag.
       - name: Build for ESP32-S3
         run: FW_VERSION="${TAG_NAME#v}" cargo build --release
 
-      # The transitional image has the fallback WiFi in it; nothing else may
-      # be. Nothing here prints a value.
-      - name: Verify the image's configuration
-        run: |
-          for key in wifi_ssid wifi_psk; do
-            if ! grep -Eq "^${key} = \".+\"" cfg.toml; then
-              echo "::error::cfg.toml has no ${key}; units on WiFi would lose it."
-              exit 1
-            fi
-          done
-
       - name: Generate Firmware Bin
+        # save-image builds again: with the same FW_VERSION, or the image
+        # would carry the crate version instead of the tag's.
         run: >-
+          FW_VERSION="${TAG_NAME#v}"
           cargo espflash save-image --release --chip esp32s3 --flash-size 16mb
           --partition-table partitions.csv --target-app-partition ota_0 firmware.bin
+
+      - name: Check the image carries the release version
+        run: |
+          if ! grep -aqF "${TAG_NAME#v}" firmware.bin; then
+            echo "::error::firmware.bin does not carry version ${TAG_NAME#v}"
+            exit 1
+          fi
 
       - name: Scan the image for secrets
         run: python3 scripts/scan-image.py firmware.bin

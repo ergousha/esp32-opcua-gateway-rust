@@ -53,10 +53,9 @@ Automated release creation:
   trigger OTA delivery
 - Skips documentation, Terraform, scripts, and other non-firmware changes
 
-This one release still compiles in the transitional fallback WiFi (`cfg.toml`
-written from the `WIFI_SSID` and `WIFI_PSK` secrets, see `src/config.rs`), so
-the image goes only to the private firmware bucket, never to the GitHub
-Release. The next release drops that step and the secrets.
+The image carries no WiFi: the firmware reads it from NVS (`src/wifi.rs`). The
+`WIFI_SSID` and `WIFI_PSK` repository secrets are no longer used and can be
+deleted.
 
 Triggers on: pushes to main when firmware source, `platform.toml`, other build
 inputs, or this workflow change
