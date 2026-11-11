@@ -195,18 +195,20 @@ fn parse_args() -> Result<Args> {
 }
 
 /// The IoT endpoint the firmware itself is built with.
-fn iot_endpoint_from_cfg(repo: &Path) -> Result<String> {
-    let path = repo.join("cfg.toml");
+/// The endpoint the firmware is built with: `[cloud] endpoint` of
+/// `platform.toml`.
+fn iot_endpoint_from_platform(repo: &Path) -> Result<String> {
+    let path = repo.join("platform.toml");
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {} (or pass --iot-endpoint)", path.display()))?;
-    let table: toml::Table = text.parse().context("cfg.toml is not valid TOML")?;
+    let table: toml::Table = text.parse().context("platform.toml is not valid TOML")?;
     table
-        .get("esp32-opcua-gateway")
-        .and_then(|t| t.get("iot_endpoint"))
+        .get("cloud")
+        .and_then(|t| t.get("endpoint"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("cfg.toml has no [esp32-opcua-gateway] iot_endpoint"))
+        .ok_or_else(|| anyhow!("platform.toml has no [cloud] endpoint"))
 }
 
 fn stamp() -> String {
@@ -223,7 +225,7 @@ fn when(ms: i64) -> String {
 fn iot_endpoint(args: &Args, repo: &Path) -> Result<String> {
     match args.iot_endpoint.clone() {
         Some(e) => Ok(e),
-        None => iot_endpoint_from_cfg(repo),
+        None => iot_endpoint_from_platform(repo),
     }
 }
 
@@ -244,6 +246,16 @@ fn restore_command(args: &Args) -> String {
         command += &format!(" --artifacts {}", args.artifacts.display());
     }
     command
+}
+
+/// Switches the platform's telemetry back off: every batch is a billed
+/// message, and nothing consumes them outside a run.
+async fn telemetry_off(cloud: &Cloud) {
+    if let Err(e) = cloud.set_platform_telemetry(false).await {
+        report::info(format!(
+            "could not switch telemetry off ({e:#}); set the platform shadow's desired.telemetry.enabled to false"
+        ));
+    }
 }
 
 /// Said last and loudly: the device is still pointed at a server that has
@@ -295,6 +307,9 @@ async fn run() -> Result<bool> {
     }
 
     let mut cloud = Cloud::new(&args.thing, &args.region, &iot_endpoint(&args, &repo)?).await?;
+    // Telemetry is opt-in on the platform; the run reads the batches back.
+    // The restore at the end switches it off again.
+    cloud.set_platform_telemetry(true).await?;
     let t0_ms = now_ms();
     // Anchor shadow freshness to the start of the run, so a `reported` block
     // left over from an earlier boot can never satisfy an assertion.
@@ -391,6 +406,7 @@ async fn run() -> Result<bool> {
         changed,
     )
     .await;
+    telemetry_off(&ctx.cloud).await;
     if restored.settled {
         if let Err(e) = std::fs::remove_file(&pending) {
             log::warn!("could not remove {}: {e}", pending.display());
@@ -470,6 +486,7 @@ async fn restore_pending(args: &Args, repo: &Path, pending: &Path) -> Result<boo
         true,
     )
     .await;
+    telemetry_off(&cloud).await;
     report::print_summary(std::slice::from_ref(&restored.result));
     println!("  restore    : {}", restored.line);
     if restored.settled {

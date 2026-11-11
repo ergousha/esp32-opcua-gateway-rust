@@ -1,23 +1,21 @@
-//! ESP32-S3-ETH — AWS IoT Zero-Touch Provisioning (Fleet Provisioning by Claim).
+//! ESP32-S3-ETH OPC UA gateway on the Ergousha IoT platform (iot-device-sdk).
 //!
 //! Boot flow:
-//!   1. Bring up W5500 Ethernet with esp_eth (DHCP).
-//!   2. Check if persistent device identity exists in NVS.
-//!        - NO  -> Perform provisioning with claim certificate, write result to NVS.
-//!        - YES -> Proceed directly with device identity.
-//!   3. Connect to IoT Core with device identity and keep connection open.
+//!   1. The platform SDK counts the boot, makes sure the device has its P-256
+//!      key (generated while the radio is still off) and starts the bench
+//!      console (`ergo commission`).
+//!   2. Bring up W5500 Ethernet with esp_eth (DHCP); fall back to WiFi from
+//!      NVS `platform`.
+//!   3. The device's identity: the one in NVS, or enrolment with the claim
+//!      written at the bench (a CSR for the soft key).
+//!   4. Connect to AWS IoT and run the gateway (`telemetry::run`).
 //!
 //! Pins (`../hardware/pins.png`, SPI2/FSPI):
 //!   MOSI=GPIO11, MISO=GPIO12, SCLK=GPIO13, CS=GPIO14, INT=GPIO10, RST=GPIO9
 
 mod config;
-mod device_id;
 mod eth;
-mod job_store;
-mod jobs;
 mod mqtt_util;
-mod ota;
-mod provisioning;
 mod settings_store;
 mod shadow;
 mod telemetry;
@@ -27,6 +25,9 @@ use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+
+// `PLATFORM`: this product as platform.toml describes it (platform-build).
+include!(concat!(env!("OUT_DIR"), "/platform.rs"));
 
 /// Stub socketpair symbol for ESP-IDF target (Unix Domain Sockets unavailable in ESP-IDF libc).
 ///
@@ -60,6 +61,9 @@ enum Net<'d> {
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    // The SDK keeps retrying AWS IoT with backoff; a new image that never
+    // gets there is restarted after device_sdk::VERIFY_DEADLINE and rolled back.
+    device_sdk::start_rollback_guard();
 
     let result = run();
     if let Err(e) = &result {
@@ -70,7 +74,7 @@ fn main() -> Result<()> {
         // Restarting hands an unverified image back to the previous one,
         // which then reports the job FAILED, and gives a valid one another go
         // at whatever failed: most often reaching AWS IoT.
-        if ota::running_unverified() {
+        if device_sdk::running_unverified() {
             log::error!("{e:#}; restarting so the bootloader restores the previous image");
             std::thread::sleep(std::time::Duration::from_secs(2));
         } else {
@@ -103,6 +107,16 @@ fn run() -> Result<()> {
     let sysloop = EspSystemEventLoop::take()?;
     let nvs_part = EspDefaultNvsPartition::take()?;
 
+    // Before the network: a soft key generated now draws on the RNG's
+    // radio-off entropy source.
+    let platform = device_sdk::Platform::init(&PLATFORM, nvs_part.clone())?;
+    // TRANSITIONAL (config.rs): the compiled-in fallback WiFi moves to NVS.
+    match platform.seed_wifi(config::CONFIG.wifi_ssid, config::CONFIG.wifi_psk) {
+        Ok(true) => log::info!("fallback WiFi moved to NVS"),
+        Ok(false) => {}
+        Err(e) => log::warn!("could not store the fallback WiFi in NVS: {e:#}"),
+    }
+
     // --- 1) Network: wired Ethernet first, if no link/DHCP, fallback to WiFi (lives throughout main) ---
     let (eth_handle, eth_up) = eth::start(
         peripherals.spi2,
@@ -120,7 +134,18 @@ fn run() -> Result<()> {
         Net::Eth(eth_handle)
     } else {
         log::warn!("Ethernet unavailable; falling back to WiFi...");
-        match wifi::start(peripherals.modem, sysloop, nvs_part.clone()) {
+        // A unit with no WiFi in NVS (a new board on the bench) waits for
+        // `ergo commission` to write it over the console, which a restart
+        // loop would keep cutting off. Once it is there, carry on.
+        let mut credentials = platform.wifi();
+        if credentials.is_none() {
+            log::warn!("no Ethernet and no WiFi in NVS; waiting for WiFi from the bench console");
+            while credentials.is_none() {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                credentials = platform.wifi();
+            }
+        }
+        match wifi::start(peripherals.modem, sysloop, nvs_part.clone(), credentials) {
             Ok(wifi) => {
                 log::info!("Network interface: WiFi");
                 Net::Wifi {
@@ -137,21 +162,17 @@ fn run() -> Result<()> {
         }
     };
 
-    // --- 2) Persistent identity check -----------------------------------------
-    let mut store = device_id::DeviceStore::new(nvs_part.clone())?;
-    let job_store = job_store::JobStore::new(nvs_part)?;
-
-    let identity = if store.exists() {
-        log::info!("Registered device identity found; skipping provisioning.");
-        store.load()?
-    } else {
-        log::info!("No registered identity found; starting zero-touch provisioning.");
-        let id = provisioning::run()?;
-        store.save(&id)?;
-        log::info!("Device identity saved to NVS.");
-        id
-    };
+    // --- 2) Identity: stored, or enrolment with the bench-provisioned claim ---
+    let identity = platform.identity()?;
 
     // --- 3) Device connection (infinite loop) ---------------------------------
-    telemetry::run(&identity, job_store)
+    // The input buffer holds a whole retained tag bundle: esp-mqtt reports the
+    // topic only on a message's first chunk.
+    let session = platform.connect(
+        &identity,
+        &device_sdk::ConnectOptions {
+            buffer_size: 12 * 1024,
+        },
+    )?;
+    telemetry::run(session)
 }

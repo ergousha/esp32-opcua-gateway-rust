@@ -1,39 +1,19 @@
-//! PoC configuration. In production, move these values to `toml-cfg`/NVS/eFuse.
+//! Compile-time configuration: none, except during the transition.
 //!
-//! Network: wired Ethernet (DHCP) is tried first; if no link/DHCP, falls back to WiFi.
-//! WiFi credentials are embedded at compile time from `cfg.toml` (in gitignore).
-
-/// WiFi credentials — read from [esp32-opcua-gateway] table inside `cfg.toml`
-/// at compile time via toml-cfg. Access: `config::CONFIG.wifi_ssid`.
-/// Compile-time configuration.
-///
-/// Only bootstrap values live here. Everything about the OPC UA session —
-/// endpoint, namespace, tag list, batching — is delivered at runtime through
-/// the `opcua` device shadow, so that a tag change does not need a firmware
-/// build. See `docs/OPCUA_CLIENT_REQUIREMENTS.md`.
+//! Everything about the cloud link comes from `platform.toml` (public) and NVS
+//! `platform` (written at the bench by `ergo commission`): images carry no
+//! secrets. Everything about the OPC UA session arrives through the `opcua`
+//! device shadow.
+//!
+//! TRANSITIONAL: gateways in the field have their fallback Wi-Fi compiled in
+//! from `cfg.toml` and nothing in NVS. This build, delivered only to the
+//! private firmware bucket (never a GitHub Release), copies it into NVS
+//! `platform` on first boot (`Platform::seed_wifi`). The next build drops
+//! these two fields and reads Wi-Fi from NVS only.
 #[toml_cfg::toml_config]
 pub struct Config {
     #[default("")]
     pub wifi_ssid: &'static str,
     #[default("")]
     pub wifi_psk: &'static str,
-    #[default("")]
-    pub iot_endpoint: &'static str,
-    #[default("")]
-    pub provisioning_template: &'static str,
-}
-
-/// This firmware's product on the IoT platform (iot-platform-infra
-/// `products`): its releases go to `s3://<bucket>/gateway/`, and an OTA job
-/// whose document names another product is refused.
-pub const PRODUCT: &str = "gateway";
-
-/// Shared secret matching the record in DynamoDB.
-/// PoC: common to all devices. In production, it must be unique per device and
-/// protected with ESP32-S3 DS peripheral.
-pub const DEVICE_SECRET: &str = "change-me-shared-secret";
-
-/// MQTT connection URL (mutual TLS, port 8883).
-pub fn mqtt_url() -> String {
-    format!("mqtts://{}:8883", CONFIG.iot_endpoint)
 }

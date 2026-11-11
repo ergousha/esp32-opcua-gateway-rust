@@ -24,6 +24,18 @@ pub const SECURITY_NONE: &str = "None";
 /// batch.
 pub const MAX_BATCH_BYTES: usize = 32 * 1024;
 
+/// Largest batch actually published, whatever the shadow asks for.
+///
+/// AWS IoT bills messaging per 5 KB, and the platform SDK refuses payloads
+/// over its per-message limit (5 KB by default), so a bigger batch would cost
+/// two units or never leave the device. Documents written before this limit
+/// stay valid; they are clamped ([`TelemetrySettings::effective`]).
+pub const PUBLISH_BATCH_BYTES: usize = 5_000;
+
+/// Shortest batch age actually used. The platform SDK admits 10 publishes a
+/// minute for everything on the connection; telemetry gets at most six.
+pub const MIN_PUBLISH_BATCH_AGE_MS: u64 = 10_000;
+
 /// `state.desired` of the `opcua` named shadow.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DesiredSettings {
@@ -125,10 +137,10 @@ fn default_batch_max_items() -> usize {
     200
 }
 fn default_batch_max_bytes() -> usize {
-    16 * 1024
+    PUBLISH_BATCH_BYTES
 }
 fn default_batch_max_age_ms() -> u64 {
-    1_000
+    60_000
 }
 
 impl Default for TelemetrySettings {
@@ -225,12 +237,23 @@ fn range(field: &'static str, value: u64, min: u64, max: u64) -> Result<(), Sett
     }
 }
 
+/// The Basic Ingest prefix this product may publish to: straight into one of
+/// its own rules (`gateway_*`), with no messaging charge. The device policy
+/// grants exactly this prefix.
+pub const BASIC_INGEST_PREFIX: &str = "$aws/rules/gateway_";
+
 /// MQTT topics must be non-empty, free of wildcards and of the null character.
+/// The only `$` topics allowed are Basic Ingest to this product's rules.
 fn validate_topic(topic: &str) -> Result<(), SettingsError> {
+    let reserved_ok = topic.strip_prefix(BASIC_INGEST_PREFIX).is_some_and(|rest| {
+        // `<rest of rule name>[/<anything>]`: rule names are [A-Za-z0-9_].
+        let rule = rest.split('/').next().unwrap_or_default();
+        !rule.is_empty() && rule.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    });
     if topic.is_empty()
         || topic.len() > 256
         || topic.contains(['+', '#', '\0'])
-        || topic.starts_with('$')
+        || (topic.starts_with('$') && !reserved_ok)
     {
         return Err(SettingsError::BadTopic(topic.to_string()));
     }
@@ -279,6 +302,16 @@ impl InstanceSettings {
 }
 
 impl TelemetrySettings {
+    /// The settings the publisher runs with: batches clamped to
+    /// [`PUBLISH_BATCH_BYTES`] and spaced at least
+    /// [`MIN_PUBLISH_BATCH_AGE_MS`].
+    pub fn effective(&self) -> Self {
+        let mut s = self.clone();
+        s.batch_max_bytes = s.batch_max_bytes.min(PUBLISH_BATCH_BYTES);
+        s.batch_max_age_ms = s.batch_max_age_ms.max(MIN_PUBLISH_BATCH_AGE_MS);
+        s
+    }
+
     /// Validates batching parameters.
     pub fn validate(&self) -> Result<(), SettingsError> {
         validate_topic(&self.topic)?;
@@ -457,7 +490,16 @@ mod tests {
 
     #[test]
     fn wildcard_and_reserved_topics_are_rejected() {
-        for bad in ["", "dt/+/opcua", "dt/gw/#", "$aws/rules/x"] {
+        for bad in [
+            "",
+            "dt/+/opcua",
+            "dt/gw/#",
+            "$aws/rules/x",
+            "$aws/rules/vaktus_logs",
+            "$aws/rules/gateway_",
+            "$aws/rules/gateway_a-b",
+            "$aws/things/x/shadow/update",
+        ] {
             let mut s = golden();
             s.telemetry.topic = bad.into();
             assert!(
@@ -465,6 +507,29 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn basic_ingest_to_own_rules_is_allowed() {
+        for ok in ["$aws/rules/gateway_opcua", "$aws/rules/gateway_opcua_logs/28848553144F"] {
+            let mut s = golden();
+            s.telemetry.topic = ok.into();
+            assert!(s.validate().is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn published_batches_are_clamped_to_the_platform_limits() {
+        let mut s = golden();
+        s.telemetry.batch_max_bytes = 16_384;
+        s.telemetry.batch_max_age_ms = 1_000;
+        assert!(s.validate().is_ok(), "old documents stay valid");
+        let e = s.telemetry.effective();
+        assert_eq!(e.batch_max_bytes, PUBLISH_BATCH_BYTES);
+        assert_eq!(e.batch_max_age_ms, MIN_PUBLISH_BATCH_AGE_MS);
+        s.telemetry.batch_max_bytes = 2_048;
+        s.telemetry.batch_max_age_ms = 60_000;
+        assert_eq!(s.telemetry.effective(), s.telemetry);
     }
 
     #[test]

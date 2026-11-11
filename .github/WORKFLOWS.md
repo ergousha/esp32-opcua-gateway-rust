@@ -45,12 +45,21 @@ Triggers on: daily schedule
 #### `release.yml`
 Automated release creation:
 - Keeps the release-please PR up to date; merging it tags the release
-- Builds the ESP32-S3 firmware for the new release
-- Uploads the firmware image to S3 to trigger OTA delivery
+- Builds the ESP32-S3 firmware for the new release, with `FW_VERSION` set to
+  the tag and no AWS credentials: `platform-build` reads only `platform.toml`
+- Scans the image for secrets (`scripts/scan-image.py`: no private key, no
+  certificate but the Amazon root CA) before anything is uploaded
+- Only then assumes the AWS role and uploads the firmware image to S3 to
+  trigger OTA delivery
 - Skips documentation, Terraform, scripts, and other non-firmware changes
 
-Triggers on: pushes to main when firmware source, build inputs, or this workflow
-change
+This one release still compiles in the transitional fallback WiFi (`cfg.toml`
+written from the `WIFI_SSID` and `WIFI_PSK` secrets, see `src/config.rs`), so
+the image goes only to the private firmware bucket, never to the GitHub
+Release. The next release drops that step and the secrets.
+
+Triggers on: pushes to main when firmware source, `platform.toml`, other build
+inputs, or this workflow change
 
 ### Automation
 

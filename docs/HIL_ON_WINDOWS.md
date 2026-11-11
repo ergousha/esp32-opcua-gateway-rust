@@ -24,9 +24,12 @@ on-device scenario — not a green run at any cost.
   `reject_digest`, `server_down`, `disable`, `reboot`.
 - Telemetry reaches CloudWatch only while the platform's `dt/+/opcua` rule is
   enabled. It is off by default; the owner turns it on for a HIL run with
-  `terraform apply -var debug_telemetry_logs=true` in iot-platform-infra (and
+  `terraform apply -var debug_telemetry_logs=true` in iot-platform (and
   off again afterwards). With it off, `telemetry` and `reconfig` fail and
-  `disable` passes without proving anything.
+  `disable` passes without proving anything. The device itself publishes only
+  while its `platform` shadow has `desired.telemetry.enabled = true`;
+  `gateway-hil` switches that on at the start of a run and off again after
+  the restore.
 - The device: thing `28848553144F`, on WiFi at `192.168.50.75`
   (subnet `192.168.50.0/24`). It already runs the current firmware, including
   the stack-overflow fix in `gateway_opcua::session::open`, so do **not**
@@ -43,7 +46,8 @@ on-device scenario — not a green run at any cost.
 - Do not commit or push unless the user asks. Do not print, log or commit AWS
   secrets.
 - Only touch AWS through `gateway-hil` itself. It writes the `opcua` shadow of
-  thing `28848553144F` and retained topics `cmd/28848553144F/opcua/tags/v*`,
+  thing `28848553144F`, the `platform` shadow's `desired.telemetry.enabled`,
+  and retained topics `cmd/28848553144F/opcua/tags/v*`,
   and on exit puts the shadow back the way it found it
   (`docs/OPCUA_INTEGRATION_TEST.md` §7.4); `--cleanup` removes the retained
   bundles it published that the restored configuration does not use. Nothing
@@ -75,11 +79,10 @@ on-device scenario — not a green run at any cost.
    broken here, and the device run cannot be interpreted.
 4. **AWS.** Set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
    `AWS_DEFAULT_REGION=eu-central-1` for the session (ask the user for
-   them), or use a configured profile. The account is `637423178579`. Get the
-   IoT data endpoint with
-   `aws ssm get-parameter --name /esp32-ztp/poc/iot_endpoint --query Parameter.Value --output text`,
-   or ask the user. It looks like `xxxx-ats.iot.eu-central-1.amazonaws.com`.
-   Pass it as `--iot-endpoint`, since there is no `cfg.toml` on this machine.
+   them), or use a configured profile. The account is `637423178579`. The
+   IoT data endpoint is read from `platform.toml` (`[cloud] endpoint`) in the
+   repository, the one the firmware is built with; `--iot-endpoint` overrides
+   it.
 5. **Network.**
    - Find this PC's IPv4 address on `192.168.50.0/24` (`ipconfig`). The
      connection profile must be *Private* (`Get-NetConnectionProfile`).
@@ -102,7 +105,7 @@ on-device scenario — not a green run at any cost.
    ```powershell
    cargo run -p gateway-hil --target host-tuple -- `
        --thing 28848553144F --server-host <PC-IP> --port <COMx> `
-       --iot-endpoint <endpoint> --cleanup
+       --cleanup
    ```
 
    If Windows asks whether to allow `gateway-hil.exe` on the network, allow
@@ -111,8 +114,11 @@ on-device scenario — not a green run at any cost.
    RESTORED", run the `--restore` command it prints before anything else.
 8. **Before calling anything a firmware bug**, apply §9.2:
    - a `reported: (stale …)` line means the device is not reporting at all;
-   - identical snapshots with the same `uptime_s` across phases mean a
-     crash loop — check `Select-String "memory allocation of" <serial log>`;
+   - identical snapshots with the same `uptime_s` across phases whose state
+     should have changed mean a crash loop — check
+     `Select-String "memory allocation of" <serial log>` (the `opcua` shadow
+     is reported only on a change, or every 6 h, so phases that change
+     nothing legitimately show the same snapshot);
    - every phase also checks "device did not crash during the phase", which
      fails on `***ERROR***`, `Guru Meditation`, `abort() was called` or
      `Rebooting...` in that phase's serial log. A crash is a finding even when
@@ -197,12 +203,16 @@ The 2026-09-27 runs used this setup; it replaces steps 5–7 above.
   ```sh
   RUSTUP_TOOLCHAIN=stable cargo run -p gateway-hil --target host-tuple -- \
       --thing 28848553144F --server-host <PC-IP> --port /dev/ttyACM0 \
-      --iot-endpoint <endpoint> --cleanup
+      --cleanup
   ```
 
 - **Firmware**, only when told to. Put `~/.cargo/bin` on `PATH` (for
-  `ldproxy`), create `cfg.toml` from `cfg.toml.example` with the WiFi
-  credentials, and run `cargo +esp build --release`. The first build
+  `ldproxy`), clone `https://github.com/ergousha/iot-device-sdk` next to the
+  repository (`../iot-device-sdk`, which the firmware builds against), and run
+  `cargo +esp build --release`. The build needs no AWS access. The device's
+  WiFi lives in NVS `platform`; only if it has never run an SDK image, create
+  `cfg.toml` from `cfg.toml.example` with the WiFi credentials, so this
+  transitional build copies them there on its first boot. The first build
   downloads ESP-IDF into `.embuild/`. Flash with
   `espflash flash --port /dev/ttyACM0 --bootloader target/bootloader.bin --partition-table partitions.csv --target-app-partition ota_0 target/xtensa-esp32s3-espidf/release/esp32-opcua-gateway`.
   `--bootloader` is not optional: without it espflash writes its own, which

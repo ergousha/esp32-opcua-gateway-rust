@@ -1,0 +1,35 @@
+# This product on the Ergousha IoT platform (ergousha/iot-platform), read at
+# build time by platform-build (iot-device-sdk). Everything here is public:
+# images carry no secrets. The claim and fallback WiFi reach a unit only at
+# the bench (`ergo commission`), over the serial console.
+
+[product]
+id = "gateway"
+chip = "esp32s3"
+# Frozen: the thing name is the Ethernet MAC, which differs from the base MAC
+# printed on the module.
+mac_type = "eth"
+# A P-256 key generated on the device, in NVS device_id/key. Units enrolled
+# before the SDK keep their RSA key from CreateKeysAndCertificate there.
+key_storage = "nvs-soft-key"
+
+[cloud]
+# Compiled-in default; NVS platform/endpoint overrides it.
+endpoint = "a2pw25e7ewpuwe-ats.iot.eu-central-1.amazonaws.com"
+template = "esp32-s3-fleet-template"
+
+[signing]
+# keys/<id>.pub.pem. Releases are signed from Phase 3 of the platform plan.
+keys = []
+
+[flash]
+partitions = "partitions.csv"
+# Rows units in the field already have (see partitions.csv).
+frozen = [
+  { name = "nvs", offset = 0x9000, size = 0x6000 },
+  { name = "phy_init", offset = 0xf000, size = 0x1000 },
+  { name = "otadata", offset = 0x10000, size = 0x2000 },
+  { name = "opcua", offset = 0x13000, size = 0xd000 },
+  { name = "ota_0", offset = 0x20000, size = 0x700000 },
+  { name = "ota_1", offset = 0x720000, size = 0x700000 },
+]

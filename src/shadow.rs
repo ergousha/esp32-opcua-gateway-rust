@@ -23,11 +23,12 @@ use gateway_opcua::{AppliedConfig, Client};
 use crate::mqtt_util::{MqttTransport, QOS1};
 use crate::settings_store::SettingsStore;
 
-/// Minimum spacing between `reported` updates.
+/// Longest gap between `reported` updates while nothing changes.
 ///
-/// AWS allows 20 shadow operations/s; one every 30 s is plenty for health, and
-/// the state-change path below reports immediately anyway.
-const REPORT_INTERVAL_MS: i64 = 30_000;
+/// Every update is a billed message (and a shadow operation), and the driver
+/// state change below reports immediately anyway; a report every 30 s, as
+/// before, cost more than the rest of the platform together.
+const REPORT_INTERVAL_MS: i64 = 6 * 3600 * 1000;
 
 /// Drives the shadow conversation and hands validated configs to the driver.
 pub struct ConfigPlane {
@@ -42,7 +43,8 @@ pub struct ConfigPlane {
     /// Set on every apply so the caller can rebuild its publisher.
     fresh_settings: Option<DesiredSettings>,
     last_report_ms: i64,
-    last_reported_state: Option<DriverState>,
+    /// State, config version, tag counts and error as last reported.
+    last_reported_state: Option<(DriverState, u32, usize, usize, Option<String>)>,
 }
 
 impl ConfigPlane {
@@ -277,10 +279,12 @@ impl ConfigPlane {
     pub fn report(&mut self, client: &mut impl MqttTransport, now_ms: i64) {
         let (payload, state) = self.opcua.update_reported(|r| {
             r.free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
-            (shadow::encode_reported(r), r.state)
+            // What counts as a change: not the counters, uptime or heap.
+            let significant = (r.state, r.cfg_v, r.applied, r.failed, r.last_error.clone());
+            (shadow::encode_reported(r), significant)
         });
 
-        let state_changed = self.last_reported_state != Some(state);
+        let state_changed = self.last_reported_state.as_ref() != Some(&state);
         let due = now_ms.saturating_sub(self.last_report_ms) >= REPORT_INTERVAL_MS;
         if !state_changed && !due {
             return;
