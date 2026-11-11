@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.0](https://github.com/ergousha/esp32-opcua-gateway-rust/compare/v0.3.0...v0.4.0) (2026-11-11)
+
+
+### Features
+
+* move the cloud link onto the platform device SDK; transitional WiFi move ([c4dbb8a](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/c4dbb8ab6180f12a09657530d0a56a74da0f3551))
+
+
+### Bug Fixes
+
+* device SDK with the connection fix and p256 0.14 ([b176156](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/b176156615a5da5bf64c5081d542df1abe71e2af))
+* device SDK without the empty-publish crash ([e293ba5](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/e293ba571a9dd6e512e3c6aa7525980e2084fa6b))
+* OTA on the gateway: free heap, MQTT paused, WiFi retries ([06f4a40](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/06f4a409058084cda4e694fe63dab53ec62af6db))
+* WiFi from NVS only; SDK session and heap fixes; release version ([866a1ff](https://github.com/ergousha/esp32-opcua-gateway-rust/commit/866a1ff2241eed6f796f8b46d2b65ed5b765e753))
+
 ## [0.3.0](https://github.com/ergousha/esp32-opcua-gateway-rust/compare/v0.2.1...v0.3.0) (2026-11-09)
 
 
