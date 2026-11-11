@@ -4,7 +4,8 @@
 //!
 //! * **config** — the `opcua` named shadow plus the retained tag bundle
 //!   ([`crate::shadow`]),
-//! * **control** — AWS IoT Jobs, i.e. OTA ([`crate::jobs`]),
+//! * **control** — AWS IoT Jobs (OTA) and the `platform` shadow, which the
+//!   platform SDK's [`Session`] handles itself,
 //! * **data** — batched OPC UA samples ([`publisher`]).
 //!
 //! The OPC UA client (`gateway-opcua`) runs on its own thread with its own
