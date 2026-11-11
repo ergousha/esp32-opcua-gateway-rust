@@ -140,7 +140,7 @@ impl Cloud {
         Ok(())
     }
 
-/// Turns the platform's telemetry switch (`platform` shadow,
+    /// Turns the platform's telemetry switch (`platform` shadow,
     /// `desired.telemetry.enabled`) on or off. The firmware publishes OPC UA
     /// batches only while it is on, and the run reads them back from Logs.
     pub async fn set_platform_telemetry(&self, enabled: bool) -> Result<()> {

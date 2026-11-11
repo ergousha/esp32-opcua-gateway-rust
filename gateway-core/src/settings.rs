@@ -511,7 +511,10 @@ mod tests {
 
     #[test]
     fn basic_ingest_to_own_rules_is_allowed() {
-        for ok in ["$aws/rules/gateway_opcua", "$aws/rules/gateway_opcua_logs/28848553144F"] {
+        for ok in [
+            "$aws/rules/gateway_opcua",
+            "$aws/rules/gateway_opcua_logs/28848553144F",
+        ] {
             let mut s = golden();
             s.telemetry.topic = ok.into();
             assert!(s.validate().is_ok(), "{ok}");
