@@ -18,6 +18,9 @@ use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 
+/// Association attempts before giving up (see `start`).
+const CONNECT_ATTEMPTS: u32 = 3;
+
 /// Wrapper keeping the connected WiFi alive (if dropped, connection closes).
 pub struct Wifi<'d> {
     _wifi: BlockingWifi<EspWifi<'d>>,
@@ -74,8 +77,26 @@ pub fn start<'d>(
 
     wifi.start().context("wifi start")?;
     log::info!("Connecting to WiFi: SSID={ssid}");
-    // No retry in place: on hardware a failed attempt left ~11 kB less heap; the caller restarts.
-    wifi.connect().context("wifi connect (SSID/password?)")?;
+    // A few attempts in place before the caller restarts. A restart of an
+    // image that has not marked itself valid yet is a rollback, and the
+    // first association after a software reset times out now and then
+    // (seen on the canary: an OTA update rolled back for it). Few, because a
+    // failed attempt once left ~11 kB less heap.
+    let mut attempt = 1;
+    loop {
+        match wifi.connect() {
+            Ok(()) => break,
+            Err(e) if attempt < CONNECT_ATTEMPTS => {
+                log::warn!(
+                    "WiFi connect attempt {attempt} of {CONNECT_ATTEMPTS} failed: {e}; retrying"
+                );
+                let _ = wifi.disconnect();
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                attempt += 1;
+            }
+            Err(e) => return Err(e).context("wifi connect (SSID/password?)"),
+        }
+    }
     wifi.wait_netif_up().context("wifi netif did not come up")?;
 
     let ip = wifi.wifi().sta_netif().get_ip_info()?;

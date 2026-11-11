@@ -148,13 +148,10 @@ fn run() -> Result<()> {
     let identity = platform.identity()?;
 
     // --- 3) Device connection (infinite loop) ---------------------------------
-    // The input buffer holds a whole retained tag bundle: esp-mqtt reports the
-    // topic only on a message's first chunk.
-    let session = platform.connect(
-        &identity,
-        &device_sdk::ConnectOptions {
-            buffer_size: 12 * 1024,
-        },
-    )?;
+    // The default 4 KB input buffer: the SDK reassembles a larger message
+    // (the retained tag bundle, up to MAX_BUNDLE_BYTES) from its chunks,
+    // topic included. A 12 KB buffer held for the whole session left OTA's
+    // TLS without a 16.7 KB block (measured on the canary).
+    let session = platform.connect(&identity, &device_sdk::ConnectOptions::default())?;
     telemetry::run(session)
 }
