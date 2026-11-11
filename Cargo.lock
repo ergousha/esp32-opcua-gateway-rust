@@ -1712,7 +1712,7 @@ dependencies = [
 
 [[package]]
 name = "esp32-opcua-gateway"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "device-sdk",
@@ -1894,7 +1894,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "log",
  "serde",
@@ -1904,7 +1904,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-hil"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1925,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-opcua"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-opcua-client",
@@ -2765,7 +2765,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "opcua-test-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-opcua-nodes",
