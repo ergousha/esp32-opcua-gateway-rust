@@ -26,7 +26,12 @@ impl MqttTransport for &device_sdk::Mqtt {
             QoS::AtMostOnce => 0,
             _ => 1,
         };
-        self.publish_with(topic, payload, qos, retain)
+        self.publish_message(&device_sdk::mqtt::Message {
+            topic,
+            payload,
+            qos,
+            retain,
+        })
     }
 
     // Subscriptions are always QoS 1: AWS IoT has no QoS 2.

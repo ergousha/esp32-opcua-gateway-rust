@@ -41,14 +41,14 @@ gateway-core = { path = "gateway-core" }
 gateway-opcua = { path = "gateway-opcua" }
 # The platform device SDK (ergousha/iot-device-sdk): enrolment with an NVS
 # soft key, OTA, the platform shadow, the bench console.
-device-sdk = { git = "https://github.com/ergousha/iot-device-sdk", rev = "5e61872fe6b623b356fe758d0a43320fe8036b4f", features = ["nvs-soft-key"] }
+device-sdk = { git = "https://github.com/ergousha/iot-device-sdk", rev = "43349bc73aea63c9ed0dd08043f97d1a24d3641d", features = ["nvs-soft-key"] }
 
 # NOT: W5500 artik ESP-IDF'in dahili esp_eth SPI surucusuyle (lwIP netif olarak)
 # suruluyor; boylece TCP/IP + mbedTLS + MQTT dogrudan calisiyor. Bu yuzden
 # saf-Rust register surucusu (w5500-ll) ve embedded-hal kaldirildi.
 
 [build-dependencies]
-platform-build = { git = "https://github.com/ergousha/iot-device-sdk", rev = "5e61872fe6b623b356fe758d0a43320fe8036b4f" }
+platform-build = { git = "https://github.com/ergousha/iot-device-sdk", rev = "43349bc73aea63c9ed0dd08043f97d1a24d3641d" }
 
 [profile.release]
 opt-level = "s"
