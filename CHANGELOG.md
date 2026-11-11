@@ -1,5 +1,10 @@
 # Changelog
 
+From the next release on, release notes are on the repository's GitHub Releases
+(the platform release pipeline writes them from the conventional commits).
+This file keeps the history before that.
+
+
 ## [0.4.0](https://github.com/ergousha/esp32-opcua-gateway-rust/compare/v0.3.0...v0.4.0) (2026-11-11)
 
 
