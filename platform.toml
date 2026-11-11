@@ -19,8 +19,10 @@ endpoint = "a2pw25e7ewpuwe-ats.iot.eu-central-1.amazonaws.com"
 template = "esp32-s3-fleet-template"
 
 [signing]
-# keys/<id>.pub.pem. Releases are signed from Phase 3 of the platform plan.
-keys = []
+# keys/<id>.pub.pem, all accepted by every image. <id>-a signs releases
+# (Environment release, FIRMWARE_SIGNING_KEY); <id>-b is the offline backup.
+# Rotation: header of iot-device-sdk scripts/signing-keys.sh.
+keys = ["gateway-a", "gateway-b"]
 
 [flash]
 partitions = "partitions.csv"
