@@ -1,175 +1,39 @@
-name: ESP32 Release
+name: Release
 
-# Two jobs:
+# Every push to main runs the platform's release pipeline
+# (iot-device-sdk firmware-release.yml, pinned by commit SHA): the next semver
+# from the conventional commits (feat: minor, fix: patch; nothing else
+# releases), a build without secrets or AWS, a signed manifest, a GitHub
+# pre-release and the upload to releases/gateway/<X.Y.Z>/. The platform's
+# OTA controller then runs it on the canary, soaks it and promotes it to the
+# fleet. Nothing to click; a failed release opens an issue.
 #
-# * release-please keeps the release PR up to date and, when that PR is
-#   merged, tags the release. It uses a GitHub App token, not GITHUB_TOKEN:
-#   GitHub starts no workflows for events that GITHUB_TOKEN causes, so the
-#   release PR would get no CI run and could not merge.
-# * firmware builds the image for a new release and puts it in the firmware
-#   bucket, whose upload event makes the OTA Lambda create an IoT job for the
-#   fleet.
-#
-# They are separate so a failed firmware build can be re-run on its own
-# ("Re-run failed jobs"): release-please only reports a release as created
-# once, so a re-run of a single combined job would skip the build.
-#
-# The image carries no secrets (platform Phase 2): no claim, no WiFi, no AWS
-# access. WiFi comes from NVS (src/wifi.rs). Until releases are signed
-# (Phase 3) it is still delivered only through the firmware bucket.
+# One-time setup (see .github/WORKFLOWS.md, Release Process): repository
+# variables AWS_ROLE_ARN and AWS_FIRMWARE_BUCKET, and Environment `release`
+# with FIRMWARE_SIGNING_KEY (iot-device-sdk scripts/signing-keys.sh).
 
 on:
   push:
     branches: [ main ]
-    paths:
-      - 'src/**'
-      # The firmware links these crates, so a change there is a firmware change.
-      - 'platform.toml'
-      - 'gateway-core/**'
-      - 'gateway-opcua/**'
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'build.rs'
-      - '.cargo/**'
-      - 'rust-toolchain.toml'
-      - 'sdkconfig.defaults'
-      - 'partitions.csv'
-      - 'certs/AmazonRootCA1.pem'
-      - '.github/workflows/release.yml'
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-  CARGO_BUILD_JOBS: "2"
-  CMAKE_BUILD_PARALLEL_LEVEL: "2"
-  ESPFLASH_VERSION: "4.5.0"
-  ESPFLASH_SHA256: "9408208ee3d2408cd1247da61bf6e85e7611d4380c590b85e61070fe7e2bb069"
+# One release at a time, never cancelled half-way (a tag without its upload
+# is reported by the controller, but better not made).
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
 
-# Every job sets its own.
 permissions: {}
 
 jobs:
-  release-please:
-    name: Release Please
-    runs-on: ubuntu-latest
-    # Nothing in this job uses GITHUB_TOKEN; release-please uses the app token.
-    permissions: {}
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-    steps:
-      # No fallback to GITHUB_TOKEN: it would quietly bring back release PRs
-      # that cannot merge.
-      - name: Verify release-please configuration
-        env:
-          APP_CLIENT_ID: ${{ vars.RELEASE_PLEASE_APP_CLIENT_ID }}
-          # Only whether the key is set; the key stays out of the shell.
-          HAS_APP_PRIVATE_KEY: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY != '' }}
-        run: |
-          if [[ -z "$APP_CLIENT_ID" || "$HAS_APP_PRIVATE_KEY" != true ]]; then
-            echo "::error::Set the RELEASE_PLEASE_APP_CLIENT_ID repository variable and the RELEASE_PLEASE_APP_PRIVATE_KEY repository secret (see .github/WORKFLOWS.md, Release Process)."
-            exit 1
-          fi
-
-      # Without owner/repositories inputs the token covers this repository
-      # only. It expires after an hour and is revoked when the job ends.
-      - name: Create release-please token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.RELEASE_PLEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
-          permission-contents: write # version bump commits, tags, GitHub Releases
-          permission-pull-requests: write # the release PR, its labels and comments
-
-      - uses: googleapis/release-please-action@7987652d64b4581673a76e33ad5e98e3dd56832f # v4.1.3
-        id: release
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-          release-type: rust
-
-  firmware:
-    name: Build & deliver the firmware (OTA)
-    needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
-    runs-on: ubuntu-latest
+  release:
+    uses: ergousha/iot-device-sdk/.github/workflows/firmware-release.yml@3c8c848859da07d509133343df247538a7eeb078 # feat/phase-3-release-pipeline
     permissions:
-      contents: read
-      id-token: write # AWS OIDC
-    env:
-      TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
-    steps:
-      - name: Verify release configuration
-        env:
-          AWS_FIRMWARE_BUCKET: ${{ vars.AWS_FIRMWARE_BUCKET }}
-          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
-        run: |
-          if [[ -z "$AWS_ROLE_ARN" || -z "$AWS_FIRMWARE_BUCKET" ]]; then
-            echo "::error::Set the AWS_ROLE_ARN and AWS_FIRMWARE_BUCKET repository variables."
-            exit 1
-          fi
-
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          persist-credentials: false
-
-      - name: Install ESP toolchain
-        uses: esp-rs/xtensa-toolchain@ec6d36527049a7f4fb2cb0c1a644668c1bb8a2a4 # v1.7.0
-        with:
-          buildtargets: esp32s3
-          ldproxy: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up swap space
-        uses: pierotofy/set-swap-space@fc79b3f67fa8a838184ce84a674ca12238d2c761 # master
-        with:
-          swap-size-gb: 10
-
-      - name: Install cargo-espflash
-        run: |
-          archive="$RUNNER_TEMP/cargo-espflash.zip"
-          curl --fail --location --retry 3 --output "$archive" \
-            "https://github.com/esp-rs/espflash/releases/download/v${ESPFLASH_VERSION}/cargo-espflash-x86_64-unknown-linux-gnu.zip"
-          echo "${ESPFLASH_SHA256}  ${archive}" | sha256sum --check
-          unzip -q "$archive" -d "$HOME/.cargo/bin"
-          chmod +x "$HOME/.cargo/bin/cargo-espflash"
-
-      # No AWS credentials: platform-build reads only platform.toml.
-      # FW_VERSION pins the version the image reports to the release tag.
-      - name: Build for ESP32-S3
-        run: FW_VERSION="${TAG_NAME#v}" cargo build --release
-
-      - name: Generate Firmware Bin
-        # save-image builds again: with the same FW_VERSION, or the image
-        # would carry the crate version instead of the tag's.
-        run: >-
-          FW_VERSION="${TAG_NAME#v}"
-          cargo espflash save-image --release --chip esp32s3 --flash-size 16mb
-          --partition-table partitions.csv --target-app-partition ota_0 firmware.bin
-
-      - name: Check the image carries the release version
-        run: |
-          if ! grep -aqF "${TAG_NAME#v}" firmware.bin; then
-            echo "::error::firmware.bin does not carry version ${TAG_NAME#v}"
-            exit 1
-          fi
-
-      - name: Scan the image for secrets
-        run: python3 scripts/scan-image.py firmware.bin
-
-      # Only now, and only for the upload.
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: eu-central-1
-
-      - name: Upload Firmware to S3 (Triggers OTA)
-        env:
-          AWS_FIRMWARE_BUCKET: ${{ vars.AWS_FIRMWARE_BUCKET }}
-        run: |
-          # Under the product's prefix: the platform's OTA trigger maps
-          # gateway/ to the gateway fleet group only (iot-platform-infra).
-          aws s3 cp firmware.bin "s3://${AWS_FIRMWARE_BUCKET}/gateway/firmware_${TAG_NAME}.bin"
+      contents: write # tag and GitHub pre-release
+      id-token: write # AWS OIDC, publish job only
+      issues: write # "release vX.Y.Z failed"
+    with:
+      flash-size: 16mb
+      aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+      firmware-bucket: ${{ vars.AWS_FIRMWARE_BUCKET }}
+      # Optional, newline-separated (the owner's SSID, say); not secrets.
+      image-scan-forbidden: ${{ vars.IMAGE_SCAN_FORBIDDEN }}

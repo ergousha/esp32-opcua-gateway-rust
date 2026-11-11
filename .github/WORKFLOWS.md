@@ -43,22 +43,21 @@ Marks inactive issues and PRs as stale, and closes them after a grace period.
 Triggers on: daily schedule
 
 #### `release.yml`
-Automated release creation:
-- Keeps the release-please PR up to date; merging it tags the release
-- Builds the ESP32-S3 firmware for the new release, with `FW_VERSION` set to
-  the tag and no AWS credentials: `platform-build` reads only `platform.toml`
-- Scans the image for secrets (`scripts/scan-image.py`: no private key, no
-  certificate but the Amazon root CA) before anything is uploaded
-- Only then assumes the AWS role and uploads the firmware image to S3 to
-  trigger OTA delivery
-- Skips documentation, Terraform, scripts, and other non-firmware changes
+Every push to `main` calls the platform's reusable release workflow
+(`ergousha/iot-device-sdk/.github/workflows/firmware-release.yml`, pinned by
+commit SHA; Dependabot bumps it):
+- **version**: the next semver from the conventional commits since the last
+  `v*` tag. Only `feat:` (minor) and `fix:` (patch) release; a breaking change
+  is a minor bump while below 1.0.
+- **build**: no secrets, no AWS, no cache. `app.bin`, `factory.bin` (first
+  flash), `manifest.json`, an SBOM; the slot-size check and the image scan.
+- **publish** (Environment `release`): signs the manifest, tags `vX.Y.Z`,
+  creates a GitHub pre-release with the images, and uploads them to
+  `s3://<bucket>/releases/gateway/X.Y.Z/` through the OIDC role.
+- **notify**: on failure, an issue "release vX.Y.Z failed".
 
-The image carries no WiFi: the firmware reads it from NVS (`src/wifi.rs`). The
-`WIFI_SSID` and `WIFI_PSK` repository secrets are no longer used and can be
-deleted.
-
-Triggers on: pushes to main when firmware source, `platform.toml`, other build
-inputs, or this workflow change
+The platform's OTA controller takes it from there: canary, soak, fleet, with
+an email at each step. There is no release PR and no GitHub App.
 
 ### Automation
 
@@ -140,7 +139,7 @@ Configure on GitHub via **Settings → Branches → Branch protection rules**:
 | security-audit.yml | ✅ (dependency paths) | ✅ (dependency paths) | Weekly | - |
 | zizmor.yml | ✅ (workflows only) | ✅ (workflows only) | - | - |
 | stale.yml | - | - | Daily | - |
-| release.yml | ✅ (firmware and workflow paths) | - | - | - |
+| release.yml | ✅ (main, every push) | - | - | - |
 
 ## Local Development
 
@@ -176,44 +175,32 @@ PRs are labeled with `dependencies` tag and assigned to `eakin`.
 
 ## Release Process
 
-Configure the release workflow after applying the Terraform stack:
+Merge a pull request whose title is a conventional commit: `fix: ...` releases
+a patch, `feat: ...` a minor version, and anything else (`docs:`, `chore:`,
+`ci:`, `refactor:`) nothing. Dependabot's cargo bumps are `fix(deps):`, so a
+merged dependency update ships; its GitHub Actions bumps are `ci:` and do not.
+Every release goes to the canary first; the fleet follows after the soak
+without a click. `iot-platform/scripts/ota.sh status gateway` shows where it
+is; `hold`, `promote`, `rerun` and `rollback` are the overrides.
 
-```bash
-gh variable set AWS_ROLE_ARN --body "$(terraform -chdir=terraform output -raw github_actions_role_arn)"
-gh variable set AWS_FIRMWARE_BUCKET --body "$(terraform -chdir=terraform output -raw firmware_bucket_name)"
-```
+### One-time setup
 
-Merging a firmware-related change to `main` updates the release PR,
-`chore(main): release x.y.z`. Merging that PR tags the release, builds the
-firmware, and uploads the image to S3. Changes outside the firmware paths do
-not start the release workflow.
-
-### release-please's GitHub App
-
-release-please uses a GitHub App token, not `GITHUB_TOKEN`: GitHub starts no
-workflows for events that `GITHUB_TOKEN` causes, so CI would never run on the
-release PR and the required `Firmware CI` check would keep it from merging.
-Without the app the *Release Please* job fails. One-time setup:
-
-1. **Create the app** in **Settings → Developer settings → GitHub Apps → New
-   GitHub App** of the account that owns this repository:
-   - Homepage URL: this repository. Webhook: clear **Active**.
-   - Repository permissions: **Contents** and **Pull requests**, both
-     **Read and write**. Nothing else (Metadata: Read-only is implied).
-   - Where it can be installed: **Only on this account**.
-2. **Install it** (**Install App**) with **Only select repositories**: this
-   repository.
-3. **Store the Client ID** (on the app's page, not the numeric App ID) and a
-   **private key** (**Generate a private key**), then delete the downloaded
-   file:
+1. Repository variables, from the iot-platform Terraform outputs:
    ```bash
-   gh variable set RELEASE_PLEASE_APP_CLIENT_ID --body "Iv23..."
-   gh secret set RELEASE_PLEASE_APP_PRIVATE_KEY < path/to/key.pem
+   gh variable set AWS_ROLE_ARN --body "$(terraform -chdir=../iot-platform-infra output -json github_actions_role_arns | jq -r .gateway)"
+   gh variable set AWS_FIRMWARE_BUCKET --body "$(terraform -chdir=../iot-platform-infra output -raw firmware_bucket_name)"
    ```
-
-**Rotating the key:** generate a new key, store it as above, re-run the latest
-*ESP32 Release* run to check it, then delete the old key on the app's page.
-Deleting a key there revokes it at once, which is also what to do if it leaks.
+2. Signing keys and Environment `release` (main only, secret
+   `FIRMWARE_SIGNING_KEY`), from an iot-device-sdk checkout:
+   ```bash
+   scripts/signing-keys.sh ../esp32-opcua-gateway-rust
+   ```
+   Commit the `keys/` and `platform.toml` it writes with a `fix:` title.
+3. Optional: `gh variable set IMAGE_SCAN_FORBIDDEN --body "<home SSID>"` makes
+   the image scan fail on that string.
+4. Remove what release-please needed: the `RELEASE_PLEASE_APP_CLIENT_ID`
+   variable, the `RELEASE_PLEASE_APP_PRIVATE_KEY` secret, and the GitHub App
+   itself once no repository uses it.
 
 ## Maintenance
 

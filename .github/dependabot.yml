@@ -14,7 +14,8 @@ updates:
       - "dependencies"
       - "rust"
     commit-message:
-      prefix: "chore"
+      # fix(deps): a merged dependency update is released (a patch).
+      prefix: "fix"
       prefix-scope: "deps"
       include: "scope"
     allow:
