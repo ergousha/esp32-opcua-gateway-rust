@@ -31,6 +31,10 @@ jobs:
       contents: write # tag and GitHub pre-release
       id-token: write # AWS OIDC, publish job only
       issues: write # "release vX.Y.Z failed"
+    # The Environment release secret (FIRMWARE_SIGNING_KEY) reaches a called
+    # workflow only through inherit. The repository keeps no other secrets,
+    # and the callee is pinned by SHA.
+    secrets: inherit # zizmor: ignore[secrets-inherit]
     with:
       flash-size: 16mb
       aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
