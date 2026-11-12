@@ -26,7 +26,7 @@ permissions: {}
 
 jobs:
   release:
-    uses: ergousha/iot-device-sdk/.github/workflows/firmware-release.yml@3c8c848859da07d509133343df247538a7eeb078 # feat/phase-3-release-pipeline
+    uses: ergousha/iot-device-sdk/.github/workflows/firmware-release.yml@2e3a583591e45a1282ddef220e546c5f1cc34955 # fix/release-title-without-product
     permissions:
       contents: write # tag and GitHub pre-release
       id-token: write # AWS OIDC, publish job only
