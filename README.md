@@ -336,7 +336,7 @@ sequenceDiagram
     else not greater than the running version, and no downgrade
         GW->>IOT: SUCCEEDED, reason already-newer, nothing downloaded
     else a greater version (or downgrade)
-        GW->>GW: verify the signed manifest, if the job carries one
+        GW->>GW: verify the signed manifest (none: FAILED, reason sig)
         GW->>IOT: IN_PROGRESS, phase downloading
         GW->>IMG: GET download_url (https only, plaintext refused)
         IMG-->>GW: image, hashed as it streams into the inactive OTA slot, and verified
@@ -412,9 +412,11 @@ The `opcua` shadow's `reported` is sent when the driver state, `cfg_v`, the
 applied or failed tag counts or `last_error` change, and otherwise every 6 h:
 every update is a billed message.
 
-The device policy must grant the named-shadow topics as well as the others: an
-unauthorised SUBSCRIBE makes AWS IoT drop the **whole** connection, Jobs and OTA
-included ([`docs/OPCUA_INTEGRATION_TEST.md`](docs/OPCUA_INTEGRATION_TEST.md) §8.1).
+The platform's device policy grants exactly the topics above (iot-device-sdk
+`PLATFORM.md` §6; no shadow `update/accepted` or `update/documents`), so a new
+subscription must be added there first: an unauthorised SUBSCRIBE makes AWS
+IoT drop the **whole** connection, Jobs and OTA included
+([`docs/OPCUA_INTEGRATION_TEST.md`](docs/OPCUA_INTEGRATION_TEST.md) §8.1).
 
 ### Key architectural decisions
 
