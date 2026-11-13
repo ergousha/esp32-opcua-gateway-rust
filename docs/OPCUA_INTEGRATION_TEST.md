@@ -1289,7 +1289,7 @@ espflash flash --port <port> --bootloader target/stack-debug/bootloader.bin \
 | All items fail: "all N monitored items were rejected" | Wrong namespace or `id_type` | Check `ns_uri` is published by the server; `ns_uri` phase and `a_wrong_namespace_without_a_uri_fails_loudly` cover this. |
 | `last_error: "session lost: …"`, then `running` again | The server went away and came back | Expected; backoff is 1 s doubling to 60 s with jitter. |
 | `reported` never updates | Reports go out when the state, `cfg_v`, the applied/failed counts or `last_error` change, otherwise every 6 h | Trigger a change, or reboot: the first report after a boot always goes out. |
-| Telemetry absent from CloudWatch but the device says it published | `dt/+/opcua` rule or its log group missing, or the rule disabled (`debug_telemetry_logs`) | §8.1's terraform also creates them. |
+| Telemetry absent from CloudWatch but the device says it published | The `gateway_opcua_telemetry_to_logs` rule is disabled (`debug_telemetry_logs`, or the platform guard tripped) | `terraform apply -var debug_telemetry_logs=true` in `cloud/`; `cloud/README.md`. |
 | Serial log says `telemetry off`; no batches at all | The `platform` shadow's `desired.telemetry.enabled` is not `true` | The HIL run sets it; by hand, update the `platform` shadow. |
 | `bootloader` fails: `v5.5.1-838-gd66ebb86d2e: no OTA rollback` | Flashed with `espflash flash` and no `--bootloader`, from outside the repository root (where `espflash.toml` supplies it) | `espflash write-bin --chip esp32s3 0x0 target/bootloader.bin`, or rerun with `--flash` (#22). |
 | `espflash not found` | `export-esp.sh` does not add `~/.cargo/bin` | `cargo install espflash`; the runner looks in `~/.cargo/bin` itself. |

@@ -85,7 +85,7 @@ flowchart LR
 | **OPC UA server** (PLC / SCADA) | The gateway is the OPC UA *client*: it opens one session, one subscription per scan rate, and reads the `NamespaceArray` to resolve namespace URIs. Phase 1 is SecurityPolicy `None` + anonymous only, on a trusted OT network. |
 | **AWS IoT Core** | One mutually authenticated MQTT connection carries every plane: enrolment, the `platform` and `opcua` named shadows, the retained tag bundle, Jobs, and telemetry. |
 | **DynamoDB registry + Lambda** | Enrolment succeeds only for a MAC and public key registered here, once, inside its enrolment window (`ergo commission`, below). |
-| **CloudWatch Logs** | Where the `dt/+/opcua` IoT rule lands telemetry; also what the on-device test reads. The rule is off by default to save cost: enable it with `-var debug_telemetry_logs=true` in iot-platform for debugging or a HIL run. The gateway publishes only while the `platform` shadow's `desired.telemetry.enabled` is `true`. |
+| **CloudWatch Logs** | Where the `dt/+/opcua` IoT rule lands telemetry; also what the on-device test reads. The rule lives in this repository's [`cloud/`](cloud/README.md) and is off by default to save cost: enable it with `terraform apply -var debug_telemetry_logs=true` there for debugging or a HIL run. The gateway publishes only while the `platform` shadow's `desired.telemetry.enabled` is `true`. |
 | **SSM Parameter Store** | Holds the claim certificate and key, which `ergo commission` reads at the bench and writes to the device over its serial console. Never read by the build or contacted by the device. |
 | **Image host** | The HTTPS `download_url` of an OTA job, typically a presigned S3 URL. |
 

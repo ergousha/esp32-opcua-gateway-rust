@@ -22,10 +22,10 @@ on-device scenario — not a green run at any cost.
   CloudWatch, and on the device's serial log. Eleven phases: `bootloader`,
   `preflight`, `provision`, `telemetry`, `reconfig`, `ns_uri`, `reject_security`,
   `reject_digest`, `server_down`, `disable`, `reboot`.
-- Telemetry reaches CloudWatch only while the platform's `dt/+/opcua` rule is
-  enabled. It is off by default; the owner turns it on for a HIL run with
-  `terraform apply -var debug_telemetry_logs=true` in iot-platform (and
-  off again afterwards). With it off, `telemetry` and `reconfig` fail and
+- Telemetry reaches CloudWatch only while the `gateway_opcua_telemetry_to_logs`
+  rule is enabled. It is off by default; the owner turns it on for a HIL run
+  with `terraform apply -var debug_telemetry_logs=true` in this repository's
+  `cloud/` (and off again afterwards). With it off, `telemetry` and `reconfig` fail and
   `disable` passes without proving anything. The device itself publishes only
   while its `platform` shadow has `desired.telemetry.enabled = true`;
   `gateway-hil` switches that on at the start of a run and off again after
