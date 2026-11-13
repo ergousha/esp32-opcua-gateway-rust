@@ -165,3 +165,86 @@ jobs:
         run: cargo doc $HOST_CRATES --no-deps --target host-tuple
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # cloud/ (the gateway's own AWS resources): format, validate, and the
+  # platform's policies (iot-device-sdk tflint/policies) at the SDK revision
+  # Cargo.toml pins. No AWS access: the owner applies cloud/ locally.
+  cloud:
+    name: cloud/
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check changed paths
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          changed_files="$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" \
+            --jq '.[].filename')"
+
+          while IFS= read -r path; do
+            case "$path" in
+              cloud/*|Cargo.toml|.github/workflows/ci.yml)
+                echo "cloud=true" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+          done <<< "$changed_files"
+
+          echo "cloud=false" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: steps.filter.outputs.cloud == 'true'
+        with:
+          persist-credentials: false
+
+      - name: SDK revision
+        id: sdk
+        if: steps.filter.outputs.cloud == 'true'
+        shell: python3 {0}
+        run: |
+          import os, re, tomllib
+          rev = tomllib.load(open("Cargo.toml", "rb"))["dependencies"]["device-sdk"]["rev"]
+          assert re.fullmatch(r"[0-9a-f]{40}", rev), rev
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"rev={rev}\n")
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: steps.filter.outputs.cloud == 'true'
+        with:
+          repository: ergousha/iot-device-sdk
+          ref: ${{ steps.sdk.outputs.rev }}
+          path: .sdk
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        if: steps.filter.outputs.cloud == 'true'
+        with:
+          terraform_version: 1.17.1
+
+      - name: Format, validate
+        if: steps.filter.outputs.cloud == 'true'
+        working-directory: cloud
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - uses: terraform-linters/setup-tflint@90f302c255ef959cbfb4bd10581afecdb7ece3e6 # v4.1.1
+        if: steps.filter.outputs.cloud == 'true'
+        with:
+          tflint_version: v0.64.0
+
+      - name: tflint (platform policies)
+        if: steps.filter.outputs.cloud == 'true'
+        working-directory: cloud
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # plugin downloads (rate limit)
+          TFLINT_OPA_POLICY_DIR: ${{ github.workspace }}/.sdk/tflint/policies
+        run: |
+          tflint --init
+          tflint --format compact

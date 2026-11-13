@@ -24,10 +24,11 @@ use gateway_core::shadow::SHADOW_NAME;
 use opcua_test_server::documents::Bundle;
 use serde_json::{json, Value};
 
-/// CloudWatch log group fed by the `dt/+/opcua` IoT rule (iot-platform-infra).
-/// That rule is OFF by default (it costs per message): before a HIL run, enable
-/// it with `terraform apply -var debug_telemetry_logs=true` in iot-platform-infra,
-/// or the telemetry phases fail and `disable` passes vacuously.
+/// CloudWatch log group fed by the `dt/+/opcua` IoT rule
+/// `gateway_opcua_telemetry_to_logs` (this repository's `cloud/`). That rule is
+/// OFF by default (it costs per message): before a HIL run, enable it with
+/// `terraform apply -var debug_telemetry_logs=true` in `cloud/`, or the
+/// telemetry phases fail and `disable` passes vacuously.
 pub const TELEMETRY_LOG_GROUP: &str = "/esp32-ztp/opcua-telemetry";
 
 pub fn now_ms() -> i64 {
