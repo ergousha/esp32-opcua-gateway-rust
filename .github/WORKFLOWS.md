@@ -52,7 +52,8 @@ commit SHA; Dependabot bumps it):
 - **build**: no secrets, no AWS, no cache. `app.bin`, `factory.bin` (first
   flash), `manifest.json`, an SBOM; the slot-size check and the image scan.
 - **publish** (Environment `release`): signs the manifest, tags `vX.Y.Z`,
-  creates a GitHub pre-release with the images, and uploads them to
+  creates a GitHub release with the images (not marked Latest; its GitHub
+  status does not affect the rollout), and uploads them to
   `s3://<bucket>/releases/gateway/X.Y.Z/` through the OIDC role.
 - **notify**: on failure, an issue "release vX.Y.Z failed".
 
