@@ -26,12 +26,27 @@ resource "aws_cloudwatch_log_group" "opcua_telemetry" {
   retention_in_days = 3
 }
 
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+# Confused-deputy guard: IoT may assume the role only for this account's OPC UA telemetry rule. The
+# ARN is built as a string: the rule resource references the role.
 data "aws_iam_policy_document" "rule_assume" {
   statement {
     actions = ["sts:AssumeRole"]
     principals {
       type        = "Service"
       identifiers = ["iot.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:SourceArn"
+      values   = ["arn:aws:iot:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:rule/gateway_opcua_telemetry_to_logs"]
     }
   }
 }
