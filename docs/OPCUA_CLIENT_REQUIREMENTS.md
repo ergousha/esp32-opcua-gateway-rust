@@ -264,8 +264,8 @@ the platform SDK's 5 KB per-message limit and AWS IoT's 5 KB billing unit) and s
 `MIN_PUBLISH_BATCH_AGE_MS` (10 s) apart, since the SDK admits 10 publishes a minute for the whole
 connection. Documents written before these limits stay valid. `topic` must be free of wildcards
 and may start with `$` only as a Basic Ingest topic to one of this product's rules,
-`$aws/rules/gateway_<rule>[/...]` (no messaging charge; the platform's device policy grants that
-prefix). Whatever the document says, nothing is published unless the platform has switched
+`$aws/rules/gateway_<rule>/<thing>`, ending in the gateway's own thing name (no messaging charge;
+the platform's device policy grants exactly that shape). Whatever the document says, nothing is published unless the platform has switched
 telemetry on (`platform` shadow, `desired.telemetry.enabled`).
 
 ### 4.2 Tag bundle — retained on `cmd/<thing>/opcua/tags/v<N>`

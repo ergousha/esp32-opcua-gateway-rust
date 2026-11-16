@@ -239,17 +239,24 @@ fn range(field: &'static str, value: u64, min: u64, max: u64) -> Result<(), Sett
 
 /// The Basic Ingest prefix this product may publish to: straight into one of
 /// its own rules (`gateway_*`), with no messaging charge. The device policy
-/// grants exactly this prefix.
+/// grants exactly `$aws/rules/gateway_<rule>/<thing>`, ending in the
+/// gateway's own thing name.
 pub const BASIC_INGEST_PREFIX: &str = "$aws/rules/gateway_";
 
 /// MQTT topics must be non-empty, free of wildcards and of the null character.
 /// The only `$` topics allowed are Basic Ingest to this product's rules.
 fn validate_topic(topic: &str) -> Result<(), SettingsError> {
-    let reserved_ok = topic.strip_prefix(BASIC_INGEST_PREFIX).is_some_and(|rest| {
-        // `<rest of rule name>[/<anything>]`: rule names are [A-Za-z0-9_].
-        let rule = rest.split('/').next().unwrap_or_default();
-        !rule.is_empty() && rule.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    });
+    let reserved_ok = topic
+        .strip_prefix(BASIC_INGEST_PREFIX)
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(rule, thing)| {
+            // `<rest of rule name>/<thing>`: rule names are [A-Za-z0-9_], and
+            // the thing is one level (the policy checks it is this device's).
+            !rule.is_empty()
+                && rule.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && !thing.is_empty()
+                && !thing.contains('/')
+        });
     if topic.is_empty()
         || topic.len() > 256
         || topic.contains(['+', '#', '\0'])
@@ -498,6 +505,11 @@ mod tests {
             "$aws/rules/vaktus_logs",
             "$aws/rules/gateway_",
             "$aws/rules/gateway_a-b",
+            // Basic Ingest ends in exactly one level, the thing name.
+            "$aws/rules/gateway_opcua",
+            "$aws/rules/gateway_opcua/",
+            "$aws/rules/gateway_a-b/28848553144F",
+            "$aws/rules/gateway_opcua_telemetry_to_logs/dt/28848553144F/opcua",
             "$aws/things/x/shadow/update",
         ] {
             let mut s = golden();
@@ -512,8 +524,8 @@ mod tests {
     #[test]
     fn basic_ingest_to_own_rules_is_allowed() {
         for ok in [
-            "$aws/rules/gateway_opcua",
             "$aws/rules/gateway_opcua_logs/28848553144F",
+            "$aws/rules/gateway_opcua_telemetry_to_logs/28848553144F",
         ] {
             let mut s = golden();
             s.telemetry.topic = ok.into();
