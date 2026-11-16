@@ -7,6 +7,10 @@ updates:
       interval: "weekly"
       day: "monday"
       time: "03:00"
+    # Wait until a release is two weeks old (as iot-platform does): most
+    # malicious releases are yanked within days.
+    cooldown:
+      default-days: 14
     open-pull-requests-limit: 10
     reviewers:
       - "eakin"
@@ -32,6 +36,10 @@ updates:
       interval: "weekly"
       day: "monday"
       time: "04:00"
+    # Wait until a release is two weeks old (as iot-platform does): most
+    # malicious releases are yanked within days.
+    cooldown:
+      default-days: 14
     open-pull-requests-limit: 5
     reviewers:
       - "eakin"
