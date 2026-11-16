@@ -70,12 +70,15 @@ resource "aws_iam_role_policy" "opcua_rule" {
 }
 
 # A batch is {t, v, d} (gateway-core batcher::Batch); gateway-hil reads v and
-# d. The thing name and arrival time are added for reading the logs.
+# d. The thing name and arrival time are added for reading the logs. The
+# thing is clientid(), which the platform pins to the thing name: topic(2)
+# would be whatever a Basic Ingest publish
+# ($aws/rules/gateway_opcua_telemetry_to_logs/dt/<other>/opcua/<thing>) said.
 resource "aws_iot_topic_rule" "opcua_telemetry_to_logs" {
   name        = "gateway_opcua_telemetry_to_logs"
   description = "OPC UA telemetry batches -> CloudWatch Logs, for debugging and gateway-hil. Off unless debug_telemetry_logs."
   enabled     = var.debug_telemetry_logs
-  sql         = "SELECT t, v, d, topic(2) AS thing, timestamp() AS ts FROM 'dt/+/opcua'"
+  sql         = "SELECT t, v, d, clientid() AS thing, timestamp() AS ts FROM 'dt/+/opcua'"
   sql_version = "2016-03-23"
   tags        = { killable = "true" }
 

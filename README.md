@@ -309,10 +309,10 @@ A batch is a positional array of rows, `[address, source_ts_ms, value]`, plus a
   (`TelemetrySettings::effective`, `PUBLISH_BATCH_BYTES`,
   `MIN_PUBLISH_BATCH_AGE_MS` in `gateway-core`), which leaves room for shadow
   and Jobs traffic. The defaults are 5,000 bytes and 60 s.
-- The topic may also be a Basic Ingest topic, `$aws/rules/gateway_<rule>[/…]`,
-  which goes straight to one of this product's IoT rules with no messaging
-  charge; the platform's device policy allows exactly that prefix. Any other
-  `$` topic is refused.
+- The topic may also be a Basic Ingest topic, `$aws/rules/gateway_<rule>/<thing>`
+  (the gateway's own thing name), which goes straight to one of this
+  product's IoT rules with no messaging charge; the platform's device policy
+  allows exactly that shape. Any other `$` topic is refused.
 - The queue and the batch limits bound memory.
 
 ### Firmware updates (OTA)
@@ -406,7 +406,7 @@ completes within 3 s even if the server never answers.
 | `$aws/things/{thing}/shadow/name/opcua/update` (`/delta`, `/rejected`) | both | config | change notifications in, `state.reported` out |
 | `cmd/{thing}/opcua/tags/v{N}` | cloud → device, retained | config | the tag bundle for config version N |
 | `$aws/things/{thing}/jobs/notify-next`, `…/jobs/$next/get` (`/accepted`), `…/jobs/{jobId}/update` (`/accepted`, `/rejected`), `…/jobs/{jobId}/get` (`/accepted`, `/rejected`) | both | control | OTA jobs and their status; `{jobId}/get` asks, before an image is activated, whether its job is still wanted |
-| `dt/{thing}/opcua` (set in the shadow's `telemetry.topic`; or a Basic Ingest topic `$aws/rules/gateway_<rule>[/…]`) | device → cloud | data | telemetry batches, only while the platform switch is on |
+| `dt/{thing}/opcua` (set in the shadow's `telemetry.topic`; or a Basic Ingest topic `$aws/rules/gateway_<rule>/{thing}`) | device → cloud | data | telemetry batches, only while the platform switch is on |
 
 The `opcua` shadow's `reported` is sent when the driver state, `cfg_v`, the
 applied or failed tag counts or `last_error` change, and otherwise every 6 h:
