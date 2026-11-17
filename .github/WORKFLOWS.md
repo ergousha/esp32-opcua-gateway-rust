@@ -53,9 +53,9 @@ commit SHA, which must be one iot-platform lists in
 - **build**: no secrets, no AWS, no cache. `app.bin`, `factory.bin` (first
   flash), `manifest.json`, an SBOM; the slot-size check and the image scan.
 - **publish** (Environment `release`): signs the manifest, tags `vX.Y.Z`,
-  creates a GitHub release with the images (not marked Latest; its GitHub
-  status does not affect the rollout), and uploads them to
-  `s3://<bucket>/releases/gateway/X.Y.Z/` through the OIDC role.
+  creates a GitHub release with the images, uploads them to
+  `s3://<bucket>/releases/gateway/X.Y.Z/` through the OIDC role, then marks the
+  release Latest (its GitHub status does not affect the rollout).
 - **notify**: on failure, an issue "release vX.Y.Z failed".
 
 The platform's OTA controller takes it from there: canary, soak, fleet, with
