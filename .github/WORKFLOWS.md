@@ -45,7 +45,8 @@ Triggers on: daily schedule
 #### `release.yml`
 Every push to `main` calls the platform's reusable release workflow
 (`ergousha/iot-device-sdk/.github/workflows/firmware-release.yml`, pinned by
-commit SHA; Dependabot bumps it):
+commit SHA, which must be one iot-platform lists in
+`release_workflow_commits.json`: its AWS role accepts no other):
 - **version**: the next semver from the conventional commits since the last
   `v*` tag. Only `feat:` (minor) and `fix:` (patch) release; a breaking change
   is a minor bump while below 1.0.
