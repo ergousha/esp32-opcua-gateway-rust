@@ -26,15 +26,17 @@ permissions: {}
 
 jobs:
   release:
-    uses: ergousha/iot-device-sdk/.github/workflows/firmware-release.yml@e8770fc5d9306d2d356c26191a1bedf386560478 # feat/full-release-not-latest
+    uses: ergousha/iot-device-sdk/.github/workflows/firmware-release.yml@399a615b08520b6edc4f1e07aaee742cc7ff5de2 # fix/issue-31-explicit-release-secret
     permissions:
       contents: write # tag and GitHub release
       id-token: write # AWS OIDC, publish job only
       issues: write # "release vX.Y.Z failed"
-    # The Environment release secret (FIRMWARE_SIGNING_KEY) reaches a called
-    # workflow only through inherit. The repository keeps no other secrets,
-    # and the callee is pinned by SHA.
-    secrets: inherit # zizmor: ignore[secrets-inherit]
+    # Only the signing key, by name: it lives in Environment `release`, which
+    # only the callee's publish job sets. The callee is pinned by SHA, and
+    # the AWS role accepts only the SHAs iot-platform lists
+    # (release_workflow_commits.json): bump the pin to a listed one.
+    secrets:
+      FIRMWARE_SIGNING_KEY: ${{ secrets.FIRMWARE_SIGNING_KEY }}
     with:
       flash-size: 16mb
       aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
